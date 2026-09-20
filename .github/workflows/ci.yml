@@ -18,9 +18,9 @@ jobs:
           go-version: "1.23.x"
           cache: false
       - name: Format check
-        run: test -z "$(gofmt -l *.go)"
+        run: test -z "$(gofmt -l *.go scripts/*.go)"
       - name: Unit tests
-        run: go test ./...
+        run: CGO_ENABLED=1 go test -v ./...
       - name: Build dynamic plugin
         run: CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/cliproxy-antigravity.so .
       - name: ABI smoke test

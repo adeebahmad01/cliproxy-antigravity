@@ -21,9 +21,12 @@ cliproxy-antigravity plugin
 Google Antigravity
 ```
 
-Authentication, account state, model access, permissions, tools, and the Antigravity runtime remain owned by the official CLI.
-
 > [!IMPORTANT]
+> **Authentication, account sessions, model access, permissions, and communication with Antigravity remain managed by the official agy CLI.**
+>
+> Unlike alternative proxy integrations that extract, copy, or directly handle Google's OAuth credentials or session tokens, `cliproxy-antigravity` interacts exclusively through the official `agy` CLI's documented headless interface.
+
+> [!NOTE]
 > This project is an independent community integration. It is not affiliated with, endorsed by, or sponsored by Google, Antigravity, CLIProxyAPI, or Synara. Provider terms can change. This architecture intentionally uses the documented `agy` headless interface, but users remain responsible for complying with the terms that apply to their accounts and usage.
 
 ## Status
@@ -47,27 +50,39 @@ The plugin registers under the provider key **`agy`**, not `antigravity`, so it 
 - A recent CLIProxyAPI build with standard dynamic-library plugin support enabled
 - The official Antigravity CLI installed and available as `agy`, or its path configured with `binary_path`
 - An authenticated Antigravity CLI session (`agy` should work normally before using the plugin)
-- Go 1.23+ and a C compiler to build the plugin from source
+- Prebuilt release binaries or Go 1.23+ with a C compiler to build from source
 
 CLIProxyAPI's Linux `no-plugin` build cannot load dynamic-library plugins.
 
-## Build
+## Install in CLIProxyAPI
 
-### Linux
+### From CLIProxyAPI Plugin Store or Prebuilt Release
+
+Download the archive for your platform from the [Releases](https://github.com/adeebahmad01/cliproxy-antigravity/releases) page or install through CLIProxyAPI:
 
 ```bash
-go test ./...
+# Each archive contains the dynamic library at root:
+# Linux: cliproxy-antigravity.so
+# macOS: cliproxy-antigravity.dylib
+```
+
+Place `cliproxy-antigravity.so` (Linux) or `cliproxy-antigravity.dylib` (macOS) into your CLIProxyAPI `plugins/` directory.
+
+### Build from Source
+
+#### Linux
+
+```bash
+CGO_ENABLED=1 go test ./...
 CGO_ENABLED=1 go build -buildmode=c-shared -o cliproxy-antigravity.so .
 ```
 
-### macOS
+#### macOS
 
 ```bash
-go test ./...
+CGO_ENABLED=1 go test ./...
 CGO_ENABLED=1 go build -buildmode=c-shared -o cliproxy-antigravity.dylib .
 ```
-
-The Go toolchain also creates a `.h` file. CLIProxyAPI only needs the dynamic library.
 
 You can also run:
 
@@ -76,11 +91,10 @@ make test
 make build
 ```
 
-## Install in CLIProxyAPI
+### Configuration
 
-1. Build the plugin for the same operating system and architecture as CLIProxyAPI.
-2. Copy the resulting library into CLIProxyAPI's plugin directory. The basename must remain `cliproxy-antigravity`.
-3. Enable the plugin in `config.yaml`:
+1. Ensure the library is located in CLIProxyAPI's plugin directory. The basename must remain `cliproxy-antigravity`.
+2. Enable the plugin in `config.yaml`:
 
 ```yaml
 plugins:
@@ -96,7 +110,7 @@ plugins:
       sandbox: false
 ```
 
-4. Start CLIProxyAPI and inspect `/v1/models`.
+3. Start CLIProxyAPI and inspect `/v1/models`.
 
 At minimum the plugin publishes:
 
@@ -204,17 +218,16 @@ Image content blocks are rejected in v0.1 instead of being silently discarded. T
 
 ## Why this approach?
 
-The project deliberately avoids turning an Antigravity account session into a reusable OAuth-backed HTTP provider. The plugin shells out to the official `agy` executable, and `agy` remains responsible for authentication and service access.
+The project deliberately avoids turning an Antigravity account session into a reusable OAuth-backed HTTP provider. **Authentication, account sessions, model access, permissions, and communication with Antigravity remain managed by the official agy CLI.** The plugin executes the official `agy` executable, and `agy` handles authentication, sessions, and upstream service communication.
 
-Google's public Antigravity CLI documentation describes headless mode as the programmatic interface for scripting, CI pipelines, machine-readable JSON/NDJSON output, model selection, permissions, and persistent stdin-driven sessions. This plugin builds on those documented interfaces rather than reverse-engineering the service.
+Google's public Antigravity CLI documentation describes headless mode as the programmatic interface for scripting, CI pipelines, machine-readable JSON/NDJSON output, model selection, permissions, and persistent stdin-driven sessions. This plugin builds on those documented interfaces rather than reverse-engineering the service or capturing session tokens.
 
 ## Development
 
 ```bash
-gofmt -w *.go
-go test ./...
-CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/cliproxy-antigravity.so .
-python3 scripts/abi_smoke.py /tmp/cliproxy-antigravity.so
+gofmt -w *.go scripts/*.go
+CGO_ENABLED=1 go test -v ./...
+make smoke
 ```
 
 No third-party Go dependencies are required for the plugin itself.
@@ -229,7 +242,6 @@ Likely next steps:
 - richer Antigravity tool/step metadata
 - structured-output support
 - optional reasoning-effort aliases
-- release binaries for supported platforms
 
 Client-side OpenAI tool-call bridging should only be added if it can preserve a clear separation between the client agent runtime and Antigravity's own agent runtime.
 

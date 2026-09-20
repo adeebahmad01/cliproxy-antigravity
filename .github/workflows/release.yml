@@ -4,18 +4,51 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  PLUGIN_ID: cliproxy-antigravity
+
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Unit tests
+        run: CGO_ENABLED=1 go test -v ./...
+
   build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
             ext: so
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            ext: so
+            cc: aarch64-linux-gnu-gcc
+            extra_apt: gcc-aarch64-linux-gnu
           - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: dylib
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
             ext: dylib
     runs-on: ${{ matrix.os }}
     steps:
@@ -24,29 +57,73 @@ jobs:
         with:
           go-version: "1.23.x"
           cache: false
-      - name: Test
-        run: go test ./...
-      - name: Build
+      - name: Install cross-compiler
+        if: matrix.extra_apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.extra_apt }}
+      - name: Build and package
         shell: bash
         run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.1.0"
+          fi
           mkdir -p dist
-          CGO_ENABLED=1 go build -buildmode=c-shared -o "dist/cliproxy-antigravity-${{ runner.os }}-${{ runner.arch }}.${{ matrix.ext }}" .
+          LIB_NAME="${PLUGIN_ID}.${{ matrix.ext }}"
+          ARCHIVE_NAME="${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+
+          if [ -n "${{ matrix.cc }}" ]; then
+            export CC="${{ matrix.cc }}"
+          fi
+
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildmode=c-shared \
+            -ldflags "-s -w" \
+            -o "dist/${LIB_NAME}" .
           rm -f dist/*.h
+
+          go run scripts/package-release.go \
+            -library "dist/${LIB_NAME}" \
+            -archive "dist/${ARCHIVE_NAME}" \
+            -checksum "dist/${ARCHIVE_NAME}.sha256"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: plugin-${{ runner.os }}-${{ runner.arch }}
-          path: dist/*
+          name: artifacts-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
 
   release:
+    name: Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          pattern: artifacts-*
           merge-multiple: true
-      - name: Create GitHub release
+          path: dist
+      - name: Create checksums and publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 | sort > checksums.txt
+          echo "Generated checksums.txt:"
+          cat checksums.txt
+          cd ..
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.zip \
+            dist/checksums.txt \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
