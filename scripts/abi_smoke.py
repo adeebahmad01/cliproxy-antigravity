@@ -49,7 +49,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-format) format="$2"; shift 2 ;;
     --print-timeout) shift 2 ;;
-    --model) shift 2 ;;
+    --model|--conversation|--effort) shift 2 ;;
     --sandbox|--dangerously-skip-permissions) shift ;;
     -p|--print|--prompt) prompt="$2"; shift 2 ;;
     *) shift ;;
@@ -117,6 +117,7 @@ def main() -> int:
         chat_request = {
             "model": "agy/mock-model-high",
             "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high",
         }
         rc, execution = call(
             "executor.execute",
@@ -133,6 +134,8 @@ def main() -> int:
             raise RuntimeError(f"unexpected assistant content: {content!r}")
         if openai_payload["usage"]["total_tokens"] != 13:
             raise RuntimeError(f"unexpected usage: {openai_payload['usage']}")
+        if openai_payload.get("conversation_id") != "mock-conversation":
+            raise RuntimeError(f"expected conversation_id in payload: {openai_payload}")
 
     api.shutdown()
     print(f"ABI smoke test passed: {result['metadata']['Name']} ({', '.join(model_ids)})")

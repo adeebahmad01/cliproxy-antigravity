@@ -13,7 +13,7 @@ OpenAI-compatible client
         v
 cliproxy-antigravity plugin
         |
-        | spawn official CLI
+        | spawn official CLI with stdin
         v
        agy
         |
@@ -31,19 +31,24 @@ Google Antigravity
 
 ## Status
 
-**v0.1** is intentionally narrow and conservative:
+**v0.1** features:
 
-- OpenAI Chat Completions-compatible text requests
-- non-streaming responses through `agy --output-format json`
-- streaming responses through `agy --output-format stream-json`
-- dynamic model discovery through `agy models`
+- OpenAI Chat Completions-compatible text & vision requests
+- Non-streaming responses through `agy --output-format json`
+- Streaming responses through `agy --output-format stream-json`
+- Prompt streaming via stdin (avoiding OS `ARG_MAX` and command-line length limits)
+- Multi-turn conversation resumption through `agy --conversation <id>`
+- Reasoning effort control via `agy --effort` (`low`, `medium`, `high`)
+- Multimodal image support via automatic workspace staging
+- Client-side OpenAI `tools[]` calling emulation (`tool_calls`)
+- Built-in model name aliasing (`gemini-3.8-flash-high`, `claude-3-7-sonnet-thought`, etc.)
+- Dynamic model discovery through `agy models`
 - Antigravity token usage mapped to OpenAI-compatible usage fields
-- no Antigravity OAuth/token extraction
-- no direct calls to private Antigravity services
-- no fake CLIProxyAPI Antigravity credential
-- no client-side OpenAI tool-call emulation
+- No Antigravity OAuth/token extraction
+- No direct calls to private Antigravity services
+- No fake CLIProxyAPI Antigravity credential
 
-The plugin registers under the provider key **`agy`**, not `antigravity`, so it does not replace CLIProxyAPI's built-in Antigravity provider.
+The plugin registers under the provider key **`agy`**, and supports requests addressed to `agy/*`, `antigravity/*`, or unprefixed models.
 
 ## Requirements
 
@@ -108,24 +113,22 @@ plugins:
       print_timeout: "30m"
       dangerously_skip_permissions: false
       sandbox: false
+      reasoning_effort: "high" # optional default: low | medium | high
 ```
 
 3. Start CLIProxyAPI and inspect `/v1/models`.
 
-At minimum the plugin publishes:
+The plugin publishes standard built-in model aliases matching CLIProxyAPI conventions:
 
 ```text
+gemini-3.8-flash-high
+gemini-3.8-flash-medium
+gemini-3.8-flash-low
+claude-3-7-sonnet-thought
 agy/default
 ```
 
-When `agy models` succeeds, it also publishes discovered models using names such as:
-
-```text
-agy/gemini-3.8-flash-high
-agy/gemini-3.8-flash-medium
-```
-
-`agy/default` omits the `--model` flag and lets your installed Antigravity CLI choose its default model.
+When `agy models` succeeds, it also discovers and publishes installed models.
 
 ## Example request
 
@@ -136,7 +139,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer YOUR_CLIPROXY_API_KEY' \
   -d '{
-    "model": "agy/default",
+    "model": "gemini-3.8-flash-high",
     "messages": [
       {"role": "user", "content": "Explain what this repository does in one paragraph."}
     ]
@@ -147,34 +150,100 @@ Streaming works with the normal Chat Completions shape:
 
 ```json
 {
-  "model": "agy/default",
+  "model": "gemini-3.8-flash-high",
   "stream": true,
   "stream_options": {"include_usage": true},
   "messages": [{"role": "user", "content": "Write a short Go example."}]
 }
 ```
 
-## How requests are executed
+### Multimodal Vision / Image Support
 
-For a non-streaming request the plugin effectively runs:
+Clients can pass images using OpenAI-format `image_url` blocks (including base64 data URLs):
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "text", "text": "Describe this architecture diagram."},
+    {
+      "type": "image_url",
+      "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}
+    }
+  ]
+}
+```
+
+The plugin decodes the image and stages it locally into `<workdir>/.cliproxy_cache/images/` for `agy` to inspect.
+
+### Client-Side Tool Calling
+
+When client applications (like Cline, RooCode, or Cursor) provide OpenAI `tools[]`, the plugin activates structured tool-calling mode. If the model invokes a tool, the response returns standard OpenAI `tool_calls`:
+
+```json
+{
+  "choices": [{
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "tool_calls": [{
+        "id": "call_12345_0",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"location\":\"Paris\"}"
+        }
+      }]
+    }
+  }]
+}
+```
+
+The client application can execute the function and pass the result back with `role: "tool"`.
+
+### Conversation Resumption
+
+To resume an existing conversation in Antigravity, pass `conversation_id` in the JSON body or via the `X-AGY-Conversation-ID` header:
 
 ```bash
-agy --output-format json --print-timeout 30m -p "<converted conversation>"
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer YOUR_CLIPROXY_API_KEY' \
+  -d '{
+    "model": "gemini-3.8-flash-high",
+    "conversation_id": "YOUR_PREVIOUS_CONVERSATION_ID",
+    "messages": [
+      {"role": "user", "content": "What was the previous answer?"}
+    ]
+  }'
+```
+
+When resuming an existing session, the plugin only sends the new turn to `agy`, avoiding duplicating previous conversation history already stored in the session.
+
+### Reasoning Effort
+
+Reasoning effort can be set in four ways:
+
+1. Model name alias: `"model": "gemini-3.8-flash-high"` or `"gemini-3.8-flash-low"`
+2. Suffix: `"model": "agy/default:high"`
+3. Request body: `"reasoning_effort": "high"`
+4. Request header: `X-AGY-Effort: high`
+
+## How requests are executed
+
+For a non-streaming request the plugin runs:
+
+```bash
+printf "%s" "<prompt>" | agy --output-format json --print-timeout 30m [--conversation <id>] [--effort <effort>] [--model <model>]
 ```
 
 For a streaming request it runs:
 
 ```bash
-agy --output-format stream-json --print-timeout 30m -p "<converted conversation>"
+printf "%s" "<prompt>" | agy --output-format stream-json --print-timeout 30m [--conversation <id>] [--effort <effort>] [--model <model>]
 ```
 
-A selected model adds:
-
-```bash
---model <agy-model-slug>
-```
-
-The plugin parses `agent_response` deltas from Antigravity's NDJSON stream and emits OpenAI-compatible SSE chunks through CLIProxyAPI's plugin stream bridge.
+The prompt is piped directly to `agy`'s standard input rather than passed as a command-line argument, preventing issues with command-line length limits (`ARG_MAX`) and keeping prompt contents private from system process tables.
 
 ## Configuration
 
@@ -185,6 +254,7 @@ The plugin parses `agent_response` deltas from Antigravity's NDJSON stream and e
 | `print_timeout` | `30m` | Passed to `--print-timeout`. |
 | `dangerously_skip_permissions` | `false` | Adds `--dangerously-skip-permissions`. This auto-approves all Antigravity tool permission requests. |
 | `sandbox` | `false` | Adds Antigravity's `--sandbox` flag. |
+| `reasoning_effort` | empty | Default reasoning effort passed to `--effort` (`low`, `medium`, `high`). |
 
 ### Permission safety
 
@@ -194,27 +264,13 @@ Do not expose a CLIProxyAPI instance using this plugin to untrusted users unless
 
 ## Compatibility and limitations
 
-### OpenAI tools
-
-This plugin does **not** translate OpenAI `tools[]` into external client-executed tool calls. Antigravity is itself an agent runtime with its own tools. If a client sends tool schemas, the plugin leaves execution to Antigravity and returns a normal assistant response.
-
-This is useful for clients that primarily need an OpenAI-compatible transport, but it is not yet a drop-in replacement for a raw LLM endpoint whose tool calls must be executed by the client.
-
-### Conversation state
-
-v0.1 sends the full Chat Completions `messages[]` history to a fresh headless `agy -p` invocation. It does not yet map client session IDs onto Antigravity `conversation_id` values or maintain persistent `--input-format stream-json` processes.
-
-### System messages
-
-The Antigravity print interface receives a prompt, not OpenAI's separate system-message channel. The plugin preserves role ordering and labels system/developer messages clearly inside the prompt, but this is not identical to a provider-native system instruction API.
-
-### Images
-
-Image content blocks are rejected in v0.1 instead of being silently discarded. Text content blocks are supported.
-
 ### Working directory
 
-`workdir` is currently global for the plugin configuration. If one CLIProxyAPI instance serves several unrelated repositories, use separate instances/configurations or wait for per-request workspace routing support.
+`workdir` is currently global for the plugin configuration. If one CLIProxyAPI instance serves several unrelated repositories, set `workdir` to a shared base path or configure per-instance plugins.
+
+### Latency
+
+Because each interaction invokes the official `agy` executable, response startup time is typically ~800ms–1.2s compared to ~150ms for raw persistent HTTP connections.
 
 ## Why this approach?
 
@@ -231,26 +287,6 @@ make smoke
 ```
 
 No third-party Go dependencies are required for the plugin itself.
-
-## Roadmap
-
-Likely next steps:
-
-- persistent `agy --input-format stream-json --output-format stream-json` process pool
-- safe session-to-`conversation_id` mapping
-- per-request/project working-directory routing
-- richer Antigravity tool/step metadata
-- structured-output support
-- optional reasoning-effort aliases
-
-Client-side OpenAI tool-call bridging should only be added if it can preserve a clear separation between the client agent runtime and Antigravity's own agent runtime.
-
-## Acknowledgements
-
-- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) for the dynamic plugin ABI and reference examples.
-- [Synara](https://github.com/Emanuele-web04/synara) for demonstrating a clean architecture where the official `agy` CLI remains responsible for Antigravity authentication, models, permissions, and runtime behavior. The implementation in this repository is independently written against the public CLI and CLIProxyAPI plugin interfaces.
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for licensing notes.
 
 ## Contributing
 

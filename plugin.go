@@ -106,24 +106,24 @@ type identifierResponse struct {
 }
 
 type modelRegistrationResponse struct {
-	Provider string
-	Models   []modelInfo
+	Provider string      `json:"Provider"`
+	Models   []modelInfo `json:"Models"`
 }
 
 type modelResponse struct {
-	Provider string
-	Models   []modelInfo
+	Provider string      `json:"Provider"`
+	Models   []modelInfo `json:"Models"`
 }
 
 type modelInfo struct {
-	ID                         string
-	Object                     string
-	OwnedBy                    string
-	DisplayName                string
-	Name                       string
-	Description                string
-	SupportedGenerationMethods []string
-	UserDefined                bool
+	ID                         string   `json:"ID"`
+	Object                     string   `json:"Object"`
+	OwnedBy                    string   `json:"OwnedBy"`
+	DisplayName                string   `json:"DisplayName"`
+	Name                       string   `json:"Name"`
+	Description                string   `json:"Description"`
+	SupportedGenerationMethods []string `json:"SupportedGenerationMethods"`
+	UserDefined                bool     `json:"UserDefined"`
 }
 
 type rpcExecutorRequest struct {
@@ -143,9 +143,9 @@ type rpcExecutorRequest struct {
 }
 
 type executorResponse struct {
-	Payload  []byte
-	Headers  http.Header
-	Metadata map[string]any
+	Payload  []byte         `json:"Payload"`
+	Headers  http.Header    `json:"Headers,omitempty"`
+	Metadata map[string]any `json:"Metadata,omitempty"`
 }
 
 type executorStreamResponse struct {
@@ -221,18 +221,26 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if strings.TrimSpace(req.StreamID) == "" {
 			return nil, pError("stream_unavailable", "CLIProxyAPI did not provide a plugin stream ID", 500)
 		}
-		if _, err := buildPrompt(req.Payload); err != nil {
+		cfg := currentConfig()
+		opts := resolveExecutionOptions(req, cfg)
+		if _, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir); err != nil {
 			return nil, err
 		}
 		go executeStream(req)
-		return okEnvelope(executorStreamResponse{Headers: http.Header{"Content-Type": []string{"text/event-stream"}}})
+		headers := http.Header{"Content-Type": []string{"text/event-stream"}}
+		if opts.ConversationID != "" {
+			headers.Set("X-AGY-Conversation-ID", opts.ConversationID)
+		}
+		return okEnvelope(executorStreamResponse{Headers: headers})
 
 	case methodExecutorCountTokens:
 		var req rpcExecutorRequest
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, pError("invalid_request", "could not decode count-tokens request: "+err.Error(), 400)
 		}
-		prompt, err := buildPrompt(req.Payload)
+		cfg := currentConfig()
+		opts := resolveExecutionOptions(req, cfg)
+		prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
 		if err != nil {
 			return nil, err
 		}
@@ -272,6 +280,7 @@ func pluginRegistration() registration {
 				{Name: "print_timeout", Type: "string", Description: "Antigravity print timeout, using Go/CLI duration syntax (default: 30m)."},
 				{Name: "dangerously_skip_permissions", Type: "boolean", Description: "Pass --dangerously-skip-permissions to agy. Disabled by default."},
 				{Name: "sandbox", Type: "boolean", Description: "Pass --sandbox to agy when supported by the installed CLI."},
+				{Name: "reasoning_effort", Type: "string", EnumValues: []string{"low", "medium", "high"}, Description: "Default reasoning effort for agy sessions (low, medium, high)."},
 			},
 		},
 		Capabilities: registrationCapability{

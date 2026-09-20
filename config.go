@@ -14,6 +14,7 @@ type pluginConfig struct {
 	PrintTimeout               string
 	DangerouslySkipPermissions bool
 	Sandbox                    bool
+	DefaultReasoningEffort     string
 }
 
 func defaultConfig() pluginConfig {
@@ -90,6 +91,12 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return pluginConfig{}, fmt.Errorf("line %d: sandbox must be true or false", lineNo+1)
 			}
 			cfg.Sandbox = parsed
+		case "reasoning_effort", "effort":
+			effort := normalizeEffort(value)
+			if effort == "" {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid reasoning_effort %q: must be low, medium, or high", lineNo+1, value)
+			}
+			cfg.DefaultReasoningEffort = effort
 		}
 	}
 
