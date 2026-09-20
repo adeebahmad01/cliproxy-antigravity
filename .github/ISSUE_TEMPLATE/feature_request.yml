@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose an improvement to the official-agy integration
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What limitation or workflow should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Architecture boundary
+      options:
+        - label: This proposal keeps authentication/service access inside the official `agy` CLI and does not require extracting OAuth/session tokens or calling private Antigravity endpoints.
+          required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security / permission impact
+      description: Describe any change to filesystem, command execution, permissions, networking, or multi-user behavior.

@@ -1,0 +1,24 @@
+# Go build outputs
+*.so
+*.dylib
+*.dll
+*.h
+*.a
+*.o
+*.exe
+
+# Test/build artifacts
+coverage.out
+coverage.html
+dist/
+bin/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local config
+.env
+.env.*

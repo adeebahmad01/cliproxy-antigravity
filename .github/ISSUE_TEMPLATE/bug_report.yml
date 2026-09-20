@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible problem with the plugin
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include Google credentials, OAuth tokens, CLIProxyAPI API keys, or other secrets.
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version / commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: cliproxy
+    attributes:
+      label: CLIProxyAPI version
+    validations:
+      required: true
+  - type: input
+    id: agy
+    attributes:
+      label: Antigravity CLI version
+      description: Output of the CLI version command, without account information.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant plugin configuration
+      description: Redact paths or values that reveal sensitive information.
+      render: yaml
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      description: Redact credentials, tokens, API keys, and personal data.
+    validations:
+      required: true
