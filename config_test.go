@@ -10,6 +10,7 @@ workdir: '/tmp/project'
 print_timeout: 12m
 dangerously_skip_permissions: true
 sandbox: false
+reasoning_effort: high
 store:
   version: 0.1.0
 `))
@@ -31,10 +32,19 @@ store:
 	if cfg.Sandbox {
 		t.Fatal("expected sandbox=false")
 	}
+	if cfg.DefaultReasoningEffort != "high" {
+		t.Fatalf("expected DefaultReasoningEffort 'high', got %q", cfg.DefaultReasoningEffort)
+	}
 }
 
 func TestParsePluginConfigRejectsBadTimeout(t *testing.T) {
 	if _, err := parsePluginConfig([]byte("print_timeout: forever\n")); err == nil {
 		t.Fatal("expected invalid timeout error")
+	}
+}
+
+func TestParsePluginConfigRejectsBadReasoningEffort(t *testing.T) {
+	if _, err := parsePluginConfig([]byte("reasoning_effort: extreme\n")); err == nil {
+		t.Fatal("expected invalid reasoning_effort error")
 	}
 }

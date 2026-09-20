@@ -35,9 +35,10 @@ type agyResult struct {
 }
 
 type agyStreamEvent struct {
-	Event      string `json:"event"`
-	Message    string `json:"message"`
-	StepUpdate struct {
+	Event          string `json:"event"`
+	Message        string `json:"message"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	StepUpdate     struct {
 		StepIndex int    `json:"step_index"`
 		StepType  string `json:"step_type"`
 		State     string `json:"state"`
@@ -50,6 +51,14 @@ type agyStreamEvent struct {
 	Response string   `json:"response"`
 	Error    string   `json:"error"`
 	Usage    agyUsage `json:"usage"`
+}
+
+type agyOptions struct {
+	NativeModel     string
+	OutputFormat    string
+	ConversationID  string
+	ReasoningEffort string
+	HasTools        bool
 }
 
 type processRegistry struct {
@@ -110,6 +119,61 @@ func invalidateModels() {
 	modelCatalog.Unlock()
 }
 
+func standardBuiltinModels() []modelInfo {
+	return []modelInfo{
+		{
+			ID:                         "agy/default",
+			Object:                     "model",
+			OwnedBy:                    "google-antigravity-cli",
+			DisplayName:                "Antigravity CLI (default model)",
+			Name:                       "default",
+			Description:                "Uses the default model selected by the installed official agy CLI.",
+			SupportedGenerationMethods: []string{"chat"},
+			UserDefined:                true,
+		},
+		{
+			ID:                         "gemini-3.8-flash-high",
+			Object:                     "model",
+			OwnedBy:                    "google-antigravity-cli",
+			DisplayName:                "Gemini 3.8 Flash (High)",
+			Name:                       "gemini-3.8-flash-high",
+			Description:                "Standard Gemini 3.8 Flash model with high thinking effort.",
+			SupportedGenerationMethods: []string{"chat"},
+			UserDefined:                true,
+		},
+		{
+			ID:                         "gemini-3.8-flash-medium",
+			Object:                     "model",
+			OwnedBy:                    "google-antigravity-cli",
+			DisplayName:                "Gemini 3.8 Flash (Medium)",
+			Name:                       "gemini-3.8-flash-medium",
+			Description:                "Standard Gemini 3.8 Flash model with medium thinking effort.",
+			SupportedGenerationMethods: []string{"chat"},
+			UserDefined:                true,
+		},
+		{
+			ID:                         "gemini-3.8-flash-low",
+			Object:                     "model",
+			OwnedBy:                    "google-antigravity-cli",
+			DisplayName:                "Gemini 3.8 Flash (Low)",
+			Name:                       "gemini-3.8-flash-low",
+			Description:                "Standard Gemini 3.8 Flash model with low thinking effort.",
+			SupportedGenerationMethods: []string{"chat"},
+			UserDefined:                true,
+		},
+		{
+			ID:                         "claude-3-7-sonnet-thought",
+			Object:                     "model",
+			OwnedBy:                    "google-antigravity-cli",
+			DisplayName:                "Claude 3.7 Sonnet (Thinking)",
+			Name:                       "claude-3-7-sonnet-thought",
+			Description:                "Claude 3.7 Sonnet Thinking model via Antigravity.",
+			SupportedGenerationMethods: []string{"chat"},
+			UserDefined:                true,
+		},
+	}
+}
+
 func discoverModels(cfg pluginConfig) []modelInfo {
 	modelCatalog.Lock()
 	defer modelCatalog.Unlock()
@@ -118,8 +182,17 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		return cloneModels(modelCatalog.models)
 	}
 
-	models := []modelInfo{defaultModelInfo()}
-	nativeByID := map[string]string{"agy/default": ""}
+	builtin := standardBuiltinModels()
+	models := append([]modelInfo(nil), builtin...)
+	nativeByID := map[string]string{
+		"agy/default":               "",
+		"antigravity/default":       "",
+		"default":                   "",
+		"gemini-3.8-flash-high":     "gemini-3.8-flash-high",
+		"gemini-3.8-flash-medium":   "gemini-3.8-flash-medium",
+		"gemini-3.8-flash-low":      "gemini-3.8-flash-low",
+		"claude-3-7-sonnet-thought": "claude-3-7-sonnet-thought",
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -133,9 +206,15 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 
 	if err := cmd.Run(); err == nil {
 		discovered, mapping := parseAgyModelLines(stdout.String())
-		models = append(models, discovered...)
+		for _, m := range discovered {
+			models = append(models, m)
+		}
 		for id, native := range mapping {
 			nativeByID[id] = native
+			// Also map unprefixed and antigravity/ prefixes
+			slug := strings.TrimPrefix(id, "agy/")
+			nativeByID[slug] = native
+			nativeByID["antigravity/"+slug] = native
 		}
 	}
 
@@ -261,23 +340,136 @@ func slugifyModelLabel(label string) string {
 }
 
 func resolveNativeModel(model string, cfg pluginConfig) string {
-	model = strings.TrimSpace(model)
-	if model == "" || model == "agy/default" || model == "default" {
+	cleanModel := strings.TrimSpace(model)
+	cleanModel = strings.TrimPrefix(cleanModel, "antigravity/")
+	cleanModel = strings.TrimPrefix(cleanModel, "agy/")
+
+	if cleanModel == "" || cleanModel == "default" {
 		return ""
 	}
 
-	// Refreshes the cached map if needed. Discovery is deliberately best-effort.
 	_ = discoverModels(cfg)
 	modelCatalog.Lock()
-	native := modelCatalog.nativeByID[model]
-	modelCatalog.Unlock()
-	if native != "" {
+	defer modelCatalog.Unlock()
+
+	if native, ok := modelCatalog.nativeByID[cleanModel]; ok && native != "" {
 		return native
 	}
-	return strings.TrimPrefix(model, "agy/")
+	if native, ok := modelCatalog.nativeByID["agy/"+cleanModel]; ok && native != "" {
+		return native
+	}
+	return cleanModel
 }
 
-func agyArgs(cfg pluginConfig, nativeModel, outputFormat, prompt string) []string {
+func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOptions {
+	var chatReq chatCompletionRequest
+	_ = json.Unmarshal(req.Payload, &chatReq)
+
+	requestedModel := strings.TrimSpace(req.Model)
+	if requestedModel == "" {
+		requestedModel = strings.TrimSpace(chatReq.Model)
+	}
+
+	effort := ""
+	// 1. Check explicit model suffix :low, :medium, :high
+	for _, suffix := range []string{":low", ":medium", ":high"} {
+		if strings.HasSuffix(strings.ToLower(requestedModel), suffix) {
+			effort = strings.TrimPrefix(suffix, ":")
+			requestedModel = requestedModel[:len(requestedModel)-len(suffix)]
+			break
+		}
+	}
+
+	// 2. Check chatReq.ReasoningEffort
+	if effort == "" && chatReq.ReasoningEffort != "" {
+		effort = normalizeEffort(chatReq.ReasoningEffort)
+	}
+
+	// 3. Check headers
+	if effort == "" && req.Headers != nil {
+		if val := req.Headers.Get("X-AGY-Effort"); val != "" {
+			effort = normalizeEffort(val)
+		} else if val := req.Headers.Get("X-Reasoning-Effort"); val != "" {
+			effort = normalizeEffort(val)
+		}
+	}
+
+	// 4. Check metadata
+	if effort == "" && req.Metadata != nil {
+		if val, ok := req.Metadata["reasoning_effort"].(string); ok && val != "" {
+			effort = normalizeEffort(val)
+		} else if val, ok := req.Metadata["effort"].(string); ok && val != "" {
+			effort = normalizeEffort(val)
+		}
+	}
+
+	// 5. Implicit effort from model names like gemini-3.8-flash-low / medium / high
+	if effort == "" {
+		lowerModel := strings.ToLower(requestedModel)
+		switch {
+		case strings.HasSuffix(lowerModel, "-low"):
+			effort = "low"
+		case strings.HasSuffix(lowerModel, "-medium"):
+			effort = "medium"
+		case strings.HasSuffix(lowerModel, "-high"):
+			effort = "high"
+		}
+	}
+
+	// 6. Fall back to config default if specified
+	if effort == "" && cfg.DefaultReasoningEffort != "" {
+		effort = cfg.DefaultReasoningEffort
+	}
+
+	// Conversation ID
+	convID := strings.TrimSpace(chatReq.ConversationID)
+	if convID == "" {
+		convID = strings.TrimSpace(chatReq.SessionID)
+	}
+	if convID == "" && req.Headers != nil {
+		if val := req.Headers.Get("X-AGY-Conversation-ID"); val != "" {
+			convID = strings.TrimSpace(val)
+		} else if val := req.Headers.Get("X-Conversation-ID"); val != "" {
+			convID = strings.TrimSpace(val)
+		} else if val := req.Headers.Get("Conversation-ID"); val != "" {
+			convID = strings.TrimSpace(val)
+		}
+	}
+	if convID == "" && req.Metadata != nil {
+		if val, ok := req.Metadata["conversation_id"].(string); ok && val != "" {
+			convID = strings.TrimSpace(val)
+		} else if val, ok := req.Metadata["agy_conversation_id"].(string); ok && val != "" {
+			convID = strings.TrimSpace(val)
+		} else if val, ok := req.Metadata["session_id"].(string); ok && val != "" {
+			convID = strings.TrimSpace(val)
+		}
+	}
+
+	nativeModel := resolveNativeModel(requestedModel, cfg)
+
+	return agyOptions{
+		NativeModel:     nativeModel,
+		ConversationID:  convID,
+		ReasoningEffort: effort,
+		HasTools:        len(chatReq.Tools) > 0,
+	}
+}
+
+func normalizeEffort(s string) string {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	switch lower {
+	case "low", "medium", "high":
+		return lower
+	default:
+		return ""
+	}
+}
+
+func agyArgs(cfg pluginConfig, opts agyOptions) []string {
+	outputFormat := opts.OutputFormat
+	if outputFormat == "" {
+		outputFormat = "json"
+	}
 	args := []string{"--output-format", outputFormat, "--print-timeout", cfg.PrintTimeout}
 	if cfg.DangerouslySkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
@@ -285,10 +477,15 @@ func agyArgs(cfg pluginConfig, nativeModel, outputFormat, prompt string) []strin
 	if cfg.Sandbox {
 		args = append(args, "--sandbox")
 	}
-	if strings.TrimSpace(nativeModel) != "" {
-		args = append(args, "--model", nativeModel)
+	if strings.TrimSpace(opts.NativeModel) != "" {
+		args = append(args, "--model", opts.NativeModel)
 	}
-	args = append(args, "-p", prompt)
+	if strings.TrimSpace(opts.ConversationID) != "" {
+		args = append(args, "--conversation", strings.TrimSpace(opts.ConversationID))
+	}
+	if strings.TrimSpace(opts.ReasoningEffort) != "" {
+		args = append(args, "--effort", strings.TrimSpace(opts.ReasoningEffort))
+	}
 	return args
 }
 
@@ -300,19 +497,21 @@ func commandTimeout(cfg pluginConfig) time.Duration {
 	return d + 30*time.Second
 }
 
-func newAgyCommand(ctx context.Context, cfg pluginConfig, nativeModel, outputFormat, prompt string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, cfg.BinaryPath, agyArgs(cfg, nativeModel, outputFormat, prompt)...)
+func newAgyCommand(ctx context.Context, cfg pluginConfig, opts agyOptions, prompt string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, cfg.BinaryPath, agyArgs(cfg, opts)...)
 	if cfg.Workdir != "" {
 		cmd.Dir = cfg.Workdir
 	}
+	cmd.Stdin = strings.NewReader(prompt)
 	return cmd
 }
 
-func runAgyJSON(cfg pluginConfig, nativeModel, prompt string) (agyResult, string, error) {
+func runAgyJSON(cfg pluginConfig, opts agyOptions, prompt string) (agyResult, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(cfg))
 	defer cancel()
 
-	cmd := newAgyCommand(ctx, cfg, nativeModel, "json", prompt)
+	opts.OutputFormat = "json"
+	cmd := newAgyCommand(ctx, cfg, opts, prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -404,13 +603,13 @@ func nonEmpty(value, fallback string) string {
 }
 
 func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
-	prompt, err := buildPrompt(req.Payload)
+	cfg := currentConfig()
+	opts := resolveExecutionOptions(req, cfg)
+	prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
 	if err != nil {
 		return executorResponse{}, err
 	}
-	cfg := currentConfig()
-	nativeModel := resolveNativeModel(req.Model, cfg)
-	result, _, err := runAgyJSON(cfg, nativeModel, prompt)
+	result, _, err := runAgyJSON(cfg, opts, prompt)
 	if err != nil {
 		return executorResponse{}, err
 	}
@@ -435,17 +634,19 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 
 func executeStream(req rpcExecutorRequest) {
 	streamID := req.StreamID
-	prompt, err := buildPrompt(req.Payload)
+	cfg := currentConfig()
+	opts := resolveExecutionOptions(req, cfg)
+	opts.OutputFormat = "stream-json"
+
+	prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
 	if err != nil {
 		closePluginStream(streamID, err.Error())
 		return
 	}
-	cfg := currentConfig()
-	nativeModel := resolveNativeModel(req.Model, cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(cfg))
 	defer cancel()
-	cmd := newAgyCommand(ctx, cfg, nativeModel, "stream-json", prompt)
+	cmd := newAgyCommand(ctx, cfg, opts, prompt)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		closePluginStream(streamID, err.Error())
@@ -463,7 +664,9 @@ func executeStream(req rpcExecutorRequest) {
 	completionID := newCompletionID()
 	created := time.Now().Unix()
 	model := displayModel(req.Model)
-	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"role": "assistant"}, nil, nil)); err != nil {
+	conversationID := opts.ConversationID
+
+	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"role": "assistant"}, nil, nil, conversationID)); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return
@@ -474,6 +677,7 @@ func executeStream(req rpcExecutorRequest) {
 	var terminal *agyResult
 	var streamError string
 	var streamedText strings.Builder
+	isToolCallStream := false
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -486,20 +690,37 @@ func executeStream(req rpcExecutorRequest) {
 		}
 
 		switch event.Event {
+		case "init":
+			if event.ConversationID != "" {
+				conversationID = event.ConversationID
+			}
 		case "step_update":
 			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 				streamedText.WriteString(event.StepUpdate.TextDelta)
-				payload := makeSSEChunk(completionID, created, model, map[string]any{"content": event.StepUpdate.TextDelta}, nil, nil)
-				if err := emitPluginStreamChunk(streamID, payload); err != nil {
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					return
+				trimmedSoFar := strings.TrimSpace(streamedText.String())
+
+				// If tools are configured and response looks like a tool call, buffer instead of streaming raw text
+				if opts.HasTools && (strings.HasPrefix(trimmedSoFar, "```tool_calls") || strings.HasPrefix(trimmedSoFar, "```json") || strings.HasPrefix(trimmedSoFar, "[")) {
+					isToolCallStream = true
+					continue
+				}
+
+				if !isToolCallStream {
+					payload := makeSSEChunk(completionID, created, model, map[string]any{"content": event.StepUpdate.TextDelta}, nil, nil, conversationID)
+					if err := emitPluginStreamChunk(streamID, payload); err != nil {
+						_ = cmd.Process.Kill()
+						_ = cmd.Wait()
+						return
+					}
 				}
 			}
 		case "result":
 			if event.Result != nil {
 				copyResult := *event.Result
 				terminal = &copyResult
+				if copyResult.ConversationID != "" {
+					conversationID = copyResult.ConversationID
+				}
 			}
 		case "error":
 			streamError = strings.TrimSpace(event.Message)
@@ -508,7 +729,10 @@ func executeStream(req rpcExecutorRequest) {
 			}
 		default:
 			if event.Status != "" {
-				terminal = &agyResult{Status: event.Status, Response: event.Response, Error: event.Error, Usage: event.Usage}
+				terminal = &agyResult{Status: event.Status, Response: event.Response, Error: event.Error, Usage: event.Usage, ConversationID: event.ConversationID}
+				if event.ConversationID != "" {
+					conversationID = event.ConversationID
+				}
 			}
 		}
 	}
@@ -544,18 +768,47 @@ func executeStream(req rpcExecutorRequest) {
 		return
 	}
 
-	if streamedText.Len() == 0 && terminal.Response != "" {
-		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"content": terminal.Response}, nil, nil)); err != nil {
+	fullResponse := terminal.Response
+	if fullResponse == "" {
+		fullResponse = streamedText.String()
+	}
+
+	toolCalls, isToolCall := extractToolCalls(fullResponse)
+	if opts.HasTools && isToolCall {
+		// Emit tool_calls delta chunk
+		toolDelta := makeSSEChunk(completionID, created, model, map[string]any{
+			"tool_calls": toolCalls,
+		}, nil, nil, conversationID)
+		_ = emitPluginStreamChunk(streamID, toolDelta)
+
+		finishReason := "tool_calls"
+		var finalUsage map[string]any
+		if requestWantsUsage(req.Payload) {
+			finalUsage = openAIUsage(terminal.Usage)
+		}
+		finalPayload := makeSSEChunk(completionID, created, model, map[string]any{}, &finishReason, finalUsage, conversationID)
+		_ = emitPluginStreamChunk(streamID, finalPayload)
+		_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
+		closePluginStream(streamID, "")
+		return
+	}
+
+	// If it was buffered thinking it was a tool call but turned out not to be
+	if isToolCallStream && streamedText.Len() > 0 {
+		payload := makeSSEChunk(completionID, created, model, map[string]any{"content": streamedText.String()}, nil, nil, conversationID)
+		_ = emitPluginStreamChunk(streamID, payload)
+	} else if streamedText.Len() == 0 && terminal.Response != "" {
+		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"content": terminal.Response}, nil, nil, conversationID)); err != nil {
 			return
 		}
 	}
 
 	finish := "stop"
-	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, &finish, nil)); err != nil {
+	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, &finish, nil, conversationID)); err != nil {
 		return
 	}
 	if requestWantsUsage(req.Payload) {
-		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, nil, openAIUsage(terminal.Usage))); err != nil {
+		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, nil, openAIUsage(terminal.Usage), conversationID)); err != nil {
 			return
 		}
 	}
