@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +44,43 @@ func currentConfig() pluginConfig {
 	return configState.value
 }
 
+func validateBinaryPath(path string) error {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return fmt.Errorf("binary_path cannot be empty")
+	}
+	if strings.ContainsAny(trimmed, ";|&$`\n\r<>") {
+		return fmt.Errorf("security violation: binary_path contains illegal shell metacharacters: %q", path)
+	}
+
+	base := strings.ToLower(filepath.Base(strings.ReplaceAll(trimmed, "\\", "/")))
+	base = strings.TrimSuffix(base, ".exe")
+	base = strings.TrimSuffix(base, ".cmd")
+	base = strings.TrimSuffix(base, ".bat")
+	if base != "agy" && base != "antigravity" {
+		return fmt.Errorf("security policy violation: binary_path must be an 'agy' or 'antigravity' executable, got %q", filepath.Base(trimmed))
+	}
+	return nil
+}
+
+func validateWorkdir(dir string) (string, error) {
+	trimmed := strings.TrimSpace(dir)
+	if trimmed == "" {
+		return "", nil
+	}
+	clean := filepath.Clean(trimmed)
+	abs, err := filepath.Abs(clean)
+	if err != nil {
+		return "", fmt.Errorf("invalid workdir path: %w", err)
+	}
+	if stat, err := os.Stat(abs); err == nil {
+		if !stat.IsDir() {
+			return "", fmt.Errorf("workdir is not a directory: %s", abs)
+		}
+	}
+	return abs, nil
+}
+
 func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	cfg := defaultConfig()
 	if len(raw) == 0 {
@@ -67,10 +106,17 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		switch key {
 		case "binary_path":
 			if value != "" {
+				if err := validateBinaryPath(value); err != nil {
+					return pluginConfig{}, fmt.Errorf("line %d: %w", lineNo+1, err)
+				}
 				cfg.BinaryPath = value
 			}
 		case "workdir":
-			cfg.Workdir = value
+			cleaned, err := validateWorkdir(value)
+			if err != nil {
+				return pluginConfig{}, fmt.Errorf("line %d: %w", lineNo+1, err)
+			}
+			cfg.Workdir = cleaned
 		case "print_timeout":
 			if value == "" {
 				continue
@@ -100,8 +146,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		}
 	}
 
-	if strings.TrimSpace(cfg.BinaryPath) == "" {
-		return pluginConfig{}, fmt.Errorf("binary_path cannot be empty")
+	if err := validateBinaryPath(cfg.BinaryPath); err != nil {
+		return pluginConfig{}, err
 	}
 	return cfg, nil
 }

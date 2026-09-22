@@ -1,25 +1,37 @@
 BINARY := cliproxy-antigravity
-VERSION ?= 0.1.1
+VERSION ?= 0.1.2
 DIST ?= dist
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-ifeq ($(UNAME_S),Darwin)
-EXT := dylib
-GOOS := darwin
+ifeq ($(GOOS),)
+  ifeq ($(UNAME_S),Darwin)
+    GOOS := darwin
+    EXT := dylib
+  else
+    GOOS := linux
+    EXT := so
+  endif
 else
-EXT := so
-GOOS := linux
+  ifeq ($(GOOS),windows)
+    EXT := dll
+  else ifeq ($(GOOS),darwin)
+    EXT := dylib
+  else
+    EXT := so
+  endif
 endif
 
-ifeq ($(UNAME_M),x86_64)
-GOARCH := amd64
-else ifeq ($(UNAME_M),aarch64)
-GOARCH := arm64
-else ifeq ($(UNAME_M),arm64)
-GOARCH := arm64
-else
-GOARCH := $(shell go env GOARCH)
+ifeq ($(GOARCH),)
+  ifeq ($(UNAME_M),x86_64)
+    GOARCH := amd64
+  else ifeq ($(UNAME_M),aarch64)
+    GOARCH := arm64
+  else ifeq ($(UNAME_M),arm64)
+    GOARCH := arm64
+  else
+    GOARCH := $(shell go env GOARCH)
+  endif
 endif
 
 .PHONY: fmt test build smoke clean package

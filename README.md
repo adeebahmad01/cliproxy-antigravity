@@ -50,12 +50,17 @@ Google Antigravity
 
 The plugin registers under the provider key **`agy`**, and supports requests addressed to `agy/*`, `antigravity/*`, or unprefixed models.
 
-## Requirements
+## Requirements & Platform Support
 
 - A recent CLIProxyAPI build with standard dynamic-library plugin support enabled
-- The official Antigravity CLI installed and available as `agy`, or its path configured with `binary_path`
+- The official Antigravity CLI installed and available as `agy` (or `agy.exe` on Windows), or configured via `binary_path`
 - An authenticated Antigravity CLI session (`agy` should work normally before using the plugin)
-- Prebuilt release binaries or Go 1.23+ with a C compiler to build from source
+- Precompiled binary release assets are provided for all tier-1 supported operating systems:
+  - **Linux**: `linux_amd64.zip`, `linux_arm64.zip` (`.so`)
+  - **macOS / Darwin**: `darwin_arm64.zip`, `darwin_amd64.zip` (`.dylib`)
+  - **Windows**: `windows_amd64.zip` (`.dll`)
+
+See [SECURITY.md](SECURITY.md) for full details on process lifecycle management, process group isolation, and execution sandboxing.
 
 CLIProxyAPI's Linux `no-plugin` build cannot load dynamic-library plugins.
 

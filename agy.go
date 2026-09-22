@@ -94,9 +94,7 @@ func (r *processRegistry) killAll() {
 	}
 	r.Unlock()
 	for _, cmd := range cmds {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		killProcessTree(cmd)
 	}
 }
 
@@ -194,27 +192,33 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		"claude-3-7-sonnet-thought": "claude-3-7-sonnet-thought",
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, cfg.BinaryPath, "models")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if cfg.Workdir != "" {
-		cmd.Dir = cfg.Workdir
-	}
-
-	if err := cmd.Run(); err == nil {
-		discovered, mapping := parseAgyModelLines(stdout.String())
-		for _, m := range discovered {
-			models = append(models, m)
+	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, cfg.BinaryPath, "models")
+		configureSysProcAttr(cmd)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if cfg.Workdir != "" {
+			cmd.Dir = cfg.Workdir
 		}
-		for id, native := range mapping {
-			nativeByID[id] = native
-			// Also map unprefixed and antigravity/ prefixes
-			slug := strings.TrimPrefix(id, "agy/")
-			nativeByID[slug] = native
-			nativeByID["antigravity/"+slug] = native
+
+		if err := cmd.Start(); err == nil {
+			activeProcesses.add(cmd)
+			_ = cmd.Wait()
+			activeProcesses.remove(cmd)
+			discovered, mapping := parseAgyModelLines(stdout.String())
+			for _, m := range discovered {
+				models = append(models, m)
+			}
+			for id, native := range mapping {
+				nativeByID[id] = native
+				// Also map unprefixed and antigravity/ prefixes
+				slug := strings.TrimPrefix(id, "agy/")
+				nativeByID[slug] = native
+				nativeByID["antigravity/"+slug] = native
+			}
 		}
 	}
 
@@ -497,13 +501,17 @@ func commandTimeout(cfg pluginConfig) time.Duration {
 	return d + 30*time.Second
 }
 
-func newAgyCommand(ctx context.Context, cfg pluginConfig, opts agyOptions, prompt string) *exec.Cmd {
+func newAgyCommand(ctx context.Context, cfg pluginConfig, opts agyOptions, prompt string) (*exec.Cmd, error) {
+	if err := validateBinaryPath(cfg.BinaryPath); err != nil {
+		return nil, pError("invalid_binary", err.Error(), http.StatusBadRequest)
+	}
 	cmd := exec.CommandContext(ctx, cfg.BinaryPath, agyArgs(cfg, opts)...)
 	if cfg.Workdir != "" {
 		cmd.Dir = cfg.Workdir
 	}
+	configureSysProcAttr(cmd)
 	cmd.Stdin = strings.NewReader(prompt)
-	return cmd
+	return cmd, nil
 }
 
 func runAgyJSON(cfg pluginConfig, opts agyOptions, prompt string) (agyResult, string, error) {
@@ -511,7 +519,10 @@ func runAgyJSON(cfg pluginConfig, opts agyOptions, prompt string) (agyResult, st
 	defer cancel()
 
 	opts.OutputFormat = "json"
-	cmd := newAgyCommand(ctx, cfg, opts, prompt)
+	cmd, err := newAgyCommand(ctx, cfg, opts, prompt)
+	if err != nil {
+		return agyResult{}, "", err
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -646,7 +657,11 @@ func executeStream(req rpcExecutorRequest) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(cfg))
 	defer cancel()
-	cmd := newAgyCommand(ctx, cfg, opts, prompt)
+	cmd, err := newAgyCommand(ctx, cfg, opts, prompt)
+	if err != nil {
+		closePluginStream(streamID, err.Error())
+		return
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		closePluginStream(streamID, err.Error())
@@ -667,7 +682,7 @@ func executeStream(req rpcExecutorRequest) {
 	conversationID := opts.ConversationID
 
 	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"role": "assistant"}, nil, nil, conversationID)); err != nil {
-		_ = cmd.Process.Kill()
+		killProcessTree(cmd)
 		_ = cmd.Wait()
 		return
 	}
@@ -708,7 +723,7 @@ func executeStream(req rpcExecutorRequest) {
 				if !isToolCallStream {
 					payload := makeSSEChunk(completionID, created, model, map[string]any{"content": event.StepUpdate.TextDelta}, nil, nil, conversationID)
 					if err := emitPluginStreamChunk(streamID, payload); err != nil {
-						_ = cmd.Process.Kill()
+						killProcessTree(cmd)
 						_ = cmd.Wait()
 						return
 					}

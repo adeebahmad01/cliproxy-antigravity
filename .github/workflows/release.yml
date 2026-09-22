@@ -50,6 +50,12 @@ jobs:
             goos: darwin
             goarch: amd64
             ext: dylib
+          - os: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            ext: dll
+            cc: x86_64-w64-mingw32-gcc
+            extra_apt: gcc-mingw-w64-x86-64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +75,7 @@ jobs:
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="0.1.0"
+            VERSION="0.1.2"
           fi
           mkdir -p dist
           LIB_NAME="${PLUGIN_ID}.${{ matrix.ext }}"

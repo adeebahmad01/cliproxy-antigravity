@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.2] - 2026-09-22
+
+### Added
+
+- Full-platform build matrix: precompiled Windows binary releases (`windows_amd64.zip` / `cliproxy-antigravity.dll`) alongside Linux (`amd64`, `arm64`) and macOS (`amd64`, `arm64`).
+- Strict security hardening and process isolation:
+  - Process group lifecycle management (`Setpgid: true` on Unix, `CREATE_NEW_PROCESS_GROUP` on Windows) and Go 1.23+ `cmd.Cancel` hooks ensuring immediate termination of entire process trees upon context timeout or disconnect.
+  - Binary allowlist validation: strictly validates `binary_path` against `agy` / `antigravity` executables, preventing arbitrary command invocation and PATH manipulation.
+  - Path traversal and filesystem guardrails for configured `workdir`.
+  - Added dedicated [SECURITY.md](SECURITY.md) covering the plugin's process sandboxing architecture, threat model, and vulnerability reporting.
+
 ## [0.1.1] - 2026-09-20
 
 ### Added

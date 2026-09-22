@@ -48,3 +48,38 @@ func TestParsePluginConfigRejectsBadReasoningEffort(t *testing.T) {
 		t.Fatal("expected invalid reasoning_effort error")
 	}
 }
+
+func TestParsePluginConfigSecurityValidations(t *testing.T) {
+	// Rejects arbitrary non-agy executables
+	badBinaries := []string{
+		"/bin/sh",
+		"/usr/bin/bash",
+		"cmd.exe",
+		"powershell.exe",
+		"curl",
+		"/usr/bin/python3",
+		"agy; rm -rf /",
+		"agy && whoami",
+		"agy | cat",
+	}
+	for _, bad := range badBinaries {
+		if _, err := parsePluginConfig([]byte("binary_path: " + bad + "\n")); err == nil {
+			t.Fatalf("expected security violation for binary_path %q, but got nil error", bad)
+		}
+	}
+
+	// Accepts valid agy binaries and variants
+	goodBinaries := []string{
+		"agy",
+		"antigravity",
+		"/usr/local/bin/agy",
+		"/opt/google/antigravity",
+		"C:\\Program Files\\Google\\agy.exe",
+		"C:\\Tools\\antigravity.exe",
+	}
+	for _, good := range goodBinaries {
+		if _, err := parsePluginConfig([]byte("binary_path: " + good + "\n")); err != nil {
+			t.Fatalf("expected binary_path %q to be allowed, got error: %v", good, err)
+		}
+	}
+}
