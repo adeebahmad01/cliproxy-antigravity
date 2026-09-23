@@ -227,12 +227,13 @@ When resuming an existing session, the plugin only sends the new turn to `agy`, 
 
 ### Reasoning Effort
 
-Reasoning effort can be set in four ways:
+Reasoning effort can be configured via:
 
-1. Model name alias: `"model": "gemini-3.8-flash-high"` or `"gemini-3.8-flash-low"`
-2. Suffix: `"model": "agy/default:high"`
-3. Request body: `"reasoning_effort": "high"`
-4. Request header: `X-AGY-Effort: high`
+1. **Embedded Model Suffix**: Selecting models like `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, or `gemini-3.8-flash-low` automatically splits the last part (`high`, `medium`, `low`) into reasoning effort and routes to the clean base model (`gemini-3.8-flash`).
+2. **Base Model Selection**: Selecting clean base models directly (e.g. `agy/gemini-3.8-flash`, `agy/gemini-3.1-pro`, `agy/gpt-oss-120b`) and configuring reasoning effort via UI selectors or request body (`"reasoning_effort": "low" | "medium" | "high"`).
+3. **Explicit Colon Override**: Colon suffixes such as `agy/gemini-3.8-flash:high` or `agy/default:high`.
+4. **Headers & Metadata**: Request headers (`X-AGY-Effort`, `X-Reasoning-Effort`) or metadata fields.
+5. **Intelligent Fallbacks**: If no effort is specified for models requiring an effort flag, sensible defaults (such as `high` for Gemini and `medium` for GPT-OSS) are applied automatically, while models that do not support reasoning effort (such as Claude) safely omit the flag.
 
 ## How requests are executed
 
