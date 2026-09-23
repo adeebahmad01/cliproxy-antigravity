@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.3] - 2026-09-23
+
+### Added
+
+- Human-readable model display names: automatically formats and humanizes model IDs (e.g. `Gemini 3.8 Flash`, `Claude 3.7 Sonnet`, `GPT-OSS 120B`) across both built-in static models and dynamically discovered `agy models`.
+- Suffix-based reasoning effort splitting: automatically extracts `-high`, `-medium`, `-low` suffixes from model request names and maps them to `--effort` while routing to the clean base model name.
+- Explicit base model support: enables selecting clean base model IDs (such as `agy/gemini-3.8-flash`) while specifying reasoning effort independently via request body, headers (`X-AGY-Effort`), or colon notation (`agy/default:high`).
+- Intelligent reasoning effort fallbacks: automatically applies default reasoning effort (e.g. `high` for Gemini, `medium` for GPT-OSS) for models requiring an effort flag, while omitting `--effort` for models that do not support reasoning effort (e.g. Claude).
+
 ## [0.1.2] - 2026-09-22
 
 ### Added
