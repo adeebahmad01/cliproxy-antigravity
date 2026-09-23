@@ -130,6 +130,16 @@ func standardBuiltinModels() []modelInfo {
 			UserDefined:                true,
 		},
 		{
+			ID:                         "gemini-3.8-flash",
+			Object:                     "model",
+			OwnedBy:                    "google-antigravity-cli",
+			DisplayName:                "Gemini 3.8 Flash",
+			Name:                       "gemini-3.8-flash",
+			Description:                "Standard Gemini 3.8 Flash model with configurable reasoning effort.",
+			SupportedGenerationMethods: []string{"chat"},
+			UserDefined:                true,
+		},
+		{
 			ID:                         "gemini-3.8-flash-high",
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
@@ -186,6 +196,7 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		"agy/default":               "",
 		"antigravity/default":       "",
 		"default":                   "",
+		"gemini-3.8-flash":          "gemini-3.8-flash",
 		"gemini-3.8-flash-high":     "gemini-3.8-flash-high",
 		"gemini-3.8-flash-medium":   "gemini-3.8-flash-medium",
 		"gemini-3.8-flash-low":      "gemini-3.8-flash-low",
@@ -218,6 +229,14 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 				slug := strings.TrimPrefix(id, "agy/")
 				nativeByID[slug] = native
 				nativeByID["antigravity/"+slug] = native
+
+				baseSlug := stripEffortSuffix(slug)
+				if baseSlug != slug {
+					baseNative := stripEffortSuffix(native)
+					nativeByID[baseSlug] = baseNative
+					nativeByID["agy/"+baseSlug] = baseNative
+					nativeByID["antigravity/"+baseSlug] = baseNative
+				}
 			}
 		}
 	}
@@ -286,20 +305,38 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 		}
 
 		id := "agy/" + slug
-		if _, exists := byID[id]; exists {
-			continue
+		if _, exists := byID[id]; !exists {
+			byID[id] = modelInfo{
+				ID:                         id,
+				Object:                     "model",
+				OwnedBy:                    "google-antigravity-cli",
+				DisplayName:                label,
+				Name:                       native,
+				Description:                "Discovered from the installed official agy CLI.",
+				SupportedGenerationMethods: []string{"chat"},
+				UserDefined:                true,
+			}
+			nativeByID[id] = native
 		}
-		byID[id] = modelInfo{
-			ID:                         id,
-			Object:                     "model",
-			OwnedBy:                    "google-antigravity-cli",
-			DisplayName:                label,
-			Name:                       native,
-			Description:                "Discovered from the installed official agy CLI.",
-			SupportedGenerationMethods: []string{"chat"},
-			UserDefined:                true,
+
+		baseSlug := stripEffortSuffix(slug)
+		if baseSlug != slug {
+			baseID := "agy/" + baseSlug
+			if _, exists := byID[baseID]; !exists {
+				baseLabel := stripEffortLabel(label)
+				byID[baseID] = modelInfo{
+					ID:                         baseID,
+					Object:                     "model",
+					OwnedBy:                    "google-antigravity-cli",
+					DisplayName:                baseLabel,
+					Name:                       baseSlug,
+					Description:                "Discovered from the installed official agy CLI with configurable reasoning effort.",
+					SupportedGenerationMethods: []string{"chat"},
+					UserDefined:                true,
+				}
+				nativeByID[baseID] = baseSlug
+			}
 		}
-		nativeByID[id] = native
 	}
 
 	ids := make([]string, 0, len(byID))
@@ -365,6 +402,72 @@ func resolveNativeModel(model string, cfg pluginConfig) string {
 	return cleanModel
 }
 
+func stripEffortLabel(label string) string {
+	cleaned := strings.TrimSpace(label)
+	for _, suffix := range []string{"(High)", "(Medium)", "(Med)", "(Low)", "(high)", "(medium)", "(med)", "(low)"} {
+		if strings.HasSuffix(cleaned, suffix) {
+			return strings.TrimSpace(strings.TrimSuffix(cleaned, suffix))
+		}
+	}
+	return cleaned
+}
+
+func extractEffortSuffix(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasSuffix(lower, "-low"):
+		return "low"
+	case strings.HasSuffix(lower, "-medium"), strings.HasSuffix(lower, "-med"):
+		return "medium"
+	case strings.HasSuffix(lower, "-high"):
+		return "high"
+	default:
+		return ""
+	}
+}
+
+func stripEffortSuffix(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasSuffix(lower, "-low"):
+		return strings.TrimSpace(model[:len(model)-4])
+	case strings.HasSuffix(lower, "-medium"):
+		return strings.TrimSpace(model[:len(model)-7])
+	case strings.HasSuffix(lower, "-med"):
+		return strings.TrimSpace(model[:len(model)-4])
+	case strings.HasSuffix(lower, "-high"):
+		return strings.TrimSpace(model[:len(model)-5])
+	default:
+		return strings.TrimSpace(model)
+	}
+}
+
+func supportsEffort(model string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	lower = strings.TrimPrefix(lower, "antigravity/")
+	lower = strings.TrimPrefix(lower, "agy/")
+	if lower == "" || lower == "default" {
+		return true
+	}
+	if strings.HasPrefix(lower, "claude-") {
+		return false
+	}
+	return true
+}
+
+func defaultEffortForModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	lower = strings.TrimPrefix(lower, "antigravity/")
+	lower = strings.TrimPrefix(lower, "agy/")
+	if strings.HasPrefix(lower, "gpt-oss-") {
+		return "medium"
+	}
+	if strings.HasPrefix(lower, "gemini-") {
+		return "high"
+	}
+	return ""
+}
+
 func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOptions {
 	var chatReq chatCompletionRequest
 	_ = json.Unmarshal(req.Payload, &chatReq)
@@ -375,21 +478,31 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 	}
 
 	effort := ""
-	// 1. Check explicit model suffix :low, :medium, :high
-	for _, suffix := range []string{":low", ":medium", ":high"} {
+	// 1. Check explicit model colon suffix override :low, :medium, :med, :high (e.g. model:high)
+	for _, suffix := range []string{":low", ":medium", ":med", ":high"} {
 		if strings.HasSuffix(strings.ToLower(requestedModel), suffix) {
-			effort = strings.TrimPrefix(suffix, ":")
-			requestedModel = requestedModel[:len(requestedModel)-len(suffix)]
+			effort = normalizeEffort(strings.TrimPrefix(suffix, ":"))
+			requestedModel = strings.TrimSpace(requestedModel[:len(requestedModel)-len(suffix)])
 			break
 		}
 	}
 
-	// 2. Check chatReq.ReasoningEffort
+	// 2. Split model name: if model has a reasoning effort suffix (e.g. -high, -medium, -low),
+	// split the last part into reasoning effort and strip it to the base model name.
+	modelEffort := extractEffortSuffix(requestedModel)
+	if modelEffort != "" {
+		if effort == "" {
+			effort = modelEffort
+		}
+		requestedModel = stripEffortSuffix(requestedModel)
+	}
+
+	// 3. Fallback: Check chatReq.ReasoningEffort from request payload
 	if effort == "" && chatReq.ReasoningEffort != "" {
 		effort = normalizeEffort(chatReq.ReasoningEffort)
 	}
 
-	// 3. Check headers
+	// 4. Fallback: Check request headers (X-AGY-Effort, X-Reasoning-Effort)
 	if effort == "" && req.Headers != nil {
 		if val := req.Headers.Get("X-AGY-Effort"); val != "" {
 			effort = normalizeEffort(val)
@@ -398,7 +511,7 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		}
 	}
 
-	// 4. Check metadata
+	// 5. Fallback: Check request metadata (reasoning_effort, effort)
 	if effort == "" && req.Metadata != nil {
 		if val, ok := req.Metadata["reasoning_effort"].(string); ok && val != "" {
 			effort = normalizeEffort(val)
@@ -407,22 +520,19 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		}
 	}
 
-	// 5. Implicit effort from model names like gemini-3.8-flash-low / medium / high
-	if effort == "" {
-		lowerModel := strings.ToLower(requestedModel)
-		switch {
-		case strings.HasSuffix(lowerModel, "-low"):
-			effort = "low"
-		case strings.HasSuffix(lowerModel, "-medium"):
-			effort = "medium"
-		case strings.HasSuffix(lowerModel, "-high"):
-			effort = "high"
-		}
-	}
-
-	// 6. Fall back to config default if specified
+	// 6. Fallback: Check config default if specified
 	if effort == "" && cfg.DefaultReasoningEffort != "" {
 		effort = cfg.DefaultReasoningEffort
+	}
+
+	// 7. Fallback: If the model requires an effort flag but none was provided, use model default fallback
+	if effort == "" {
+		effort = defaultEffortForModel(requestedModel)
+	}
+
+	// If the model does not support reasoning effort (e.g. claude-*), clear effort
+	if !supportsEffort(requestedModel) {
+		effort = ""
 	}
 
 	// Conversation ID
@@ -462,8 +572,12 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 func normalizeEffort(s string) string {
 	lower := strings.ToLower(strings.TrimSpace(s))
 	switch lower {
-	case "low", "medium", "high":
-		return lower
+	case "low":
+		return "low"
+	case "medium", "med":
+		return "medium"
+	case "high":
+		return "high"
 	default:
 		return ""
 	}
@@ -481,14 +595,25 @@ func agyArgs(cfg pluginConfig, opts agyOptions) []string {
 	if cfg.Sandbox {
 		args = append(args, "--sandbox")
 	}
-	if strings.TrimSpace(opts.NativeModel) != "" {
-		args = append(args, "--model", opts.NativeModel)
+	model := strings.TrimSpace(opts.NativeModel)
+	effort := strings.TrimSpace(opts.ReasoningEffort)
+
+	// Guard against conflicting model and effort flags (e.g. --model gemini-3.8-flash-high --effort low).
+	// If the model name already specifies an effort suffix and effort differs, strip the suffix
+	// so the base model is used with the desired effort flag.
+	modelEffort := extractEffortSuffix(model)
+	if modelEffort != "" && effort != "" && modelEffort != effort {
+		model = stripEffortSuffix(model)
+	}
+
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	if strings.TrimSpace(opts.ConversationID) != "" {
 		args = append(args, "--conversation", strings.TrimSpace(opts.ConversationID))
 	}
-	if strings.TrimSpace(opts.ReasoningEffort) != "" {
-		args = append(args, "--effort", strings.TrimSpace(opts.ReasoningEffort))
+	if effort != "" && supportsEffort(model) {
+		args = append(args, "--effort", effort)
 	}
 	return args
 }

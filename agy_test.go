@@ -13,11 +13,14 @@ gemini-3.6-flash-high	Gemini 3.6 Flash (High)
 gemini-3.6-flash-medium    Gemini 3.6 Flash (Medium)
 * Claude Sonnet 4.6 (Thinking)
 `)
-	if len(models) != 3 {
-		t.Fatalf("len(models) = %d, want 3: %#v", len(models), models)
+	if len(models) != 4 {
+		t.Fatalf("len(models) = %d, want 4: %#v", len(models), models)
 	}
 	if mapping["agy/gemini-3.6-flash-high"] != "gemini-3.6-flash-high" {
 		t.Fatalf("unexpected mapping: %#v", mapping)
+	}
+	if mapping["agy/gemini-3.6-flash"] != "gemini-3.6-flash" {
+		t.Fatalf("base model mapping missing: %#v", mapping)
 	}
 	if mapping["agy/claude-sonnet-4-6-thinking"] != "Claude Sonnet 4.6 (Thinking)" {
 		t.Fatalf("legacy label mapping missing: %#v", mapping)
@@ -29,7 +32,7 @@ func TestAgyArgs(t *testing.T) {
 	cfg.DangerouslySkipPermissions = true
 	cfg.Sandbox = true
 	opts := agyOptions{
-		NativeModel:     "gemini-x-high",
+		NativeModel:     "gemini-3.8-flash",
 		OutputFormat:    "stream-json",
 		ConversationID:  "test-conv-123",
 		ReasoningEffort: "high",
@@ -40,9 +43,44 @@ func TestAgyArgs(t *testing.T) {
 		"--print-timeout", "30m",
 		"--dangerously-skip-permissions",
 		"--sandbox",
-		"--model", "gemini-x-high",
+		"--model", "gemini-3.8-flash",
 		"--conversation", "test-conv-123",
 		"--effort", "high",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("agyArgs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestAgyArgsResolvesConflict(t *testing.T) {
+	cfg := defaultConfig()
+	opts := agyOptions{
+		NativeModel:     "gemini-3.8-flash-high",
+		ReasoningEffort: "low",
+	}
+	got := agyArgs(cfg, opts)
+	want := []string{
+		"--output-format", "json",
+		"--print-timeout", "30m",
+		"--model", "gemini-3.8-flash",
+		"--effort", "low",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("agyArgs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestAgyArgsClaudeOmitsEffort(t *testing.T) {
+	cfg := defaultConfig()
+	opts := agyOptions{
+		NativeModel:     "claude-sonnet-4-6",
+		ReasoningEffort: "high",
+	}
+	got := agyArgs(cfg, opts)
+	want := []string{
+		"--output-format", "json",
+		"--print-timeout", "30m",
+		"--model", "claude-sonnet-4-6",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("agyArgs() = %#v, want %#v", got, want)
@@ -98,7 +136,7 @@ func TestResolveExecutionOptions(t *testing.T) {
 		t.Fatalf("expected effort 'low', got %q", opts3.ReasoningEffort)
 	}
 
-	// 4. Built-in alias: antigravity/gemini-3.8-flash-high strips prefix and extracts high effort
+	// 4. Built-in alias: antigravity/gemini-3.8-flash-high splits suffix into high effort and base model gemini-3.8-flash
 	req4 := rpcExecutorRequest{
 		Model:   "antigravity/gemini-3.8-flash-high",
 		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
@@ -107,8 +145,73 @@ func TestResolveExecutionOptions(t *testing.T) {
 	if opts4.ReasoningEffort != "high" {
 		t.Fatalf("expected implicit high effort from gemini-3.8-flash-high, got %q", opts4.ReasoningEffort)
 	}
-	if opts4.NativeModel != "gemini-3.8-flash-high" {
-		t.Fatalf("expected native model gemini-3.8-flash-high, got %q", opts4.NativeModel)
+	if opts4.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected native model gemini-3.8-flash, got %q", opts4.NativeModel)
+	}
+
+	// 5. Explicit model alias (gemini-3.8-flash-high) splits into base model and high effort, ignoring payload low effort
+	req5 := rpcExecutorRequest{
+		Model:   "agy/gemini-3.8-flash-high",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`),
+	}
+	opts5 := resolveExecutionOptions(req5, cfg)
+	if opts5.ReasoningEffort != "high" {
+		t.Fatalf("expected model alias to take priority for effort, got %q", opts5.ReasoningEffort)
+	}
+	if opts5.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected native model gemini-3.8-flash, got %q", opts5.NativeModel)
+	}
+
+	// 6. Colon override on model with effort suffix: gemini-3.8-flash-high:low overrides effort to low and strips -high
+	req6 := rpcExecutorRequest{
+		Model:   "agy/gemini-3.8-flash-high:low",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts6 := resolveExecutionOptions(req6, cfg)
+	if opts6.ReasoningEffort != "low" {
+		t.Fatalf("expected colon override to set effort to 'low', got %q", opts6.ReasoningEffort)
+	}
+	if opts6.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected native model gemini-3.8-flash after stripping conflicting suffix, got %q", opts6.NativeModel)
+	}
+
+	// 7. Base model gemini-3.8-flash with payload reasoning_effort
+	req7 := rpcExecutorRequest{
+		Model:   "agy/gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`),
+	}
+	opts7 := resolveExecutionOptions(req7, cfg)
+	if opts7.ReasoningEffort != "low" {
+		t.Fatalf("expected effort 'low' from payload, got %q", opts7.ReasoningEffort)
+	}
+	if opts7.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected native model gemini-3.8-flash, got %q", opts7.NativeModel)
+	}
+
+	// 8. Base model without any effort provided falls back to model default (high)
+	req8 := rpcExecutorRequest{
+		Model:   "agy/gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts8 := resolveExecutionOptions(req8, defaultConfig())
+	if opts8.ReasoningEffort != "high" {
+		t.Fatalf("expected fallback effort 'high' for base gemini model, got %q", opts8.ReasoningEffort)
+	}
+	if opts8.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected native model gemini-3.8-flash, got %q", opts8.NativeModel)
+	}
+
+	// 9. Claude model does not support effort and effort is cleared
+	req9 := rpcExecutorRequest{
+		Model:   "agy/claude-sonnet-4-6",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`),
+	}
+	opts9 := resolveExecutionOptions(req9, cfg)
+	if opts9.ReasoningEffort != "" {
+		t.Fatalf("expected effort to be cleared for claude model, got %q", opts9.ReasoningEffort)
+	}
+	if opts9.NativeModel != "claude-sonnet-4-6" {
+		t.Fatalf("expected native model claude-sonnet-4-6, got %q", opts9.NativeModel)
 	}
 }
 
