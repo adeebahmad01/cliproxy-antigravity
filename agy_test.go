@@ -25,6 +25,62 @@ gemini-3.6-flash-medium    Gemini 3.6 Flash (Medium)
 	if mapping["agy/claude-sonnet-4-6-thinking"] != "Claude Sonnet 4.6 (Thinking)" {
 		t.Fatalf("legacy label mapping missing: %#v", mapping)
 	}
+
+	byID := map[string]modelInfo{}
+	for _, m := range models {
+		byID[m.ID] = m
+	}
+	if byID["agy/gemini-3.6-flash-high"].Name != "Gemini 3.6 Flash (High)" {
+		t.Fatalf("unexpected Name for gemini-3.6-flash-high: %q", byID["agy/gemini-3.6-flash-high"].Name)
+	}
+	if byID["agy/gemini-3.6-flash"].Name != "Gemini 3.6 Flash" {
+		t.Fatalf("unexpected Name for base gemini-3.6-flash: %q", byID["agy/gemini-3.6-flash"].Name)
+	}
+
+	rawModels, _ := parseAgyModelLines(`
+gemini-3.8-flash-high
+gpt-oss-120b-medium
+claude-sonnet-4-6
+`)
+	rawByID := map[string]modelInfo{}
+	for _, m := range rawModels {
+		rawByID[m.ID] = m
+	}
+	if rawByID["agy/gemini-3.8-flash"].Name != "Gemini 3.8 Flash" {
+		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gemini-3.8-flash"].Name)
+	}
+	if rawByID["agy/gpt-oss-120b"].Name != "GPT-OSS 120B" {
+		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gpt-oss-120b"].Name)
+	}
+	if rawByID["agy/claude-sonnet-4-6"].Name != "Claude Sonnet 4.6" {
+		t.Fatalf("unexpected humanized Name for raw claude slug: %q", rawByID["agy/claude-sonnet-4-6"].Name)
+	}
+}
+
+func TestHumanizeModelName(t *testing.T) {
+	tests := map[string]string{
+		"gemini-3.8-flash-high":    "Gemini 3.8 Flash (High)",
+		"gemini-3.8-flash":         "Gemini 3.8 Flash",
+		"gpt-oss-120b-medium":      "GPT-OSS 120B (Medium)",
+		"gpt-oss-120b":             "GPT-OSS 120B",
+		"claude-sonnet-4-6":        "Claude Sonnet 4.6",
+		"claude-opus-4-6-thinking": "Claude Opus 4.6 (Thinking)",
+		"default":                  "Antigravity CLI (default model)",
+	}
+	for slug, want := range tests {
+		got := humanizeModelName(slug)
+		if got != want {
+			t.Errorf("humanizeModelName(%q) = %q, want %q", slug, got, want)
+		}
+	}
+}
+
+func TestStandardBuiltinModelsHaveCleanNames(t *testing.T) {
+	for _, m := range standardBuiltinModels() {
+		if m.Name == "" || looksLikeModelSlug(m.Name) {
+			t.Fatalf("builtin model %s has ugly slug name %q", m.ID, m.Name)
+		}
+	}
 }
 
 func TestAgyArgs(t *testing.T) {

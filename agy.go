@@ -124,7 +124,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Antigravity CLI (default model)",
-			Name:                       "default",
+			Name:                       "Antigravity CLI (default model)",
 			Description:                "Uses the default model selected by the installed official agy CLI.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -134,7 +134,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash",
-			Name:                       "gemini-3.8-flash",
+			Name:                       "Gemini 3.8 Flash",
 			Description:                "Standard Gemini 3.8 Flash model with configurable reasoning effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -144,7 +144,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash (High)",
-			Name:                       "gemini-3.8-flash-high",
+			Name:                       "Gemini 3.8 Flash (High)",
 			Description:                "Standard Gemini 3.8 Flash model with high thinking effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -154,7 +154,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash (Medium)",
-			Name:                       "gemini-3.8-flash-medium",
+			Name:                       "Gemini 3.8 Flash (Medium)",
 			Description:                "Standard Gemini 3.8 Flash model with medium thinking effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -164,7 +164,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash (Low)",
-			Name:                       "gemini-3.8-flash-low",
+			Name:                       "Gemini 3.8 Flash (Low)",
 			Description:                "Standard Gemini 3.8 Flash model with low thinking effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -174,7 +174,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Claude 3.7 Sonnet (Thinking)",
-			Name:                       "claude-3-7-sonnet-thought",
+			Name:                       "Claude 3.7 Sonnet (Thinking)",
 			Description:                "Claude 3.7 Sonnet Thinking model via Antigravity.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -193,14 +193,20 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	builtin := standardBuiltinModels()
 	models := append([]modelInfo(nil), builtin...)
 	nativeByID := map[string]string{
-		"agy/default":               "",
-		"antigravity/default":       "",
-		"default":                   "",
-		"gemini-3.8-flash":          "gemini-3.8-flash",
-		"gemini-3.8-flash-high":     "gemini-3.8-flash-high",
-		"gemini-3.8-flash-medium":   "gemini-3.8-flash-medium",
-		"gemini-3.8-flash-low":      "gemini-3.8-flash-low",
-		"claude-3-7-sonnet-thought": "claude-3-7-sonnet-thought",
+		"agy/default":                     "",
+		"antigravity/default":             "",
+		"default":                         "",
+		"Antigravity CLI (default model)": "",
+		"gemini-3.8-flash":                "gemini-3.8-flash",
+		"Gemini 3.8 Flash":                "gemini-3.8-flash",
+		"gemini-3.8-flash-high":           "gemini-3.8-flash-high",
+		"Gemini 3.8 Flash (High)":         "gemini-3.8-flash-high",
+		"gemini-3.8-flash-medium":         "gemini-3.8-flash-medium",
+		"Gemini 3.8 Flash (Medium)":       "gemini-3.8-flash-medium",
+		"gemini-3.8-flash-low":            "gemini-3.8-flash-low",
+		"Gemini 3.8 Flash (Low)":          "gemini-3.8-flash-low",
+		"claude-3-7-sonnet-thought":       "claude-3-7-sonnet-thought",
+		"Claude 3.7 Sonnet (Thinking)":    "claude-3-7-sonnet-thought",
 	}
 
 	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
@@ -254,7 +260,7 @@ func defaultModelInfo() modelInfo {
 		Object:                     "model",
 		OwnedBy:                    "google-antigravity-cli",
 		DisplayName:                "Antigravity CLI (default model)",
-		Name:                       "default",
+		Name:                       "Antigravity CLI (default model)",
 		Description:                "Uses the default model selected by the installed official agy CLI.",
 		SupportedGenerationMethods: []string{"chat"},
 		UserDefined:                true,
@@ -294,6 +300,10 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 				slug = fields[0]
 				label = strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
 				native = slug
+			} else if len(fields) == 1 && looksLikeModelSlug(fields[0]) {
+				slug = fields[0]
+				label = humanizeModelName(slug)
+				native = slug
 			} else {
 				label = line
 				slug = slugifyModelLabel(label)
@@ -304,37 +314,47 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 			continue
 		}
 
+		name := label
+		if name == "" || name == slug || looksLikeModelSlug(name) {
+			name = humanizeModelName(slug)
+		}
+
 		id := "agy/" + slug
 		if _, exists := byID[id]; !exists {
 			byID[id] = modelInfo{
 				ID:                         id,
 				Object:                     "model",
 				OwnedBy:                    "google-antigravity-cli",
-				DisplayName:                label,
-				Name:                       native,
+				DisplayName:                name,
+				Name:                       name,
 				Description:                "Discovered from the installed official agy CLI.",
 				SupportedGenerationMethods: []string{"chat"},
 				UserDefined:                true,
 			}
 			nativeByID[id] = native
+			nativeByID[name] = native
 		}
 
 		baseSlug := stripEffortSuffix(slug)
 		if baseSlug != slug {
 			baseID := "agy/" + baseSlug
 			if _, exists := byID[baseID]; !exists {
-				baseLabel := stripEffortLabel(label)
+				baseName := stripEffortLabel(name)
+				if baseName == "" || baseName == baseSlug || looksLikeModelSlug(baseName) {
+					baseName = humanizeModelName(baseSlug)
+				}
 				byID[baseID] = modelInfo{
 					ID:                         baseID,
 					Object:                     "model",
 					OwnedBy:                    "google-antigravity-cli",
-					DisplayName:                baseLabel,
-					Name:                       baseSlug,
+					DisplayName:                baseName,
+					Name:                       baseName,
 					Description:                "Discovered from the installed official agy CLI with configurable reasoning effort.",
 					SupportedGenerationMethods: []string{"chat"},
 					UserDefined:                true,
 				}
 				nativeByID[baseID] = baseSlug
+				nativeByID[baseName] = baseSlug
 			}
 		}
 	}
@@ -404,12 +424,105 @@ func resolveNativeModel(model string, cfg pluginConfig) string {
 
 func stripEffortLabel(label string) string {
 	cleaned := strings.TrimSpace(label)
-	for _, suffix := range []string{"(High)", "(Medium)", "(Med)", "(Low)", "(high)", "(medium)", "(med)", "(low)"} {
+	for _, suffix := range []string{
+		"(High)", "(Medium)", "(Med)", "(Low)", "(Thinking)",
+		"(high)", "(medium)", "(med)", "(low)", "(thinking)",
+	} {
 		if strings.HasSuffix(cleaned, suffix) {
 			return strings.TrimSpace(strings.TrimSuffix(cleaned, suffix))
 		}
 	}
 	return cleaned
+}
+
+func humanizeModelName(slug string) string {
+	raw := strings.TrimSpace(slug)
+	if raw == "" {
+		return ""
+	}
+	if raw == "default" {
+		return "Antigravity CLI (default model)"
+	}
+
+	effortSuffix := ""
+	clean := raw
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.HasSuffix(lower, "-high"):
+		effortSuffix = " (High)"
+		clean = raw[:len(raw)-5]
+	case strings.HasSuffix(lower, "-medium"):
+		effortSuffix = " (Medium)"
+		clean = raw[:len(raw)-7]
+	case strings.HasSuffix(lower, "-med"):
+		effortSuffix = " (Medium)"
+		clean = raw[:len(raw)-4]
+	case strings.HasSuffix(lower, "-low"):
+		effortSuffix = " (Low)"
+		clean = raw[:len(raw)-4]
+	case strings.HasSuffix(lower, "-thinking"):
+		effortSuffix = " (Thinking)"
+		clean = raw[:len(raw)-9]
+	case strings.HasSuffix(lower, "-thought"):
+		effortSuffix = " (Thinking)"
+		clean = raw[:len(raw)-8]
+	}
+
+	parts := strings.Split(clean, "-")
+	var formatted []string
+	for i, part := range parts {
+		pLower := strings.ToLower(part)
+		switch pLower {
+		case "gpt":
+			formatted = append(formatted, "GPT")
+		case "oss":
+			formatted = append(formatted, "OSS")
+		case "gemini":
+			formatted = append(formatted, "Gemini")
+		case "claude":
+			formatted = append(formatted, "Claude")
+		case "sonnet":
+			formatted = append(formatted, "Sonnet")
+		case "opus":
+			formatted = append(formatted, "Opus")
+		case "haiku":
+			formatted = append(formatted, "Haiku")
+		case "flash":
+			formatted = append(formatted, "Flash")
+		case "pro":
+			formatted = append(formatted, "Pro")
+		case "ultra":
+			formatted = append(formatted, "Ultra")
+		default:
+			if len(pLower) > 1 && pLower[len(pLower)-1] == 'b' && isDigits(pLower[:len(pLower)-1]) {
+				formatted = append(formatted, strings.ToUpper(part))
+			} else if isDigits(part) && i > 0 && isDigits(parts[i-1]) && len(formatted) > 0 {
+				formatted[len(formatted)-1] = formatted[len(formatted)-1] + "." + part
+			} else {
+				r := []rune(part)
+				if len(r) > 0 {
+					r[0] = unicode.ToUpper(r[0])
+					formatted = append(formatted, string(r))
+				}
+			}
+		}
+	}
+
+	res := strings.Join(formatted, " ")
+	res = strings.ReplaceAll(res, "GPT OSS", "GPT-OSS")
+	return res + effortSuffix
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func extractEffortSuffix(model string) string {
