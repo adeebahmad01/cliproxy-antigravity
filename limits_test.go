@@ -100,6 +100,9 @@ func TestCheckModelLimitsEnforcement(t *testing.T) {
 	if err == nil || pe.HTTPStatus != http.StatusTooManyRequests || !pe.Retryable || pe.Code != "agy_quota_exhausted" {
 		t.Fatalf("expected retryable 429, got %#v", pe)
 	}
+	if pe.RetryAfterSeconds <= 0 {
+		t.Fatalf("expected retry-after until the bucket resets, got %d", pe.RetryAfterSeconds)
+	}
 	if !strings.Contains(pe.Message, "Claude and GPT models") || !strings.Contains(pe.Message, "2099-11-19T02:31:24Z") || !strings.Contains(pe.Message, "weekly limit for") {
 		t.Fatalf("message should name the group and reset time: %q", pe.Message)
 	}

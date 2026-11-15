@@ -57,13 +57,13 @@ type toolCallCandidate struct {
 func decodeChatRequest(raw []byte) (chatCompletionRequest, error) {
 	var req chatCompletionRequest
 	if len(raw) == 0 {
-		return req, pError("invalid_request", "chat-completions payload is empty", http.StatusBadRequest)
+		return req, pError(errorCodeRequestScoped, "chat-completions payload is empty", http.StatusBadRequest)
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return req, pError("invalid_request", "invalid chat-completions JSON: "+err.Error(), http.StatusBadRequest)
+		return req, pError(errorCodeRequestScoped, "invalid chat-completions JSON: "+err.Error(), http.StatusBadRequest)
 	}
 	if len(req.Messages) == 0 {
-		return req, pError("invalid_request", "messages must contain at least one message", http.StatusBadRequest)
+		return req, pError(errorCodeRequestScoped, "messages must contain at least one message", http.StatusBadRequest)
 	}
 	return req, nil
 }
@@ -102,7 +102,7 @@ func buildPrompt(raw []byte, conversationID string, workdir string) (string, err
 	if convID != "" && len(messages) == 1 && (strings.TrimSpace(messages[0].Role) == "" || strings.EqualFold(strings.TrimSpace(messages[0].Role), "user")) && len(req.Tools) == 0 && messages[0].ToolCallID == "" && len(messages[0].ToolCalls) == 0 {
 		content, err := messageContentText(messages[0].Content, workdir)
 		if err != nil {
-			return "", pError("unsupported_content", fmt.Sprintf("message: %v", err), http.StatusBadRequest)
+			return "", pError(errorCodeRequestScoped, fmt.Sprintf("message: %v", err), http.StatusBadRequest)
 		}
 		return content, nil
 	}
@@ -120,7 +120,7 @@ func buildPrompt(raw []byte, conversationID string, workdir string) (string, err
 		}
 		content, err := messageContentText(msg.Content, workdir)
 		if err != nil {
-			return "", pError("unsupported_content", fmt.Sprintf("message %d: %v", i+1, err), http.StatusBadRequest)
+			return "", pError(errorCodeRequestScoped, fmt.Sprintf("message %d: %v", i+1, err), http.StatusBadRequest)
 		}
 
 		b.WriteString("--- message ")

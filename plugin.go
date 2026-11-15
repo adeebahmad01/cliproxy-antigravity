@@ -20,6 +20,7 @@ const (
 	methodPluginReconfigure     = "plugin.reconfigure"
 	methodModelRegister         = "model.register"
 	methodModelStatic           = "model.static"
+	methodModelRoute            = "model.route"
 	methodExecutorIdentifier    = "executor.identifier"
 	methodExecutorExecute       = "executor.execute"
 	methodExecutorExecuteStream = "executor.execute_stream"
@@ -41,21 +42,42 @@ type envelope struct {
 	Error  *envelopeError  `json:"error,omitempty"`
 }
 
+// Error codes CLIProxyAPI's routing and cooldown pipeline recognizes (pluginabi.ErrorCode*).
+const (
+	// errorCodeRequestScoped marks a failure caused by the request itself: no cooldown, no credential rotation.
+	errorCodeRequestScoped = "request_scoped"
+	// errorCodeModelNotFound cools only the requested model as unsupported.
+	errorCodeModelNotFound = "model_not_found"
+)
+
 type envelopeError struct {
 	Code       string `json:"code"`
 	Message    string `json:"message"`
 	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfterSeconds feeds CLIProxyAPI's cooldown and the client Retry-After header.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 type pluginError struct {
-	Code       string
-	Message    string
-	HTTPStatus int
-	Retryable  bool
+	Code              string
+	Message           string
+	HTTPStatus        int
+	Retryable         bool
+	RetryAfterSeconds int
 }
 
 func (e *pluginError) Error() string { return e.Message }
+
+func (e *pluginError) envelopeError() *envelopeError {
+	return &envelopeError{
+		Code:              e.Code,
+		Message:           e.Message,
+		Retryable:         e.Retryable,
+		HTTPStatus:        e.HTTPStatus,
+		RetryAfterSeconds: e.RetryAfterSeconds,
+	}
+}
 
 func asPluginError(err error) *pluginError {
 	if err == nil {
@@ -99,6 +121,7 @@ type metadata struct {
 type configField struct {
 	Name        string
 	Type        string
+	Default     any
 	EnumValues  []string
 	Description string
 }
@@ -106,6 +129,7 @@ type configField struct {
 type registrationCapability struct {
 	ModelRegistrar        bool     `json:"model_registrar"`
 	ModelProvider         bool     `json:"model_provider"`
+	ModelRouter           bool     `json:"model_router"`
 	Executor              bool     `json:"executor"`
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
@@ -155,6 +179,18 @@ type rpcExecutorRequest struct {
 	HostCallbackID  string `json:"host_callback_id,omitempty"`
 }
 
+// modelRouteRequest is the subset of pluginapi.ModelRouteRequest the router needs.
+type modelRouteRequest struct {
+	RequestedModel     string
+	AvailableProviders []string
+}
+
+type modelRouteResponse struct {
+	Handled    bool
+	TargetKind string
+	Reason     string
+}
+
 type executorResponse struct {
 	Payload  []byte         `json:"Payload"`
 	Headers  http.Header    `json:"Headers,omitempty"`
@@ -186,6 +222,9 @@ type streamEmitRequest struct {
 type streamCloseRequest struct {
 	StreamID string `json:"stream_id"`
 	Error    string `json:"error,omitempty"`
+	// ErrorDetail keeps the HTTP status, code and retry-after that Error alone cannot carry.
+	// Hosts that predate it fall back to Error.
+	ErrorDetail *envelopeError `json:"error_detail,omitempty"`
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -211,6 +250,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case methodModelStatic:
 		models := discoverModels(currentConfig())
 		return okEnvelope(modelResponse{Provider: providerID, Models: models})
+
+	case methodModelRoute:
+		var req modelRouteRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, pError("invalid_request", "could not decode model route request: "+err.Error(), 400)
+		}
+		return okEnvelope(routeModel(req))
 
 	case methodExecutorIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerID})
@@ -321,6 +367,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func pluginRegistration() registration {
+	defaults := defaultConfig()
 	return registration{
 		SchemaVersion: schemaVersion,
 		Metadata: metadata{
@@ -329,20 +376,21 @@ func pluginRegistration() registration {
 			Author:           "adeebahmad01 and contributors",
 			GitHubRepository: "https://github.com/adeebahmad01/cliproxy-antigravity",
 			ConfigFields: []configField{
-				{Name: "binary_path", Type: "string", Description: "Path or command name for the official Antigravity CLI (default: agy)."},
-				{Name: "workdir", Type: "string", Description: "Working directory used when agy executes requests."},
-				{Name: "print_timeout", Type: "string", Description: "Antigravity print timeout, using Go/CLI duration syntax (default: 30m)."},
-				{Name: "dangerously_skip_permissions", Type: "boolean", Description: "Pass --dangerously-skip-permissions to agy. Disabled by default."},
-				{Name: "sandbox", Type: "boolean", Description: "Pass --sandbox to agy when supported by the installed CLI."},
-				{Name: "reasoning_effort", Type: "string", EnumValues: []string{"low", "medium", "high"}, Description: "Default reasoning effort for agy sessions (low, medium, high)."},
-				{Name: "limits_tracking", Type: "boolean", Description: "Track Antigravity usage limits via agy /usage (default: true)."},
-				{Name: "limits_refresh_interval", Type: "string", Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
-				{Name: "enforce_limits", Type: "boolean", Description: "Reject requests with HTTP 429 when the model's quota group is exhausted, without launching agy (default: false)."},
+				{Name: "binary_path", Type: "string", Default: defaults.BinaryPath, Description: "Path or command name for the official Antigravity CLI (default: agy)."},
+				{Name: "workdir", Type: "string", Default: defaults.Workdir, Description: "Working directory used when agy executes requests."},
+				{Name: "print_timeout", Type: "string", Default: defaults.PrintTimeout, Description: "Antigravity print timeout, using Go/CLI duration syntax (default: 30m)."},
+				{Name: "dangerously_skip_permissions", Type: "boolean", Default: defaults.DangerouslySkipPermissions, Description: "Pass --dangerously-skip-permissions to agy. Disabled by default."},
+				{Name: "sandbox", Type: "boolean", Default: defaults.Sandbox, Description: "Pass --sandbox to agy when supported by the installed CLI."},
+				{Name: "reasoning_effort", Type: "enum", Default: defaults.DefaultReasoningEffort, EnumValues: []string{"low", "medium", "high"}, Description: "Default reasoning effort for agy sessions (low, medium, high). Empty uses the per-model default."},
+				{Name: "limits_tracking", Type: "boolean", Default: defaults.LimitsTracking, Description: "Track Antigravity usage limits via agy /usage (default: true)."},
+				{Name: "limits_refresh_interval", Type: "string", Default: defaults.LimitsRefreshInterval, Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
+				{Name: "enforce_limits", Type: "boolean", Default: defaults.EnforceLimits, Description: "Reject requests with HTTP 429 when the quota group of the model is exhausted, without launching agy (default: false)."},
 			},
 		},
 		Capabilities: registrationCapability{
 			ModelRegistrar:        true,
 			ModelProvider:         true,
+			ModelRouter:           true,
 			Executor:              true,
 			ExecutorModelScope:    "static",
 			ExecutorInputFormats:  []string{"chat-completions"},
@@ -361,15 +409,7 @@ func okEnvelope(v any) ([]byte, error) {
 	return json.Marshal(envelope{OK: true, Result: raw})
 }
 
-func mustErrorEnvelope(code, message string, status int, retryable bool) []byte {
-	raw, _ := json.Marshal(envelope{
-		OK: false,
-		Error: &envelopeError{
-			Code:       code,
-			Message:    message,
-			Retryable:  retryable,
-			HTTPStatus: status,
-		},
-	})
+func mustErrorEnvelope(pe *pluginError) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: pe.envelopeError()})
 	return raw
 }

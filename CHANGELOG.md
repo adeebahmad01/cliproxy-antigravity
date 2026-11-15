@@ -13,8 +13,20 @@ All notable changes to this project will be documented here.
   - Optional `enforce_limits` to reject requests for an exhausted group with a retryable 429 before starting `agy`.
 - New config fields: `limits_tracking`, `limits_refresh_interval`, `enforce_limits`.
 
+### Changed
+
+- Compatible with CLIProxyAPI v8 (tested against v8.0.72):
+  - Declares the `model_router` capability and routes `agy` models to its own executor. v8 has no auth record for `agy`, so requests previously failed with `auth_not_found: no auth available (providers=agy)`. An explicit `agy` auth record keeps the normal credential path.
+  - Errors use CLIProxyAPI's routing codes: client payload faults are `request_scoped` (no credential cooldown), unknown models are `model_not_found`, and `enforce_limits` rejections include `retry_after_seconds`.
+  - Streaming failures send a structured `error_detail` on `host.stream.close`, keeping their HTTP status (for example 429 for quota errors).
+  - Config fields publish their defaults, and `reasoning_effort` is an `enum` field, for the v8 management UI.
+  - CLIProxyAPI thinking suffixes such as `agy/gemini-3.8-flash(high)` are honoured when the host passes them through.
+- Release builds pin the baseline CPU instruction set (`GOAMD64=v1`, `-march=x86-64` / `GOARM64=v8.0`, `-march=armv8-a`) so the library loads on older CPUs.
+- README uses the v8 config key `requests.passthrough-headers`.
+
 ### Fixed
 
+- Empty plugin config values (`reasoning_effort: ""`, as written by management clients) keep the default instead of failing to load the plugin.
 - Client prompts beginning with `/` were expanded as `agy` slash commands (for example `/usage` or plugin/skill commands); `--disable-slash-commands` is now always passed.
 - Removed the `claude-3-7-sonnet-thought` built-in alias, which `agy` rejects as an unknown model.
 - Errors are classified from `agy`'s structured `AGY_ERROR` report: quota errors carry `retryable`, unknown models return 404 instead of 502, print and command timeouts return 504, and duplicated or `exit status N` messages are cleaned up.

@@ -47,13 +47,15 @@ Google Antigravity
 - Antigravity token usage mapped to OpenAI-compatible usage fields
 - No Antigravity OAuth/token extraction
 - No direct calls to private Antigravity services
-- No fake CLIProxyAPI Antigravity credential
+- No fake CLIProxyAPI Antigravity credential: the plugin's `model_router` capability sends its models straight to its own executor, so no auth file is needed
 
 The plugin registers under the provider key **`agy`**, and supports requests addressed to `agy/*`, `antigravity/*`, or unprefixed models.
 
+Because `agy` manages its own login, CLIProxyAPI has no auth record to schedule for these models. The plugin therefore routes `agy/*` models, its published unprefixed models, and `antigravity/*` models (only while CLIProxyAPI's built-in Antigravity provider has no credentials) to itself. If you do add an auth record with provider `agy`, routing is left to CLIProxyAPI's normal credential path. Requests can arrive through any CLIProxyAPI entry protocol (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`); the host translates them to Chat Completions for the plugin.
+
 ## Requirements & Platform Support
 
-- A recent CLIProxyAPI build with standard dynamic-library plugin support enabled
+- CLIProxyAPI v8 with dynamic-library plugin support (tested against v8.0.72)
 - The official Antigravity CLI installed and available as `agy` (or `agy.exe` on Windows), or configured via `binary_path`
 - An authenticated Antigravity CLI session (`agy` should work normally before using the plugin)
 - Precompiled binary release assets are provided for all tier-1 supported operating systems:
@@ -234,7 +236,7 @@ Reasoning effort can be configured via:
 
 1. **Embedded Model Suffix**: Selecting models like `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, or `gemini-3.8-flash-low` automatically splits the last part (`high`, `medium`, `low`) into reasoning effort and routes to the clean base model (`gemini-3.8-flash`).
 2. **Base Model Selection**: Selecting clean base models directly (e.g. `agy/gemini-3.8-flash`, `agy/gemini-3.1-pro`, `agy/gpt-oss-120b`) and configuring reasoning effort via UI selectors or request body (`"reasoning_effort": "low" | "medium" | "high"`).
-3. **Explicit Colon Override**: Colon suffixes such as `agy/gemini-3.8-flash:high` or `agy/default:high`.
+3. **Explicit Overrides**: CLIProxyAPI thinking suffixes such as `agy/gemini-3.8-flash(high)`, or colon suffixes such as `agy/gemini-3.8-flash:high` and `agy/default:high`.
 4. **Headers & Metadata**: Request headers (`X-AGY-Effort`, `X-Reasoning-Effort`) or metadata fields.
 5. **Intelligent Fallbacks**: If no effort is specified for models requiring an effort flag, sensible defaults (such as `high` for Gemini and `medium` for GPT-OSS) are applied automatically, while models that do not support reasoning effort (such as Claude) safely omit the flag.
 
@@ -294,10 +296,12 @@ Antigravity groups models (for example *Gemini Models* and *Claude and GPT model
   }
   ```
 
-- **Response headers** on every completion, for the requested model's group: `X-AGY-Limit-Group`, `X-AGY-Limit-Weekly-Remaining`, `X-AGY-Limit-Weekly-Reset`, `X-AGY-Limit-5h-Remaining`, `X-AGY-Limit-5h-Reset`. CLIProxyAPI forwards them to clients only when `passthrough-headers: true` is set.
-- **CLIProxyAPI quota API** — the plugin implements the `quota_provider` capability (`quota.fetch`), so the host's `/v0/management/quota/*` endpoints work for any auth record whose provider is `agy`.
+- **Response headers** on every completion, for the requested model's group: `X-AGY-Limit-Group`, `X-AGY-Limit-Weekly-Remaining`, `X-AGY-Limit-Weekly-Reset`, `X-AGY-Limit-5h-Remaining`, `X-AGY-Limit-5h-Reset`. CLIProxyAPI forwards them to clients only when `requests.passthrough-headers: true` is set (`passthrough-headers: true` in legacy config files).
+- **CLIProxyAPI quota API** — the plugin implements the `quota_provider` capability (`quota.fetch`), so the host's `/v0/management/quota/*` and `/v0/management/plugins/cliproxy-antigravity/quota` endpoints work for any auth record whose provider is `agy` (they require an `auth_index`).
 
-Quota errors from `agy` are returned as HTTP 429 with `retryable` set from Antigravity's own error report, so CLIProxyAPI can cool down and retry correctly.
+Quota errors from `agy` are returned as HTTP 429 with `retryable` set from Antigravity's own error report, so CLIProxyAPI can cool down and retry correctly. When `enforce_limits` rejects a request, the error also carries `retry_after_seconds` until the bucket resets, which CLIProxyAPI turns into a `Retry-After` header.
+
+Errors use the codes CLIProxyAPI's routing pipeline understands: malformed client payloads are `request_scoped` (HTTP 400, no credential cooldown), and models `agy` does not recognise are `model_not_found` (HTTP 404). Streaming failures are reported through `host.stream.close` with a structured `error_detail`, so they keep their HTTP status instead of collapsing into a generic 500.
 
 ### Permission safety
 
