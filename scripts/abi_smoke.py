@@ -45,16 +45,23 @@ if [ "$1" = "models" ]; then
   exit 0
 fi
 format="text"
+slash=1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-format) format="$2"; shift 2 ;;
     --print-timeout) shift 2 ;;
     --model|--conversation|--effort) shift 2 ;;
     --sandbox|--dangerously-skip-permissions) shift ;;
+    --disable-slash-commands) slash=0; shift ;;
     -p|--print|--prompt) prompt="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+stdin="$(cat)"
+if [ "$slash" = "1" ] && [ "$stdin" = "/usage" ]; then
+  printf '%s\\n' '{"status":"SUCCESS","response":"","command":{"name":"usage","data":{"groups":[{"name":"Mock Models","description":"Models within this group: Mock Model","buckets":[{"id":"mock-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.5,"reset_time":"2099-01-01T00:00:00Z"}]}]}}}'
+  exit 0
+fi
 if [ "$format" = "json" ]; then
   printf '%s\\n' '{"conversation_id":"mock-conversation","status":"SUCCESS","response":"mock response","usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":1,"cache_read_tokens":2,"total_tokens":13}}'
   exit 0
@@ -136,6 +143,33 @@ def main() -> int:
             raise RuntimeError(f"unexpected usage: {openai_payload['usage']}")
         if openai_payload.get("conversation_id") != "mock-conversation":
             raise RuntimeError(f"expected conversation_id in payload: {openai_payload}")
+
+        # A client prompt must never be expanded as an agy slash command.
+        slash_request = {"model": "agy/mock-model-high", "messages": [{"role": "user", "content": "/usage"}]}
+        rc, execution = call(
+            "executor.execute",
+            {"Model": "agy/mock-model-high", "Payload": base64.b64encode(json.dumps(slash_request).encode()).decode()},
+        )
+        if rc != 0 or not execution.get("ok"):
+            raise RuntimeError(f"slash-command executor call failed: {execution}")
+        slash_payload = json.loads(base64.b64decode(execution["result"]["Payload"]))
+        if slash_payload["choices"][0]["message"]["content"] != "mock response":
+            raise RuntimeError(f"client prompt was run as a slash command: {slash_payload}")
+
+        rc, management = call("management.register", {})
+        routes = management.get("result", {}).get("routes", [])
+        if rc != 0 or not any(r.get("Path") == "/agy/limits" for r in routes):
+            raise RuntimeError(f"expected /agy/limits management route: {management}")
+        rc, limits = call("management.handle", {"Method": "GET", "Path": "/v0/management/agy/limits"})
+        if rc != 0 or not limits.get("ok") or limits["result"]["StatusCode"] != 200:
+            raise RuntimeError(f"limits route failed: {limits}")
+        report = json.loads(base64.b64decode(limits["result"]["Body"]))
+        if report["groups"][0]["buckets"][0]["remaining_fraction"] != 0.5:
+            raise RuntimeError(f"unexpected limits report: {report}")
+
+        rc, quota = call("quota.fetch", {"auth_index": "", "auth_id": "", "provider": "agy"})
+        if rc != 0 or not quota.get("ok") or quota["result"]["groups"][0]["displayName"] != "Mock Models":
+            raise RuntimeError(f"quota.fetch failed: {quota}")
 
     api.shutdown()
     print(f"ABI smoke test passed: {result['metadata']['Name']} ({', '.join(model_ids)})")

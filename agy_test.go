@@ -97,6 +97,7 @@ func TestAgyArgs(t *testing.T) {
 	want := []string{
 		"--output-format", "stream-json",
 		"--print-timeout", "30m",
+		"--disable-slash-commands",
 		"--dangerously-skip-permissions",
 		"--sandbox",
 		"--model", "gemini-3.8-flash",
@@ -118,6 +119,7 @@ func TestAgyArgsResolvesConflict(t *testing.T) {
 	want := []string{
 		"--output-format", "json",
 		"--print-timeout", "30m",
+		"--disable-slash-commands",
 		"--model", "gemini-3.8-flash",
 		"--effort", "low",
 	}
@@ -136,6 +138,7 @@ func TestAgyArgsClaudeOmitsEffort(t *testing.T) {
 	want := []string{
 		"--output-format", "json",
 		"--print-timeout", "30m",
+		"--disable-slash-commands",
 		"--model", "claude-sonnet-4-6",
 	}
 	if !reflect.DeepEqual(got, want) {

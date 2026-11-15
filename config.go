@@ -17,12 +17,17 @@ type pluginConfig struct {
 	DangerouslySkipPermissions bool
 	Sandbox                    bool
 	DefaultReasoningEffort     string
+	LimitsTracking             bool
+	LimitsRefreshInterval      string
+	EnforceLimits              bool
 }
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{
-		BinaryPath:   "agy",
-		PrintTimeout: "30m",
+		BinaryPath:            "agy",
+		PrintTimeout:          "30m",
+		LimitsTracking:        true,
+		LimitsRefreshInterval: "1m",
 	}
 }
 
@@ -36,6 +41,7 @@ func setConfig(cfg pluginConfig) {
 	configState.value = cfg
 	configState.Unlock()
 	invalidateModels()
+	invalidateLimits()
 }
 
 func currentConfig() pluginConfig {
@@ -143,6 +149,24 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return pluginConfig{}, fmt.Errorf("line %d: invalid reasoning_effort %q: must be low, medium, or high", lineNo+1, value)
 			}
 			cfg.DefaultReasoningEffort = effort
+		case "limits_tracking":
+			parsed, err := strconv.ParseBool(value)
+			if err != nil {
+				return pluginConfig{}, fmt.Errorf("line %d: limits_tracking must be true or false", lineNo+1)
+			}
+			cfg.LimitsTracking = parsed
+		case "limits_refresh_interval":
+			d, err := time.ParseDuration(value)
+			if err != nil || d < 10*time.Second {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid limits_refresh_interval %q: must be a duration of at least 10s", lineNo+1, value)
+			}
+			cfg.LimitsRefreshInterval = value
+		case "enforce_limits":
+			parsed, err := strconv.ParseBool(value)
+			if err != nil {
+				return pluginConfig{}, fmt.Errorf("line %d: enforce_limits must be true or false", lineNo+1)
+			}
+			cfg.EnforceLimits = parsed
 		}
 	}
 

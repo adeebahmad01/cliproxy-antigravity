@@ -85,7 +85,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		response.len = 0
 	}
 	if method == nil {
-		writeResponse(response, mustErrorEnvelope("invalid_method", "method is required", 400))
+		writeResponse(response, mustErrorEnvelope("invalid_method", "method is required", 400, false))
 		return 1
 	}
 
@@ -97,7 +97,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	raw, err := handleMethod(C.GoString(method), requestBytes)
 	if err != nil {
 		pe := asPluginError(err)
-		writeResponse(response, mustErrorEnvelope(pe.Code, pe.Message, pe.HTTPStatus))
+		writeResponse(response, mustErrorEnvelope(pe.Code, pe.Message, pe.HTTPStatus, pe.Retryable))
 		return 1
 	}
 	writeResponse(response, raw)

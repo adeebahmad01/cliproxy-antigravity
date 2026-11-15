@@ -41,7 +41,8 @@ Google Antigravity
 - Reasoning effort control via `agy --effort` (`low`, `medium`, `high`)
 - Multimodal image support via automatic workspace staging
 - Client-side OpenAI `tools[]` calling emulation (`tool_calls`)
-- Built-in model name aliasing (`gemini-3.8-flash-high`, `claude-3-7-sonnet-thought`, etc.)
+- Built-in model name aliasing (`gemini-3.8-flash-high`, `gemini-3.8-flash-low`, etc.)
+- Antigravity usage-limit tracking (weekly and 5-hour quota per model group) via `agy /usage`
 - Dynamic model discovery through `agy models`
 - Antigravity token usage mapped to OpenAI-compatible usage fields
 - No Antigravity OAuth/token extraction
@@ -119,6 +120,9 @@ plugins:
       dangerously_skip_permissions: false
       sandbox: false
       reasoning_effort: "high" # optional default: low | medium | high
+      limits_tracking: true # track Antigravity usage limits via agy /usage
+      limits_refresh_interval: "1m"
+      enforce_limits: false # reject requests with 429 when the model's quota group is exhausted
 ```
 
 3. Start CLIProxyAPI and inspect `/v1/models`.
@@ -129,7 +133,6 @@ The plugin publishes standard built-in model aliases matching CLIProxyAPI conven
 gemini-3.8-flash-high
 gemini-3.8-flash-medium
 gemini-3.8-flash-low
-claude-3-7-sonnet-thought
 agy/default
 ```
 
@@ -240,16 +243,18 @@ Reasoning effort can be configured via:
 For a non-streaming request the plugin runs:
 
 ```bash
-printf "%s" "<prompt>" | agy --output-format json --print-timeout 30m [--conversation <id>] [--effort <effort>] [--model <model>]
+printf "%s" "<prompt>" | agy --output-format json --print-timeout 30m --disable-slash-commands [--conversation <id>] [--effort <effort>] [--model <model>]
 ```
 
 For a streaming request it runs:
 
 ```bash
-printf "%s" "<prompt>" | agy --output-format stream-json --print-timeout 30m [--conversation <id>] [--effort <effort>] [--model <model>]
+printf "%s" "<prompt>" | agy --output-format stream-json --print-timeout 30m --disable-slash-commands [--conversation <id>] [--effort <effort>] [--model <model>]
 ```
 
 The prompt is piped directly to `agy`'s standard input rather than passed as a command-line argument, preventing issues with command-line length limits (`ARG_MAX`) and keeping prompt contents private from system process tables.
+
+`--disable-slash-commands` is always passed so that client text such as `/usage` or a plugin command is treated as a plain prompt and never expanded into an `agy` slash command or skill.
 
 ## Configuration
 
@@ -261,6 +266,38 @@ The prompt is piped directly to `agy`'s standard input rather than passed as a c
 | `dangerously_skip_permissions` | `false` | Adds `--dangerously-skip-permissions`. This auto-approves all Antigravity tool permission requests. |
 | `sandbox` | `false` | Adds Antigravity's `--sandbox` flag. |
 | `reasoning_effort` | empty | Default reasoning effort passed to `--effort` (`low`, `medium`, `high`). |
+| `limits_tracking` | `true` | Track Antigravity usage limits by running `agy /usage` (no tokens consumed). |
+| `limits_refresh_interval` | `1m` | How long cached limits stay fresh (minimum `10s`). Limits are also refreshed after any quota error. |
+| `enforce_limits` | `false` | Reject requests with HTTP 429 (`agy_quota_exhausted`, retryable) when the model's quota group is known to be exhausted, without starting `agy`. Off by default because paid plans may continue on AI credits after a limit is reached. |
+
+### Usage limits
+
+Antigravity groups models (for example *Gemini Models* and *Claude and GPT models*) and gives every group a weekly limit and a 5-hour limit. With `limits_tracking` enabled the plugin reads them from `agy /usage` and surfaces them in three places:
+
+- **Management API** — `GET /v0/management/agy/limits` (requires the CLIProxyAPI management key; add `?refresh=1` to bypass the cache):
+
+  ```json
+  {
+    "provider": "agy",
+    "tracking": true,
+    "fetched_at": "2026-11-15T14:20:00Z",
+    "groups": [
+      {
+        "name": "Gemini Models",
+        "description": "Models within this group: Gemini 3.8 Flash",
+        "buckets": [
+          {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.93, "reset_time": "2026-11-21T06:20:27Z"},
+          {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1, "reset_time": "2026-11-15T19:16:01Z"}
+        ]
+      }
+    ]
+  }
+  ```
+
+- **Response headers** on every completion, for the requested model's group: `X-AGY-Limit-Group`, `X-AGY-Limit-Weekly-Remaining`, `X-AGY-Limit-Weekly-Reset`, `X-AGY-Limit-5h-Remaining`, `X-AGY-Limit-5h-Reset`. CLIProxyAPI forwards them to clients only when `passthrough-headers: true` is set.
+- **CLIProxyAPI quota API** — the plugin implements the `quota_provider` capability (`quota.fetch`), so the host's `/v0/management/quota/*` endpoints work for any auth record whose provider is `agy`.
+
+Quota errors from `agy` are returned as HTTP 429 with `retryable` set from Antigravity's own error report, so CLIProxyAPI can cool down and retry correctly.
 
 ### Permission safety
 

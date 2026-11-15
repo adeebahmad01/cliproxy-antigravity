@@ -169,16 +169,6 @@ func standardBuiltinModels() []modelInfo {
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
 		},
-		{
-			ID:                         "claude-3-7-sonnet-thought",
-			Object:                     "model",
-			OwnedBy:                    "google-antigravity-cli",
-			DisplayName:                "Claude 3.7 Sonnet (Thinking)",
-			Name:                       "Claude 3.7 Sonnet (Thinking)",
-			Description:                "Claude 3.7 Sonnet Thinking model via Antigravity.",
-			SupportedGenerationMethods: []string{"chat"},
-			UserDefined:                true,
-		},
 	}
 }
 
@@ -205,8 +195,6 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		"Gemini 3.8 Flash (Medium)":       "gemini-3.8-flash-medium",
 		"gemini-3.8-flash-low":            "gemini-3.8-flash-low",
 		"Gemini 3.8 Flash (Low)":          "gemini-3.8-flash-low",
-		"claude-3-7-sonnet-thought":       "claude-3-7-sonnet-thought",
-		"Claude 3.7 Sonnet (Thinking)":    "claude-3-7-sonnet-thought",
 	}
 
 	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
@@ -252,19 +240,6 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	modelCatalog.models = models
 	modelCatalog.nativeByID = nativeByID
 	return cloneModels(models)
-}
-
-func defaultModelInfo() modelInfo {
-	return modelInfo{
-		ID:                         "agy/default",
-		Object:                     "model",
-		OwnedBy:                    "google-antigravity-cli",
-		DisplayName:                "Antigravity CLI (default model)",
-		Name:                       "Antigravity CLI (default model)",
-		Description:                "Uses the default model selected by the installed official agy CLI.",
-		SupportedGenerationMethods: []string{"chat"},
-		UserDefined:                true,
-	}
 }
 
 func cloneModels(in []modelInfo) []modelInfo {
@@ -701,7 +676,9 @@ func agyArgs(cfg pluginConfig, opts agyOptions) []string {
 	if outputFormat == "" {
 		outputFormat = "json"
 	}
-	args := []string{"--output-format", outputFormat, "--print-timeout", cfg.PrintTimeout}
+	// Client prompts are untrusted text: never let a leading "/" expand into an agy
+	// slash command or skill (e.g. "/usage", plugin commands).
+	args := []string{"--output-format", outputFormat, "--print-timeout", cfg.PrintTimeout, "--disable-slash-commands"}
 	if cfg.DangerouslySkipPermissions {
 		args = append(args, "--dangerously-skip-permissions")
 	}
@@ -771,6 +748,9 @@ func runAgyJSON(cfg pluginConfig, opts agyOptions, prompt string) (agyResult, st
 	activeProcesses.add(cmd)
 	errWait := cmd.Wait()
 	activeProcesses.remove(cmd)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return agyResult{}, stderr.String(), classifyAgyError(ctx.Err(), stderr.String())
+	}
 
 	result, errParse := parseAgyJSONOutput(stdout.Bytes())
 	if errParse != nil {
@@ -820,20 +800,91 @@ func parseAgyJSONOutput(raw []byte) (agyResult, error) {
 	return agyResult{}, fmt.Errorf("no terminal result object found")
 }
 
+// agyStructuredError is the machine-readable "AGY_ERROR: {...}" line agy writes to stderr.
+type agyStructuredError struct {
+	ShortError string `json:"short_error"`
+	Status     string `json:"status"`
+	ErrorCode  int    `json:"error_code"`
+	Retryable  bool   `json:"retryable"`
+	Reason     string `json:"reason"`
+}
+
+const agyErrorPrefix = "AGY_ERROR:"
+
+// splitAgyStderr separates the last structured AGY_ERROR line from the human-readable stderr text.
+func splitAgyStderr(stderr string) (agyStructuredError, bool, string) {
+	var structured agyStructuredError
+	found := false
+	var text []string
+	for _, line := range strings.Split(stderr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(trimmed, agyErrorPrefix); ok {
+			var parsed agyStructuredError
+			if json.Unmarshal([]byte(strings.TrimSpace(rest)), &parsed) == nil {
+				structured = parsed
+				found = true
+			}
+			continue
+		}
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "error:"))
+		if trimmed != "" {
+			text = append(text, trimmed)
+		}
+	}
+	return structured, found, strings.Join(text, "\n")
+}
+
 func classifyAgyError(err error, stderr string) error {
-	msg := strings.TrimSpace(strings.Join([]string{errorString(err), stderr}, "\n"))
+	structured, hasStructured, stderrText := splitAgyStderr(stderr)
+
+	// "exit status N" says nothing useful when agy explained itself on stderr.
+	var exitErr *exec.ExitError
+	errText := errorString(err)
+	if errors.As(err, &exitErr) && (stderrText != "" || hasStructured) {
+		errText = ""
+	}
+	if errText != "" && strings.Contains(stderrText, strings.TrimSpace(errText)) {
+		errText = ""
+	}
+	msg := strings.TrimSpace(strings.Join([]string{errText, stderrText}, "\n"))
+	if msg == "" && hasStructured {
+		msg = structured.ShortError
+	}
 	lower := strings.ToLower(msg)
-	switch {
-	case errors.Is(err, exec.ErrNotFound), strings.Contains(lower, "executable file not found"), strings.Contains(lower, "no such file or directory") && strings.Contains(lower, "agy"):
+
+	if errors.Is(err, exec.ErrNotFound) || strings.Contains(lower, "executable file not found") || strings.Contains(lower, "no such file or directory") && strings.Contains(lower, "agy") {
 		return pError("agy_not_found", "official Antigravity CLI executable was not found; install agy or set binary_path", http.StatusServiceUnavailable)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return pRetryableError("agy_timeout", "Antigravity CLI did not finish before the command timeout", http.StatusGatewayTimeout)
+	}
+
+	if hasStructured {
+		switch {
+		case structured.Status == "RESOURCE_EXHAUSTED" || structured.ErrorCode == http.StatusTooManyRequests:
+			markLimitsStale()
+			return &pluginError{Code: "agy_rate_limit", Message: nonEmpty(msg, "Antigravity quota or rate limit reached"), HTTPStatus: http.StatusTooManyRequests, Retryable: structured.Retryable}
+		case structured.Status == "UNAUTHENTICATED" || structured.ErrorCode == http.StatusUnauthorized:
+			return pError("agy_authentication_error", nonEmpty(msg, "Antigravity CLI is not authenticated"), http.StatusUnauthorized)
+		case structured.Status == "PERMISSION_DENIED" || structured.ErrorCode == http.StatusForbidden:
+			return pError("agy_permission_denied", nonEmpty(msg, "Antigravity denied the request"), http.StatusForbidden)
+		case structured.Status == "DEADLINE_EXCEEDED" || structured.Reason == "print_timeout":
+			return &pluginError{Code: "agy_timeout", Message: nonEmpty(msg, "Antigravity CLI print timeout reached"), HTTPStatus: http.StatusGatewayTimeout, Retryable: structured.Retryable}
+		case structured.ErrorCode >= 500 && structured.ErrorCode <= 599:
+			return &pluginError{Code: "agy_upstream_error", Message: nonEmpty(msg, "Antigravity upstream error"), HTTPStatus: http.StatusBadGateway, Retryable: structured.Retryable}
+		}
+	}
+
+	switch {
+	case strings.Contains(lower, "quota"), strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "resource_exhausted"):
+		markLimitsStale()
+		return pRetryableError("agy_rate_limit", nonEmpty(msg, "Antigravity quota or rate limit reached"), http.StatusTooManyRequests)
+	case strings.Contains(lower, "invalid model selection"), strings.Contains(lower, "model") && (strings.Contains(lower, "not found") || strings.Contains(lower, "unknown") || strings.Contains(lower, "not recognized")):
+		return pError("agy_model_not_found", nonEmpty(msg, "Antigravity model not found"), http.StatusNotFound)
 	case strings.Contains(lower, "sign in"), strings.Contains(lower, "login"), strings.Contains(lower, "authenticate"), strings.Contains(lower, "credential"):
 		return pError("agy_authentication_error", nonEmpty(msg, "Antigravity CLI is not authenticated"), http.StatusUnauthorized)
-	case strings.Contains(lower, "quota"), strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many requests"):
-		return pError("agy_rate_limit", nonEmpty(msg, "Antigravity quota or rate limit reached"), http.StatusTooManyRequests)
-	case strings.Contains(lower, "model") && (strings.Contains(lower, "not found") || strings.Contains(lower, "unknown")):
-		return pError("agy_model_not_found", nonEmpty(msg, "Antigravity model not found"), http.StatusNotFound)
 	default:
-		return pError("agy_execution_error", nonEmpty(msg, "Antigravity CLI execution failed"), http.StatusBadGateway)
+		return &pluginError{Code: "agy_execution_error", Message: nonEmpty(msg, "Antigravity CLI execution failed"), HTTPStatus: http.StatusBadGateway, Retryable: hasStructured && structured.Retryable}
 	}
 }
 
@@ -858,6 +909,9 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	if err != nil {
 		return executorResponse{}, err
 	}
+	if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
+		return executorResponse{}, err
+	}
 	result, _, err := runAgyJSON(cfg, opts, prompt)
 	if err != nil {
 		return executorResponse{}, err
@@ -871,6 +925,7 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	if result.ConversationID != "" {
 		headers.Set("X-AGY-Conversation-ID", result.ConversationID)
 	}
+	mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
 	return executorResponse{
 		Payload: payload,
 		Headers: headers,
@@ -930,7 +985,10 @@ func executeStream(req rpcExecutorRequest) {
 	var terminal *agyResult
 	var streamError string
 	var streamedText strings.Builder
+	emittedLen := 0
 	isToolCallStream := false
+	// With client tools, hold text back until it is clear the reply is not a tool-call block.
+	toolDecisionPending := opts.HasTools
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -950,21 +1008,27 @@ func executeStream(req rpcExecutorRequest) {
 		case "step_update":
 			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 				streamedText.WriteString(event.StepUpdate.TextDelta)
-				trimmedSoFar := strings.TrimSpace(streamedText.String())
 
-				// If tools are configured and response looks like a tool call, buffer instead of streaming raw text
-				if opts.HasTools && (strings.HasPrefix(trimmedSoFar, "```tool_calls") || strings.HasPrefix(trimmedSoFar, "```json") || strings.HasPrefix(trimmedSoFar, "[")) {
-					isToolCallStream = true
+				if toolDecisionPending {
+					switch toolCallPrefixState(streamedText.String()) {
+					case toolPrefixMatch:
+						isToolCallStream = true
+						toolDecisionPending = false
+					case toolPrefixNone:
+						toolDecisionPending = false
+					}
+				}
+				if isToolCallStream || toolDecisionPending {
 					continue
 				}
 
-				if !isToolCallStream {
-					payload := makeSSEChunk(completionID, created, model, map[string]any{"content": event.StepUpdate.TextDelta}, nil, nil, conversationID)
-					if err := emitPluginStreamChunk(streamID, payload); err != nil {
-						killProcessTree(cmd)
-						_ = cmd.Wait()
-						return
-					}
+				pending := streamedText.String()[emittedLen:]
+				emittedLen = streamedText.Len()
+				payload := makeSSEChunk(completionID, created, model, map[string]any{"content": pending}, nil, nil, conversationID)
+				if err := emitPluginStreamChunk(streamID, payload); err != nil {
+					killProcessTree(cmd)
+					_ = cmd.Wait()
+					return
 				}
 			}
 		case "result":
@@ -992,6 +1056,10 @@ func executeStream(req rpcExecutorRequest) {
 
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		closePluginStream(streamID, classifyAgyError(ctx.Err(), stderr.String()).Error())
+		return
+	}
 	if scanErr != nil {
 		closePluginStream(streamID, "reading agy stream: "+scanErr.Error())
 		return
@@ -1009,11 +1077,8 @@ func executeStream(req rpcExecutorRequest) {
 		return
 	}
 	if !strings.EqualFold(terminal.Status, "SUCCESS") {
-		msg := nonEmpty(terminal.Error, stderr.String())
-		if msg == "" {
-			msg = "Antigravity CLI ended with status " + terminal.Status
-		}
-		closePluginStream(streamID, msg)
+		msg := nonEmpty(terminal.Error, "Antigravity CLI ended with status "+terminal.Status)
+		closePluginStream(streamID, classifyAgyError(errors.New(msg), stderr.String()).Error())
 		return
 	}
 	if waitErr != nil {
@@ -1034,21 +1099,20 @@ func executeStream(req rpcExecutorRequest) {
 		}, nil, nil, conversationID)
 		_ = emitPluginStreamChunk(streamID, toolDelta)
 
+		// The finish chunk and the usage chunk must stay separate: a usage chunk has empty choices.
 		finishReason := "tool_calls"
-		var finalUsage map[string]any
+		_ = emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, &finishReason, nil, conversationID))
 		if requestWantsUsage(req.Payload) {
-			finalUsage = openAIUsage(terminal.Usage)
+			_ = emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, nil, openAIUsage(terminal.Usage), conversationID))
 		}
-		finalPayload := makeSSEChunk(completionID, created, model, map[string]any{}, &finishReason, finalUsage, conversationID)
-		_ = emitPluginStreamChunk(streamID, finalPayload)
 		_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
 		closePluginStream(streamID, "")
 		return
 	}
 
 	// If it was buffered thinking it was a tool call but turned out not to be
-	if isToolCallStream && streamedText.Len() > 0 {
-		payload := makeSSEChunk(completionID, created, model, map[string]any{"content": streamedText.String()}, nil, nil, conversationID)
+	if streamedText.Len() > emittedLen {
+		payload := makeSSEChunk(completionID, created, model, map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil, conversationID)
 		_ = emitPluginStreamChunk(streamID, payload)
 	} else if streamedText.Len() == 0 && terminal.Response != "" {
 		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"content": terminal.Response}, nil, nil, conversationID)); err != nil {
@@ -1069,6 +1133,38 @@ func executeStream(req rpcExecutorRequest) {
 		return
 	}
 	closePluginStream(streamID, "")
+}
+
+type toolPrefixState int
+
+const (
+	toolPrefixPending toolPrefixState = iota
+	toolPrefixMatch
+	toolPrefixNone
+)
+
+var toolCallMarkers = []string{"```tool_calls", "```json", "[", "{"}
+
+// toolCallPrefixState reports whether streamed text starts a tool-call block, cannot start one,
+// or is still too short to tell (e.g. a lone "`").
+func toolCallPrefixState(text string) toolPrefixState {
+	trimmed := strings.TrimLeftFunc(text, unicode.IsSpace)
+	if trimmed == "" {
+		return toolPrefixPending
+	}
+	pending := false
+	for _, marker := range toolCallMarkers {
+		if strings.HasPrefix(trimmed, marker) {
+			return toolPrefixMatch
+		}
+		if strings.HasPrefix(marker, trimmed) {
+			pending = true
+		}
+	}
+	if pending {
+		return toolPrefixPending
+	}
+	return toolPrefixNone
 }
 
 func emitPluginStreamChunk(streamID string, payload []byte) error {
