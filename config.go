@@ -108,6 +108,9 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			continue
 		}
 		value = unquoteYAMLScalar(value)
+		if value == "" || value == "~" || value == "null" { // management clients may save empty fields; keep the default
+			continue
+		}
 
 		switch key {
 		case "binary_path":

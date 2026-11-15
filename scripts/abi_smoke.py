@@ -113,6 +113,12 @@ def main() -> int:
             raise RuntimeError(f"registration failed: {registration}")
         result = registration["result"]
         assert result["capabilities"]["executor_model_scope"] == "static"
+        fields = {f["Name"]: f for f in result["metadata"]["ConfigFields"]}
+        if fields["reasoning_effort"]["Type"] != "enum" or fields["binary_path"]["Default"] != "agy":
+            raise RuntimeError(f"unexpected config field metadata: {fields}")
+
+        if not result["capabilities"].get("model_router"):
+            raise RuntimeError("expected model_router capability")
 
         rc, model_response = call("model.register", {})
         if rc != 0 or not model_response.get("ok"):
@@ -120,6 +126,14 @@ def main() -> int:
         model_ids = [m["ID"] for m in model_response["result"]["Models"]]
         if "agy/default" not in model_ids or "agy/mock-model-high" not in model_ids:
             raise RuntimeError(f"expected default + discovered model: {model_ids}")
+
+        # agy has no CLIProxyAPI auth record, so its models are routed straight to this executor.
+        rc, route = call("model.route", {"RequestedModel": "agy/mock-model(high)"})
+        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
+            raise RuntimeError(f"expected self route for agy model: {route}")
+        rc, route = call("model.route", {"RequestedModel": "gpt-5.5"})
+        if rc != 0 or route["result"]["Handled"]:
+            raise RuntimeError(f"foreign model must not be routed: {route}")
 
         chat_request = {
             "model": "agy/mock-model-high",
@@ -155,6 +169,15 @@ def main() -> int:
         slash_payload = json.loads(base64.b64decode(execution["result"]["Payload"]))
         if slash_payload["choices"][0]["message"]["content"] != "mock response":
             raise RuntimeError(f"client prompt was run as a slash command: {slash_payload}")
+
+        # Client payload faults must not cool down the agy credential.
+        bad_request = {"model": "agy/mock-model-high", "messages": []}
+        rc, execution = call(
+            "executor.execute",
+            {"Model": "agy/mock-model-high", "Payload": base64.b64encode(json.dumps(bad_request).encode()).decode()},
+        )
+        if rc == 0 or execution["error"]["code"] != "request_scoped" or execution["error"]["http_status"] != 400:
+            raise RuntimeError(f"expected request_scoped 400: {execution}")
 
         rc, management = call("management.register", {})
         routes = management.get("result", {}).get("routes", [])

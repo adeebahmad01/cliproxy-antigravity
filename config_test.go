@@ -83,3 +83,20 @@ func TestParsePluginConfigSecurityValidations(t *testing.T) {
 		}
 	}
 }
+
+func TestParsePluginConfigEmptyValuesKeepDefaults(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte(`
+enabled: true
+priority: 1
+reasoning_effort: ""
+limits_refresh_interval: ''
+enforce_limits: null
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := defaultConfig()
+	if cfg.DefaultReasoningEffort != "" || cfg.LimitsRefreshInterval != want.LimitsRefreshInterval || cfg.EnforceLimits != want.EnforceLimits {
+		t.Fatalf("empty values should keep defaults, got %+v", cfg)
+	}
+}

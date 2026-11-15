@@ -84,6 +84,13 @@ jobs:
           if [ -n "${{ matrix.cc }}" ]; then
             export CC="${{ matrix.cc }}"
           fi
+          # Pin the baseline instruction set so the library loads on older CPUs and VMs
+          # (CLIProxyAPI's recommendation for distributed c-shared plugins).
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            export GOAMD64=v1 CGO_CFLAGS="-march=x86-64"
+          else
+            export GOARM64=v8.0 CGO_CFLAGS="-march=armv8-a"
+          fi
 
           CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -buildmode=c-shared \

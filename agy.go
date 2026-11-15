@@ -242,6 +242,59 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	return cloneModels(models)
 }
 
+// routeModel sends requests for agy models straight to this plugin's executor. agy manages its
+// own login, so there is no CLIProxyAPI auth record for the host's credential scheduler to pick.
+// When an agy auth record does exist, the normal auth path is left in charge.
+func routeModel(req modelRouteRequest) modelRouteResponse {
+	if containsFold(req.AvailableProviders, providerID) {
+		return modelRouteResponse{}
+	}
+	model := strings.TrimSpace(req.RequestedModel)
+	if open := strings.LastIndex(model, "("); open > 0 && strings.HasSuffix(model, ")") {
+		model = strings.TrimSpace(model[:open])
+	}
+	for _, suffix := range []string{":low", ":medium", ":med", ":high"} {
+		if strings.HasSuffix(strings.ToLower(model), suffix) {
+			model = model[:len(model)-len(suffix)]
+			break
+		}
+	}
+	lower := strings.ToLower(model)
+	// antigravity/ is only claimed when the built-in Antigravity provider is not configured.
+	owned := strings.HasPrefix(lower, "agy/") ||
+		strings.HasPrefix(lower, "antigravity/") && !containsFold(req.AvailableProviders, "antigravity") ||
+		catalogHasModel(model)
+	if !owned {
+		return modelRouteResponse{}
+	}
+	return modelRouteResponse{Handled: true, TargetKind: "self", Reason: "agy model served by the local Antigravity CLI"}
+}
+
+// catalogHasModel checks the last published catalog without running agy, since routing is on the request path.
+func catalogHasModel(model string) bool {
+	modelCatalog.Lock()
+	models := modelCatalog.models
+	modelCatalog.Unlock()
+	if len(models) == 0 {
+		models = standardBuiltinModels()
+	}
+	for _, m := range models {
+		if strings.EqualFold(m.ID, model) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFold(values []string, target string) bool {
+	for _, v := range values {
+		if strings.EqualFold(strings.TrimSpace(v), target) {
+			return true
+		}
+	}
+	return false
+}
+
 func cloneModels(in []modelInfo) []modelInfo {
 	out := make([]modelInfo, len(in))
 	copy(out, in)
@@ -566,16 +619,25 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 	}
 
 	effort := ""
-	// 1. Check explicit model colon suffix override :low, :medium, :med, :high (e.g. model:high)
+	// 1. CLIProxyAPI thinking suffix (e.g. model(high)). The host normally moves it into
+	// reasoning_effort itself, but passes it through for models it has no metadata for.
+	if open := strings.LastIndex(requestedModel, "("); open > 0 && strings.HasSuffix(requestedModel, ")") {
+		effort = normalizeEffort(requestedModel[open+1 : len(requestedModel)-1])
+		requestedModel = strings.TrimSpace(requestedModel[:open])
+	}
+
+	// 2. Check explicit model colon suffix override :low, :medium, :med, :high (e.g. model:high)
 	for _, suffix := range []string{":low", ":medium", ":med", ":high"} {
 		if strings.HasSuffix(strings.ToLower(requestedModel), suffix) {
-			effort = normalizeEffort(strings.TrimPrefix(suffix, ":"))
+			if effort == "" {
+				effort = normalizeEffort(strings.TrimPrefix(suffix, ":"))
+			}
 			requestedModel = strings.TrimSpace(requestedModel[:len(requestedModel)-len(suffix)])
 			break
 		}
 	}
 
-	// 2. Split model name: if model has a reasoning effort suffix (e.g. -high, -medium, -low),
+	// 3. Split model name: if model has a reasoning effort suffix (e.g. -high, -medium, -low),
 	// split the last part into reasoning effort and strip it to the base model name.
 	modelEffort := extractEffortSuffix(requestedModel)
 	if modelEffort != "" {
@@ -585,12 +647,12 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		requestedModel = stripEffortSuffix(requestedModel)
 	}
 
-	// 3. Fallback: Check chatReq.ReasoningEffort from request payload
+	// 4. Fallback: Check chatReq.ReasoningEffort from request payload
 	if effort == "" && chatReq.ReasoningEffort != "" {
 		effort = normalizeEffort(chatReq.ReasoningEffort)
 	}
 
-	// 4. Fallback: Check request headers (X-AGY-Effort, X-Reasoning-Effort)
+	// 5. Fallback: Check request headers (X-AGY-Effort, X-Reasoning-Effort)
 	if effort == "" && req.Headers != nil {
 		if val := req.Headers.Get("X-AGY-Effort"); val != "" {
 			effort = normalizeEffort(val)
@@ -599,7 +661,7 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		}
 	}
 
-	// 5. Fallback: Check request metadata (reasoning_effort, effort)
+	// 6. Fallback: Check request metadata (reasoning_effort, effort)
 	if effort == "" && req.Metadata != nil {
 		if val, ok := req.Metadata["reasoning_effort"].(string); ok && val != "" {
 			effort = normalizeEffort(val)
@@ -608,12 +670,12 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		}
 	}
 
-	// 6. Fallback: Check config default if specified
+	// 7. Fallback: Check config default if specified
 	if effort == "" && cfg.DefaultReasoningEffort != "" {
 		effort = cfg.DefaultReasoningEffort
 	}
 
-	// 7. Fallback: If the model requires an effort flag but none was provided, use model default fallback
+	// 8. Fallback: If the model requires an effort flag but none was provided, use model default fallback
 	if effort == "" {
 		effort = defaultEffortForModel(requestedModel)
 	}
@@ -880,7 +942,7 @@ func classifyAgyError(err error, stderr string) error {
 		markLimitsStale()
 		return pRetryableError("agy_rate_limit", nonEmpty(msg, "Antigravity quota or rate limit reached"), http.StatusTooManyRequests)
 	case strings.Contains(lower, "invalid model selection"), strings.Contains(lower, "model") && (strings.Contains(lower, "not found") || strings.Contains(lower, "unknown") || strings.Contains(lower, "not recognized")):
-		return pError("agy_model_not_found", nonEmpty(msg, "Antigravity model not found"), http.StatusNotFound)
+		return pError(errorCodeModelNotFound, nonEmpty(msg, "Antigravity model not found"), http.StatusNotFound)
 	case strings.Contains(lower, "sign in"), strings.Contains(lower, "login"), strings.Contains(lower, "authenticate"), strings.Contains(lower, "credential"):
 		return pError("agy_authentication_error", nonEmpty(msg, "Antigravity CLI is not authenticated"), http.StatusUnauthorized)
 	default:
@@ -944,7 +1006,7 @@ func executeStream(req rpcExecutorRequest) {
 
 	prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
 	if err != nil {
-		closePluginStream(streamID, err.Error())
+		closePluginStream(streamID, err)
 		return
 	}
 
@@ -952,18 +1014,18 @@ func executeStream(req rpcExecutorRequest) {
 	defer cancel()
 	cmd, err := newAgyCommand(ctx, cfg, opts, prompt)
 	if err != nil {
-		closePluginStream(streamID, err.Error())
+		closePluginStream(streamID, err)
 		return
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		closePluginStream(streamID, err.Error())
+		closePluginStream(streamID, err)
 		return
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		closePluginStream(streamID, classifyAgyError(err, stderr.String()).Error())
+		closePluginStream(streamID, classifyAgyError(err, stderr.String()))
 		return
 	}
 	activeProcesses.add(cmd)
@@ -1057,32 +1119,32 @@ func executeStream(req rpcExecutorRequest) {
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		closePluginStream(streamID, classifyAgyError(ctx.Err(), stderr.String()).Error())
+		closePluginStream(streamID, classifyAgyError(ctx.Err(), stderr.String()))
 		return
 	}
 	if scanErr != nil {
-		closePluginStream(streamID, "reading agy stream: "+scanErr.Error())
+		closePluginStream(streamID, pRetryableError("agy_stream_error", "reading agy stream: "+scanErr.Error(), http.StatusBadGateway))
 		return
 	}
 	if streamError != "" {
-		closePluginStream(streamID, streamError)
+		closePluginStream(streamID, classifyAgyError(errors.New(streamError), stderr.String()))
 		return
 	}
 	if terminal == nil {
 		if waitErr != nil {
-			closePluginStream(streamID, classifyAgyError(waitErr, stderr.String()).Error())
+			closePluginStream(streamID, classifyAgyError(waitErr, stderr.String()))
 		} else {
-			closePluginStream(streamID, "agy stream ended without a result event")
+			closePluginStream(streamID, pError("invalid_upstream_response", "agy stream ended without a result event", http.StatusBadGateway))
 		}
 		return
 	}
 	if !strings.EqualFold(terminal.Status, "SUCCESS") {
 		msg := nonEmpty(terminal.Error, "Antigravity CLI ended with status "+terminal.Status)
-		closePluginStream(streamID, classifyAgyError(errors.New(msg), stderr.String()).Error())
+		closePluginStream(streamID, classifyAgyError(errors.New(msg), stderr.String()))
 		return
 	}
 	if waitErr != nil {
-		closePluginStream(streamID, classifyAgyError(waitErr, stderr.String()).Error())
+		closePluginStream(streamID, classifyAgyError(waitErr, stderr.String()))
 		return
 	}
 
@@ -1106,7 +1168,7 @@ func executeStream(req rpcExecutorRequest) {
 			_ = emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, nil, openAIUsage(terminal.Usage), conversationID))
 		}
 		_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
-		closePluginStream(streamID, "")
+		closePluginStream(streamID, nil)
 		return
 	}
 
@@ -1132,7 +1194,7 @@ func executeStream(req rpcExecutorRequest) {
 	if err := emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n")); err != nil {
 		return
 	}
-	closePluginStream(streamID, "")
+	closePluginStream(streamID, nil)
 }
 
 type toolPrefixState int
@@ -1175,9 +1237,16 @@ func emitPluginStreamChunk(streamID string, payload []byte) error {
 	return err
 }
 
-func closePluginStream(streamID, errMsg string) {
+// closePluginStream ends a plugin stream; a non-nil err is reported with its status, code and retry-after.
+func closePluginStream(streamID string, err error) {
 	if strings.TrimSpace(streamID) == "" {
 		return
 	}
-	_, _ = callHost(methodHostStreamClose, streamCloseRequest{StreamID: streamID, Error: strings.TrimSpace(errMsg)})
+	req := streamCloseRequest{StreamID: streamID}
+	if err != nil {
+		pe := asPluginError(err)
+		req.Error = strings.TrimSpace(pe.Message)
+		req.ErrorDetail = pe.envelopeError()
+	}
+	_, _ = callHost(methodHostStreamClose, req)
 }

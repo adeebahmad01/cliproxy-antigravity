@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"reflect"
 	"testing"
@@ -272,6 +273,52 @@ func TestResolveExecutionOptions(t *testing.T) {
 	if opts9.NativeModel != "claude-sonnet-4-6" {
 		t.Fatalf("expected native model claude-sonnet-4-6, got %q", opts9.NativeModel)
 	}
+
+	// 10. CLIProxyAPI thinking suffix that the host passed through: agy/gemini-3.8-flash(low)
+	req10 := rpcExecutorRequest{
+		Model:   "agy/gemini-3.8-flash(low)",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`),
+	}
+	opts10 := resolveExecutionOptions(req10, cfg)
+	if opts10.ReasoningEffort != "low" || opts10.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected low effort on gemini-3.8-flash from (low) suffix, got %q on %q", opts10.ReasoningEffort, opts10.NativeModel)
+	}
+
+	// 11. A numeric budget suffix is stripped from the model and falls back to other sources
+	req11 := rpcExecutorRequest{
+		Model:   "agy/gemini-3.8-flash(8192)",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}`),
+	}
+	opts11 := resolveExecutionOptions(req11, cfg)
+	if opts11.ReasoningEffort != "medium" || opts11.NativeModel != "gemini-3.8-flash" {
+		t.Fatalf("expected payload effort on gemini-3.8-flash, got %q on %q", opts11.ReasoningEffort, opts11.NativeModel)
+	}
+}
+
+func TestErrorEnvelopeCarriesRetryAfter(t *testing.T) {
+	raw := mustErrorEnvelope(&pluginError{Code: "agy_quota_exhausted", Message: "exhausted", HTTPStatus: http.StatusTooManyRequests, Retryable: true, RetryAfterSeconds: 90})
+	var env struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code              string `json:"code"`
+			HTTPStatus        int    `json:"http_status"`
+			Retryable         bool   `json:"retryable"`
+			RetryAfterSeconds int    `json:"retry_after_seconds"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.OK || env.Error.Code != "agy_quota_exhausted" || env.Error.HTTPStatus != 429 || !env.Error.Retryable || env.Error.RetryAfterSeconds != 90 {
+		t.Fatalf("unexpected envelope: %s", raw)
+	}
+}
+
+func TestClassifyAgyErrorModelNotFoundUsesHostCode(t *testing.T) {
+	pe := asPluginError(classifyAgyError(errors.New("invalid model selection: nope"), ""))
+	if pe.Code != errorCodeModelNotFound || pe.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("expected %s/404, got %s/%d", errorCodeModelNotFound, pe.Code, pe.HTTPStatus)
+	}
 }
 
 func TestParseAgyJSONOutputUsesTerminalLine(t *testing.T) {
@@ -281,5 +328,29 @@ func TestParseAgyJSONOutputUsesTerminalLine(t *testing.T) {
 	}
 	if got.Status != "SUCCESS" || got.Response != "ok" {
 		t.Fatalf("unexpected result: %#v", got)
+	}
+}
+
+func TestRouteModel(t *testing.T) {
+	invalidateModels()
+	cases := []struct {
+		model     string
+		providers []string
+		want      bool
+	}{
+		{"agy/gemini-3.8-flash", nil, true},
+		{"agy/gemini-3.8-flash(high)", nil, true},
+		{"agy/default:high", nil, true},
+		{"gemini-3.8-flash-high", nil, true},
+		{"antigravity/gemini-3.8-flash", nil, true},
+		{"antigravity/gemini-3.8-flash", []string{"antigravity"}, false},
+		{"gpt-5.5", nil, false},
+		{"agy/gemini-3.8-flash", []string{"agy"}, false},
+	}
+	for _, tc := range cases {
+		resp := routeModel(modelRouteRequest{RequestedModel: tc.model, AvailableProviders: tc.providers})
+		if resp.Handled != tc.want || (tc.want && resp.TargetKind != "self") {
+			t.Errorf("routeModel(%q, %v) = %+v, want handled=%v", tc.model, tc.providers, resp, tc.want)
+		}
 	}
 }

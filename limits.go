@@ -270,10 +270,12 @@ func checkModelLimits(cfg pluginConfig, nativeModel string) error {
 			continue
 		}
 		msg := fmt.Sprintf("Antigravity %s limit for %s is exhausted", nonEmpty(b.Window, b.ID), group.Name)
+		retryAfter := 0
 		if reset, ok := b.resetAt(); ok {
 			msg += fmt.Sprintf("; resets at %s (in %s)", reset.UTC().Format(time.RFC3339), reset.Sub(now).Round(time.Minute))
+			retryAfter = int(math.Ceil(reset.Sub(now).Seconds()))
 		}
-		return &pluginError{Code: "agy_quota_exhausted", Message: msg, HTTPStatus: http.StatusTooManyRequests, Retryable: true}
+		return &pluginError{Code: "agy_quota_exhausted", Message: msg, HTTPStatus: http.StatusTooManyRequests, Retryable: true, RetryAfterSeconds: retryAfter}
 	}
 	return nil
 }
