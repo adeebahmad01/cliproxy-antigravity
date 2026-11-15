@@ -205,7 +205,7 @@ func stageImage(dataURLOrPath string, workdir string) (string, error) {
 		if workdir != "" {
 			cacheDir = filepath.Join(workdir, ".cliproxy_cache", "images")
 		}
-		if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		if err := os.MkdirAll(cacheDir, 0700); err != nil {
 			return "", fmt.Errorf("failed to create image cache directory: %w", err)
 		}
 
@@ -214,7 +214,7 @@ func stageImage(dataURLOrPath string, workdir string) (string, error) {
 		targetPath := filepath.Join(cacheDir, filename)
 
 		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-			if err := os.WriteFile(targetPath, rawBytes, 0644); err != nil {
+			if err := os.WriteFile(targetPath, rawBytes, 0600); err != nil {
 				return "", fmt.Errorf("failed to write cached image: %w", err)
 			}
 		}

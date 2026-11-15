@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Added
+
+- Antigravity usage-limit tracking from `agy /usage` (weekly and 5-hour quota per model group), cached and refreshed every `limits_refresh_interval` and after quota errors:
+  - Management API route `GET /v0/management/agy/limits`.
+  - `X-AGY-Limit-*` response headers for the requested model's quota group.
+  - CLIProxyAPI `quota_provider` capability (`quota.identifier`, `quota.describe`, `quota.fetch`).
+  - Optional `enforce_limits` to reject requests for an exhausted group with a retryable 429 before starting `agy`.
+- New config fields: `limits_tracking`, `limits_refresh_interval`, `enforce_limits`.
+
+### Fixed
+
+- Client prompts beginning with `/` were expanded as `agy` slash commands (for example `/usage` or plugin/skill commands); `--disable-slash-commands` is now always passed.
+- Removed the `claude-3-7-sonnet-thought` built-in alias, which `agy` rejects as an unknown model.
+- Errors are classified from `agy`'s structured `AGY_ERROR` report: quota errors carry `retryable`, unknown models return 404 instead of 502, print and command timeouts return 504, and duplicated or `exit status N` messages are cleaned up.
+- The plugin now sets the `retryable` flag on error envelopes.
+- Streaming with client tools: a partial tool-call fence (such as a lone `` ` ``) was streamed as raw text before being recognised; text is now held back until the reply can be classified.
+- Streaming tool calls with `stream_options.include_usage` lost `finish_reason: "tool_calls"` because it shared a chunk with usage (usage chunks have empty `choices`).
+- Staged images are written owner-only (`0700` directory, `0600` files) instead of world-readable.
+
 ## [0.1.3] - 2026-09-23
 
 ### Added

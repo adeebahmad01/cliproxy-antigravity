@@ -25,6 +25,12 @@ const (
 	methodExecutorExecuteStream = "executor.execute_stream"
 	methodExecutorCountTokens   = "executor.count_tokens"
 	methodExecutorHTTPRequest   = "executor.http_request"
+	methodManagementRegister    = "management.register"
+	methodManagementHandle      = "management.handle"
+	methodQuotaIdentifier       = "quota.identifier"
+	methodQuotaDescribe         = "quota.describe"
+	methodQuotaFetch            = "quota.fetch"
+	methodQuotaReset            = "quota.reset"
 	methodHostStreamEmit        = "host.stream.emit"
 	methodHostStreamClose       = "host.stream.close"
 )
@@ -46,6 +52,7 @@ type pluginError struct {
 	Code       string
 	Message    string
 	HTTPStatus int
+	Retryable  bool
 }
 
 func (e *pluginError) Error() string { return e.Message }
@@ -63,6 +70,10 @@ func asPluginError(err error) *pluginError {
 
 func pError(code, message string, status int) error {
 	return &pluginError{Code: code, Message: message, HTTPStatus: status}
+}
+
+func pRetryableError(code, message string, status int) error {
+	return &pluginError{Code: code, Message: message, HTTPStatus: status, Retryable: true}
 }
 
 type lifecycleRequest struct {
@@ -99,6 +110,8 @@ type registrationCapability struct {
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats"`
 	ExecutorOutputFormats []string `json:"executor_output_formats"`
+	ManagementAPI         bool     `json:"management_api"`
+	QuotaProvider         bool     `json:"quota_provider"`
 }
 
 type identifierResponse struct {
@@ -226,11 +239,15 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if _, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir); err != nil {
 			return nil, err
 		}
+		if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
+			return nil, err
+		}
 		go executeStream(req)
 		headers := http.Header{"Content-Type": []string{"text/event-stream"}}
 		if opts.ConversationID != "" {
 			headers.Set("X-AGY-Conversation-ID", opts.ConversationID)
 		}
+		mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
 		return okEnvelope(executorStreamResponse{Headers: headers})
 
 	case methodExecutorCountTokens:
@@ -261,6 +278,43 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Body:       body,
 		})
 
+	case methodManagementRegister:
+		return okEnvelope(managementRegistrationResponse{Routes: []managementRoute{{
+			Method:      http.MethodGet,
+			Path:        limitsManagementPath,
+			Description: "Antigravity usage limits (weekly and 5-hour quota per model group). Add ?refresh=1 to bypass the cache.",
+		}}})
+
+	case methodManagementHandle:
+		var req managementRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, pError("invalid_request", "could not decode management request: "+err.Error(), 400)
+		}
+		return okEnvelope(handleManagement(req))
+
+	case methodQuotaIdentifier:
+		return okEnvelope(identifierResponse{Identifier: providerID})
+
+	case methodQuotaDescribe:
+		return okEnvelope(quotaDescribeResponse{SupportedProviders: []string{providerID, "antigravity"}, DisplayName: "Antigravity CLI"})
+
+	case methodQuotaFetch:
+		cfg := currentConfig()
+		if !cfg.LimitsTracking {
+			return nil, pError("limits_tracking_disabled", "limits tracking is disabled in the cliproxy-antigravity configuration", http.StatusServiceUnavailable)
+		}
+		limits, _, err := currentLimits(cfg)
+		if limits == nil {
+			if err == nil {
+				err = fmt.Errorf("Antigravity usage limits are unavailable")
+			}
+			return nil, err
+		}
+		return okEnvelope(quotaFetchFromLimits(limits))
+
+	case methodQuotaReset:
+		return okEnvelope(quotaResetResponse{Success: false, Message: "Antigravity quota cannot be reset by the plugin; it refreshes on the schedule reported by agy"})
+
 	default:
 		return nil, pError("unknown_method", fmt.Sprintf("unknown plugin method %q", method), 404)
 	}
@@ -281,6 +335,9 @@ func pluginRegistration() registration {
 				{Name: "dangerously_skip_permissions", Type: "boolean", Description: "Pass --dangerously-skip-permissions to agy. Disabled by default."},
 				{Name: "sandbox", Type: "boolean", Description: "Pass --sandbox to agy when supported by the installed CLI."},
 				{Name: "reasoning_effort", Type: "string", EnumValues: []string{"low", "medium", "high"}, Description: "Default reasoning effort for agy sessions (low, medium, high)."},
+				{Name: "limits_tracking", Type: "boolean", Description: "Track Antigravity usage limits via agy /usage (default: true)."},
+				{Name: "limits_refresh_interval", Type: "string", Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
+				{Name: "enforce_limits", Type: "boolean", Description: "Reject requests with HTTP 429 when the model's quota group is exhausted, without launching agy (default: false)."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -290,6 +347,8 @@ func pluginRegistration() registration {
 			ExecutorModelScope:    "static",
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
+			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	}
 }
@@ -302,12 +361,13 @@ func okEnvelope(v any) ([]byte, error) {
 	return json.Marshal(envelope{OK: true, Result: raw})
 }
 
-func mustErrorEnvelope(code, message string, status int) []byte {
+func mustErrorEnvelope(code, message string, status int, retryable bool) []byte {
 	raw, _ := json.Marshal(envelope{
 		OK: false,
 		Error: &envelopeError{
 			Code:       code,
 			Message:    message,
+			Retryable:  retryable,
 			HTTPStatus: status,
 		},
 	})
