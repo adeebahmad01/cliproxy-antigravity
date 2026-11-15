@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+Requires CLIProxyAPI v8 (tested against v8.0.72).
+
 ### Added
 
 - Antigravity usage-limit tracking from `agy /usage` (weekly and 5-hour quota per model group), cached and refreshed every `limits_refresh_interval` and after quota errors:
