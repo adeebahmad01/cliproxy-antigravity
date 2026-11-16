@@ -84,10 +84,10 @@
     <h2>Add an Antigravity account</h2>
     <ol>
       <li><a id="loginLink" href="#" target="_blank" rel="noopener noreferrer">Open Google sign-in</a> and sign in with the account you want to add.</li>
-      <li>You end up on an antigravity.google page. Copy that page's full URL from the address bar (or the code it shows) and paste it here.</li>
+      <li>Google then shows an authorization code. Copy it and paste it here.</li>
     </ol>
     <form id="codeForm" class="row">
-      <input id="codeInput" autocomplete="off" placeholder="https://antigravity.google/oauth-callback?code=...">
+      <input id="codeInput" autocomplete="off" placeholder="Authorization code">
       <button id="codeBtn" class="primary" type="submit">Add</button>
       <button id="cancelBtn" type="button">Cancel</button>
     </form>
@@ -259,6 +259,7 @@
     const value = $('codeInput').value.trim();
     if (!value) return;
     const body = { provider: PROVIDER, state: login.state };
+    // A pasted callback URL still works; the host extracts the code from it.
     if (/^https?:\/\//i.test(value)) body.redirect_url = value; else body.code = value;
     $('codeBtn').disabled = true;
     try {

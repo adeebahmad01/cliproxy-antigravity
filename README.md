@@ -313,9 +313,9 @@ agy keeps its login, settings and conversations in `$HOME/.gemini/antigravity-cl
 The plugin adds an **Antigravity accounts** entry to the management panel's sidebar. It lists every account with its usage limits and lets you add, disable and remove accounts:
 
 1. Click **Add account**, then **Open Google sign-in**, and sign in with the account to add.
-2. Google sends you to an `antigravity.google/oauth-callback` page. Copy that page's URL (or the code it shows) and paste it into the panel.
+2. Google then shows an authorization code. Copy it and paste it into the panel.
 
-An **Antigravity CLI** card also appears on the panel's OAuth login page. It runs the same flow, and you paste the URL into the panel's usual callback box.
+An **Antigravity CLI** card also appears on the panel's OAuth login page. It runs the same flow, but the panel's callback box there expects the full `antigravity.google/oauth-callback` URL rather than just the code, so the sidebar page is the easier way.
 
 Behind the scenes the plugin starts the official `agy` sign-in in a new home under `accounts_dir` (default `~/.agy-accounts`) and types the pasted code into it. The tokens are exchanged and stored by `agy` itself; the plugin never sees them. CLIProxyAPI then saves an auth file pointing at the new home. Adding accounts from the panel requires Linux or macOS.
 
