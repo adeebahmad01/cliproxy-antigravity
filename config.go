@@ -52,7 +52,6 @@ func currentConfig() pluginConfig {
 	return configState.value
 }
 
-
 func isExecutableFile(path string) bool {
 	stat, err := os.Stat(path)
 	if err != nil || stat.IsDir() {
