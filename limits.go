@@ -138,6 +138,7 @@ func fetchAgyLimits(cfg pluginConfig) (agyLimits, error) {
 	if cfg.Workdir != "" {
 		cmd.Dir = cfg.Workdir
 	}
+	applyAccountEnv(cmd, cfg)
 	configureSysProcAttr(cmd)
 	cmd.Stdin = strings.NewReader("/usage\n")
 	var stdout, stderr bytes.Buffer
@@ -170,7 +171,11 @@ type limitsCache struct {
 	refreshing bool
 }
 
-var limitsState = limitsCache{}
+// limitsState holds one cache per account home ("" is the CLIProxyAPI process HOME).
+var limitsState = struct {
+	sync.Mutex
+	byHome map[string]*limitsCache
+}{byHome: map[string]*limitsCache{}}
 
 // fetchLimitsFunc is swapped out in tests.
 var fetchLimitsFunc = fetchAgyLimits
@@ -183,21 +188,32 @@ func limitsRefreshInterval(cfg pluginConfig) time.Duration {
 	return d
 }
 
+func limitsCacheFor(cfg pluginConfig) *limitsCache {
+	limitsState.Lock()
+	defer limitsState.Unlock()
+	c := limitsState.byHome[cfg.AccountHome]
+	if c == nil {
+		c = &limitsCache{}
+		limitsState.byHome[cfg.AccountHome] = c
+	}
+	return c
+}
+
 func invalidateLimits() {
 	limitsState.Lock()
-	limitsState.limits = nil
-	limitsState.fetchedAt = time.Time{}
-	limitsState.binaryPath = ""
-	limitsState.lastErr = nil
-	limitsState.stale = false
+	limitsState.byHome = map[string]*limitsCache{}
 	limitsState.Unlock()
 }
 
 // markLimitsStale forces the next lookup to refresh, e.g. after agy reports a quota error.
 func markLimitsStale() {
 	limitsState.Lock()
-	limitsState.stale = true
-	limitsState.Unlock()
+	defer limitsState.Unlock()
+	for _, c := range limitsState.byHome {
+		c.Lock()
+		c.stale = true
+		c.Unlock()
+	}
 }
 
 func (c *limitsCache) needsRefreshLocked(cfg pluginConfig) bool {
@@ -222,38 +238,40 @@ func (c *limitsCache) store(cfg pluginConfig, limits agyLimits, err error) {
 
 // currentLimits returns the cached limits, refreshing synchronously when they are stale.
 func currentLimits(cfg pluginConfig) (*agyLimits, time.Time, error) {
-	limitsState.Lock()
-	if !limitsState.needsRefreshLocked(cfg) {
-		limits, fetchedAt, lastErr := limitsState.limits, limitsState.fetchedAt, limitsState.lastErr
-		limitsState.Unlock()
+	c := limitsCacheFor(cfg)
+	c.Lock()
+	if !c.needsRefreshLocked(cfg) {
+		limits, fetchedAt, lastErr := c.limits, c.fetchedAt, c.lastErr
+		c.Unlock()
 		return limits, fetchedAt, lastErr
 	}
-	limitsState.refreshing = true
-	limitsState.Unlock()
+	c.refreshing = true
+	c.Unlock()
 
 	limits, err := fetchLimitsFunc(cfg)
-	limitsState.store(cfg, limits, err)
+	c.store(cfg, limits, err)
 
-	limitsState.Lock()
-	defer limitsState.Unlock()
-	return limitsState.limits, limitsState.fetchedAt, limitsState.lastErr
+	c.Lock()
+	defer c.Unlock()
+	return c.limits, c.fetchedAt, c.lastErr
 }
 
 // cachedLimits never blocks on agy: it returns what is cached and refreshes in the background.
 func cachedLimits(cfg pluginConfig) *agyLimits {
-	limitsState.Lock()
-	defer limitsState.Unlock()
-	if limitsState.needsRefreshLocked(cfg) && !limitsState.refreshing {
-		limitsState.refreshing = true
+	c := limitsCacheFor(cfg)
+	c.Lock()
+	defer c.Unlock()
+	if c.needsRefreshLocked(cfg) && !c.refreshing {
+		c.refreshing = true
 		go func() {
 			limits, err := fetchLimitsFunc(cfg)
-			limitsState.store(cfg, limits, err)
+			c.store(cfg, limits, err)
 		}()
 	}
-	if limitsState.binaryPath != cfg.BinaryPath {
+	if c.binaryPath != cfg.BinaryPath {
 		return nil
 	}
-	return limitsState.limits
+	return c.limits
 }
 
 // checkModelLimits rejects a request up front when the model's quota group is known to be exhausted.
@@ -327,7 +345,15 @@ const limitsManagementPath = "/agy/limits"
 
 // Management API wire types. The host's structs carry no json tags, so Go field names are the keys.
 type managementRegistrationResponse struct {
-	Routes []managementRoute `json:"routes,omitempty"`
+	Routes    []managementRoute `json:"routes,omitempty"`
+	Resources []resourceRoute   `json:"resources,omitempty"`
+}
+
+// resourceRoute is a browser page served without management auth, listed in the UI sidebar.
+type resourceRoute struct {
+	Path        string
+	Menu        string
+	Description string
 }
 
 type managementRoute struct {
@@ -361,11 +387,27 @@ type limitsReport struct {
 
 func handleManagement(req managementRequest) managementResponse {
 	path := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(req.Path), "/v0/management"), "/")
-	if path != limitsManagementPath {
-		return jsonManagementResponse(http.StatusNotFound, map[string]string{"error": "unknown cliproxy-antigravity management route"})
+	// Resource pages are served without management auth: only the static page lives there.
+	if page, ok := strings.CutPrefix(path, "/v0/resource/plugins/"+pluginID); ok {
+		if page != accountsResourcePath {
+			return jsonManagementResponse(http.StatusNotFound, map[string]string{"error": "unknown cliproxy-antigravity resource"})
+		}
+		return accountsPageResponse()
 	}
 	if method := strings.ToUpper(strings.TrimSpace(req.Method)); method != "" && method != http.MethodGet {
 		return jsonManagementResponse(http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	}
+	refresh := false
+	if v := firstQueryValue(req.Query, "refresh"); v != "" && v != "0" && !strings.EqualFold(v, "false") {
+		refresh = true
+	}
+
+	switch path {
+	case limitsManagementPath:
+	case accountsManagementPath:
+		return jsonManagementResponse(http.StatusOK, listAccounts(currentConfig(), currentAuthDir(), refresh))
+	default:
+		return jsonManagementResponse(http.StatusNotFound, map[string]string{"error": "unknown cliproxy-antigravity management route"})
 	}
 
 	cfg := currentConfig()
@@ -373,8 +415,8 @@ func handleManagement(req managementRequest) managementResponse {
 	if !cfg.LimitsTracking {
 		return jsonManagementResponse(http.StatusOK, report)
 	}
-	if refresh := firstQueryValue(req.Query, "refresh"); refresh != "" && refresh != "0" && !strings.EqualFold(refresh, "false") {
-		markLimitsStale()
+	if refresh {
+		markAccountLimitsStale(cfg)
 	}
 	limits, fetchedAt, err := currentLimits(cfg)
 	if limits != nil {
@@ -415,6 +457,11 @@ type quotaDescribeResponse struct {
 	SupportedProviders []string `json:"supported_providers,omitempty"`
 	DisplayName        string   `json:"display_name,omitempty"`
 	SupportsReset      bool     `json:"supports_reset,omitempty"`
+}
+
+// quotaFetchRequest is the subset of pluginapi.QuotaFetchRequest needed to pick the account.
+type quotaFetchRequest struct {
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 type quotaFetchResponse struct {

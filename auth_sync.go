@@ -5,11 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // ensureAuthFile ensures an auth file for the agy provider is present in CLIProxyAPI's
 // auth-dir so the credential and quota card are displayed in CLIProxyAPI's management UI.
-func ensureAuthFile(configYAML []byte) {
+// With accounts_dir set, every signed-in account home in it gets its own auth file,
+// so CLIProxyAPI schedules the accounts like any other multi-credential provider.
+func ensureAuthFile(configYAML []byte, cfg pluginConfig) {
 	authDir := resolveAuthDir(configYAML)
 	if authDir == "" {
 		return
@@ -18,13 +21,15 @@ func ensureAuthFile(configYAML []byte) {
 		return
 	}
 
-	// Check if a valid, non-empty agy auth file already exists.
+	// Check which agy auth files already exist.
 	entries, err := os.ReadDir(authDir)
 	if err != nil {
 		return
 	}
 
 	var emptyCandidate string
+	hasAgyAuth := false
+	knownHomes := map[string]bool{}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
 			continue
@@ -42,12 +47,29 @@ func ensureAuthFile(configYAML []byte) {
 		}
 		var meta struct {
 			Type string `json:"type"`
+			Home string `json:"home"`
 		}
-		if errParse := json.Unmarshal(data, &meta); errParse == nil {
-			if strings.EqualFold(meta.Type, "agy") {
-				// Already present and valid
-				return
+		if errParse := json.Unmarshal(data, &meta); errParse == nil && strings.EqualFold(meta.Type, "agy") {
+			hasAgyAuth = true
+			if home, errHome := validateWorkdir(meta.Home); errHome == nil && home != "" {
+				knownHomes[home] = true
 			}
+		}
+	}
+
+	if cfg.AccountsDir != "" {
+		syncAccountAuthFiles(authDir, cfg.AccountsDir, knownHomes)
+	}
+
+	// The process HOME account is only added when no agy auth file exists yet. With accounts_dir
+	// set it must also be signed in, so an unused default home does not join the rotation.
+	if hasAgyAuth {
+		return
+	}
+	if cfg.AccountsDir != "" {
+		home, errHome := os.UserHomeDir()
+		if errHome != nil || !accountSignedIn(home) {
+			return
 		}
 	}
 
@@ -62,18 +84,83 @@ func ensureAuthFile(configYAML []byte) {
 		safeEmail := sanitizeEmailForFilename(email)
 		targetPath = filepath.Join(authDir, "antigravity-"+safeEmail+".json")
 	}
+	writeAgyAuthFile(targetPath, email, "")
+}
 
+// syncAccountAuthFiles adds an auth file for every signed-in account home under accountsDir
+// that no existing auth file points at. Accounts are signed in with HOME=<accountsDir>/<name> agy.
+func syncAccountAuthFiles(authDir, accountsDir string, knownHomes map[string]bool) {
+	entries, err := os.ReadDir(accountsDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		home := filepath.Join(accountsDir, entry.Name())
+		if knownHomes[home] || !accountSignedIn(home) {
+			continue
+		}
+		email := emailFromHome(home)
+		if email == "" {
+			email = entry.Name()
+		}
+		targetPath := filepath.Join(authDir, "antigravity-"+sanitizeEmailForFilename(email)+".json")
+		if _, errStat := os.Stat(targetPath); errStat == nil {
+			targetPath = filepath.Join(authDir, "antigravity-"+sanitizeEmailForFilename(email)+"-"+sanitizeEmailForFilename(entry.Name())+".json")
+			if _, errStat := os.Stat(targetPath); errStat == nil {
+				continue
+			}
+		}
+		writeAgyAuthFile(targetPath, email, home)
+		knownHomes[home] = true
+	}
+}
+
+func writeAgyAuthFile(path, email, home string) {
 	content := map[string]any{
 		"type":     "agy",
 		"email":    email,
 		"label":    email,
 		"disabled": false,
 	}
+	if home != "" {
+		content["home"] = home
+	}
 	encoded, errMarshal := json.MarshalIndent(content, "", "  ")
 	if errMarshal != nil {
 		return
 	}
-	_ = os.WriteFile(targetPath, encoded, 0o600)
+	_ = os.WriteFile(path, encoded, 0o600)
+}
+
+func agyStateDir(home string) string {
+	return filepath.Join(home, ".gemini", "antigravity-cli")
+}
+
+// accountSignedIn reports whether agy has stored a login under home.
+func accountSignedIn(home string) bool {
+	info, err := os.Stat(filepath.Join(agyStateDir(home), "antigravity-oauth-token"))
+	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
+var authDirState struct {
+	sync.RWMutex
+	dir string
+}
+
+// setAuthDir remembers CLIProxyAPI's auth-dir from the last plugin configuration.
+func setAuthDir(dir string) {
+	authDirState.Lock()
+	authDirState.dir = dir
+	authDirState.Unlock()
+}
+
+func currentAuthDir() string {
+	authDirState.RLock()
+	defer authDirState.RUnlock()
+	return authDirState.dir
 }
 
 func resolveAuthDir(configYAML []byte) string {
@@ -114,8 +201,12 @@ func detectAntigravityEmail() string {
 	if err != nil || home == "" {
 		return ""
 	}
+	return emailFromHome(home)
+}
 
-	tokenPath := filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+// emailFromHome reads the signed-in account's email from the agy state under home.
+func emailFromHome(home string) string {
+	tokenPath := filepath.Join(agyStateDir(home), "antigravity-oauth-token")
 	if data, errRead := os.ReadFile(tokenPath); errRead == nil && len(data) > 0 {
 		var tokenData struct {
 			IDTokenEmail string `json:"id_token_email"`
@@ -131,7 +222,7 @@ func detectAntigravityEmail() string {
 		}
 	}
 
-	settingsPath := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
+	settingsPath := filepath.Join(agyStateDir(home), "settings.json")
 	if data, errRead := os.ReadFile(settingsPath); errRead == nil && len(data) > 0 {
 		var settingsData struct {
 			Email string `json:"email"`

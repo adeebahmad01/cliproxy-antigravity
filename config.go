@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,10 @@ type pluginConfig struct {
 	LimitsTracking             bool
 	LimitsRefreshInterval      string
 	EnforceLimits              bool
+	AccountsDir                string
+	// AccountHome is the HOME given to agy for the account selected by CLIProxyAPI.
+	// It comes from the "home" field of the agy auth file, never from the plugin YAML.
+	AccountHome string
 }
 
 func defaultConfig() pluginConfig {
@@ -50,6 +55,33 @@ func currentConfig() pluginConfig {
 	configState.RLock()
 	defer configState.RUnlock()
 	return configState.value
+}
+
+// withAccount returns cfg bound to the account described by an agy auth record's metadata.
+// Records without a "home" field use the HOME of the CLIProxyAPI process.
+func withAccount(cfg pluginConfig, authMetadata map[string]any) (pluginConfig, error) {
+	raw, _ := authMetadata["home"].(string)
+	if strings.TrimSpace(raw) == "" {
+		return cfg, nil
+	}
+	home, err := validateWorkdir(raw)
+	if err != nil {
+		return cfg, pError("agy_account_home_invalid", "invalid agy account home "+strconv.Quote(raw)+": "+err.Error(), http.StatusServiceUnavailable)
+	}
+	if stat, err := os.Stat(home); err != nil || !stat.IsDir() {
+		return cfg, pError("agy_account_home_missing", "agy account home does not exist: "+home, http.StatusServiceUnavailable)
+	}
+	cfg.AccountHome = home
+	return cfg, nil
+}
+
+// applyAccountEnv points agy at the account's home, where it keeps its login and sessions.
+func applyAccountEnv(cmd *exec.Cmd, cfg pluginConfig) {
+	if cfg.AccountHome == "" {
+		return
+	}
+	// Later duplicates win, so these override the inherited values.
+	cmd.Env = append(os.Environ(), "HOME="+cfg.AccountHome, "USERPROFILE="+cfg.AccountHome)
 }
 
 func isExecutableFile(path string) bool {
@@ -311,6 +343,12 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return pluginConfig{}, fmt.Errorf("line %d: enforce_limits must be true or false", lineNo+1)
 			}
 			cfg.EnforceLimits = parsed
+		case "accounts_dir":
+			cleaned, err := validateWorkdir(value)
+			if err != nil {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid accounts_dir: %w", lineNo+1, err)
+			}
+			cfg.AccountsDir = cleaned
 		}
 	}
 

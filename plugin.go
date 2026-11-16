@@ -32,6 +32,11 @@ const (
 	methodQuotaDescribe         = "quota.describe"
 	methodQuotaFetch            = "quota.fetch"
 	methodQuotaReset            = "quota.reset"
+	methodAuthIdentifier        = "auth.identifier"
+	methodAuthParse             = "auth.parse"
+	methodAuthLoginStart        = "auth.login.start"
+	methodAuthLoginPoll         = "auth.login.poll"
+	methodAuthRefresh           = "auth.refresh"
 	methodHostStreamEmit        = "host.stream.emit"
 	methodHostStreamClose       = "host.stream.close"
 )
@@ -136,6 +141,7 @@ type registrationCapability struct {
 	ExecutorOutputFormats []string `json:"executor_output_formats"`
 	ManagementAPI         bool     `json:"management_api"`
 	QuotaProvider         bool     `json:"quota_provider"`
+	AuthProvider          bool     `json:"auth_provider"`
 }
 
 type identifierResponse struct {
@@ -166,6 +172,7 @@ type modelInfo struct {
 type rpcExecutorRequest struct {
 	AuthID          string
 	AuthProvider    string
+	AuthMetadata    map[string]any
 	Model           string
 	Format          string
 	Stream          bool
@@ -241,7 +248,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, pError("invalid_config", err.Error(), 400)
 		}
 		setConfig(cfg)
-		ensureAuthFile(req.ConfigYAML)
+		ensureAuthFile(req.ConfigYAML, cfg)
 		return okEnvelope(pluginRegistration())
 
 	case methodModelRegister:
@@ -281,7 +288,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if strings.TrimSpace(req.StreamID) == "" {
 			return nil, pError("stream_unavailable", "CLIProxyAPI did not provide a plugin stream ID", 500)
 		}
-		cfg := currentConfig()
+		cfg, err := withAccount(currentConfig(), req.AuthMetadata)
+		if err != nil {
+			return nil, err
+		}
 		opts := resolveExecutionOptions(req, cfg)
 		if _, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir); err != nil {
 			return nil, err
@@ -326,11 +336,22 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		})
 
 	case methodManagementRegister:
-		return okEnvelope(managementRegistrationResponse{Routes: []managementRoute{{
-			Method:      http.MethodGet,
-			Path:        limitsManagementPath,
-			Description: "Antigravity usage limits (weekly and 5-hour quota per model group). Add ?refresh=1 to bypass the cache.",
-		}}})
+		return okEnvelope(managementRegistrationResponse{
+			Routes: []managementRoute{{
+				Method:      http.MethodGet,
+				Path:        limitsManagementPath,
+				Description: "Antigravity usage limits (weekly and 5-hour quota per model group). Add ?refresh=1 to bypass the cache.",
+			}, {
+				Method:      http.MethodGet,
+				Path:        accountsManagementPath,
+				Description: "Antigravity accounts with their usage limits. Add ?refresh=1 to bypass the limits cache.",
+			}},
+			Resources: []resourceRoute{{
+				Path:        accountsResourcePath,
+				Menu:        "Antigravity accounts",
+				Description: "Add, disable and remove Antigravity CLI accounts and see their usage limits.",
+			}},
+		})
 
 	case methodManagementHandle:
 		var req managementRequest
@@ -346,7 +367,16 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(quotaDescribeResponse{SupportedProviders: []string{providerID, "antigravity"}, DisplayName: "Antigravity CLI"})
 
 	case methodQuotaFetch:
-		cfg := currentConfig()
+		var req quotaFetchRequest
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, pError("invalid_request", "could not decode quota fetch request: "+err.Error(), 400)
+			}
+		}
+		cfg, err := withAccount(currentConfig(), req.Metadata)
+		if err != nil {
+			return nil, err
+		}
 		if !cfg.LimitsTracking {
 			return nil, pError("limits_tracking_disabled", "limits tracking is disabled in the cliproxy-antigravity configuration", http.StatusServiceUnavailable)
 		}
@@ -358,6 +388,45 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		return okEnvelope(quotaFetchFromLimits(limits))
+
+	case methodAuthIdentifier:
+		return okEnvelope(identifierResponse{Identifier: providerID})
+
+	case methodAuthParse:
+		var req authParseRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, pError("invalid_request", "could not decode auth parse request: "+err.Error(), 400)
+		}
+		return okEnvelope(parseAgyAuth(req))
+
+	case methodAuthLoginStart:
+		var req authLoginStartRequest
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, pError("invalid_request", "could not decode login start request: "+err.Error(), 400)
+			}
+		}
+		resp, err := startAgyLogin(currentConfig())
+		if err != nil {
+			return nil, pError("agy_login_failed", err.Error(), http.StatusBadGateway)
+		}
+		return okEnvelope(resp)
+
+	case methodAuthLoginPoll:
+		var req authLoginPollRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, pError("invalid_request", "could not decode login poll request: "+err.Error(), 400)
+		}
+		return okEnvelope(pollAgyLogin(req.State, nonEmpty(req.Host.AuthDir, currentAuthDir())))
+
+	case methodAuthRefresh:
+		var req authRefreshRequest
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, pError("invalid_request", "could not decode auth refresh request: "+err.Error(), 400)
+			}
+		}
+		return okEnvelope(refreshAgyAuth(req))
 
 	case methodQuotaReset:
 		return okEnvelope(quotaResetResponse{Success: false, Message: "Antigravity quota cannot be reset by the plugin; it refreshes on the schedule reported by agy"})
@@ -386,6 +455,7 @@ func pluginRegistration() registration {
 				{Name: "limits_tracking", Type: "boolean", Default: defaults.LimitsTracking, Description: "Track Antigravity usage limits via agy /usage (default: true)."},
 				{Name: "limits_refresh_interval", Type: "string", Default: defaults.LimitsRefreshInterval, Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
 				{Name: "enforce_limits", Type: "boolean", Default: defaults.EnforceLimits, Description: "Reject requests with HTTP 429 when the quota group of the model is exhausted, without launching agy (default: false)."},
+				{Name: "accounts_dir", Type: "string", Default: defaults.AccountsDir, Description: "Directory with one agy home per account. Accounts added from the panel are created here (default ~/.agy-accounts), and every signed-in home in it gets its own CLIProxyAPI auth file. CLIProxyAPI rotates between the accounts."},
 			},
 		},
 		Capabilities: registrationCapability{

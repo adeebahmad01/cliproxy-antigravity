@@ -4,6 +4,14 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Multiple Antigravity accounts: an `agy` auth file can set `home`, and the plugin runs `agy` with `HOME`/`USERPROFILE` set to that directory, so CLIProxyAPI rotates and cools down accounts per credential. Usage limits and `quota.fetch` are tracked per account.
+- `accounts_dir` option: every signed-in account home in the directory gets its own auth file in `auth-dir`.
+- "Antigravity accounts" page in the CLIProxyAPI management sidebar: lists accounts with their usage limits, and adds, disables and removes accounts.
+- `auth_provider` capability: an "Antigravity CLI" card on the management OAuth page. Both it and the sidebar page run the official `agy` sign-in in a new account home and type the pasted Google code into it (Linux and macOS).
+- Management route `GET /v0/management/agy/accounts`.
+
 ## [0.2.2] - 2026-11-16
 
 ### Added
