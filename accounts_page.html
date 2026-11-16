@@ -197,6 +197,9 @@
 
   async function load(refresh) {
     const list = $('accounts');
+    // Limits come from running agy for every account, which takes a few seconds.
+    const loading = el('div', { class: 'empty-state' }, refresh ? 'Refreshing usage limits…' : 'Loading accounts…');
+    if (!list.children.length || refresh) list.replaceChildren(loading);
     try {
       const data = await api('GET', '/v0/management/agy/accounts' + (refresh ? '?refresh=1' : ''));
       list.replaceChildren();

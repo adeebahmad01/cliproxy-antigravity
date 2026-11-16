@@ -51,6 +51,7 @@ type authParseRequest struct {
 	Provider string
 	FileName string
 	RawJSON  []byte
+	Host     hostConfigSummary
 }
 
 type authParseResponse struct {
