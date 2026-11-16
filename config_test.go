@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+)
 
 func TestParsePluginConfig(t *testing.T) {
 	cfg, err := parsePluginConfig([]byte(`
@@ -98,5 +103,88 @@ enforce_limits: null
 	want := defaultConfig()
 	if cfg.DefaultReasoningEffort != "" || cfg.LimitsRefreshInterval != want.LimitsRefreshInterval || cfg.EnforceLimits != want.EnforceLimits {
 		t.Fatalf("empty values should keep defaults, got %+v", cfg)
+	}
+}
+
+func TestExpandHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("skipping TestExpandHome: cannot determine home dir")
+	}
+
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"~", home},
+		{"~/", home},
+		{"~/.local/bin/agy", filepath.Join(home, ".local", "bin", "agy")},
+		{"~/bin/antigravity", filepath.Join(home, "bin", "antigravity")},
+		{"/opt/homebrew/bin/agy", "/opt/homebrew/bin/agy"},
+		{"agy", "agy"},
+	}
+
+	for _, tc := range tests {
+		got := expandHome(tc.input)
+		if got != tc.want {
+			t.Errorf("expandHome(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestResolveBinaryPathWithTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("skipping: cannot determine home dir")
+	}
+
+	// Create a temp executable in home/.local/bin or temp dir
+	tmpDir := t.TempDir()
+	binName := "agy"
+	if runtime.GOOS == "windows" {
+		binName = "agy.exe"
+	}
+	fakeAgy := filepath.Join(tmpDir, binName)
+	if err := os.WriteFile(fakeAgy, []byte("#!/bin/sh\necho test\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct resolution with explicit path
+	resolved := resolveBinaryPath(fakeAgy)
+	if resolved != fakeAgy {
+		t.Errorf("resolveBinaryPath(%q) = %q, want %q", fakeAgy, resolved, fakeAgy)
+	}
+}
+
+func TestResolveBinaryPathCandidateSearch(t *testing.T) {
+	// Verify that candidates directory list contains standard macOS and Linux paths
+	dirs := getBinarySearchDirectories()
+	foundLocalBin := false
+	foundHomebrew := false
+	foundUsrLocal := false
+
+	home, _ := os.UserHomeDir()
+	expectedLocalBin := filepath.Join(home, ".local", "bin")
+
+	for _, d := range dirs {
+		if d == expectedLocalBin {
+			foundLocalBin = true
+		}
+		if d == "/opt/homebrew/bin" {
+			foundHomebrew = true
+		}
+		if d == "/usr/local/bin" {
+			foundUsrLocal = true
+		}
+	}
+
+	if home != "" && !foundLocalBin {
+		t.Errorf("expected %q in search directories", expectedLocalBin)
+	}
+	if !foundHomebrew {
+		t.Errorf("expected /opt/homebrew/bin in search directories")
+	}
+	if !foundUsrLocal {
+		t.Errorf("expected /usr/local/bin in search directories")
 	}
 }

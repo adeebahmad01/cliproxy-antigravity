@@ -133,7 +133,8 @@ func fetchAgyLimits(cfg pluginConfig) (agyLimits, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	// Slash commands are deliberately enabled here: the prompt is our fixed "/usage", never client text.
-	cmd := exec.CommandContext(ctx, cfg.BinaryPath, "--output-format", "json", "--print-timeout", "30s")
+	binPath := resolveBinaryPath(cfg.BinaryPath)
+	cmd := exec.CommandContext(ctx, binPath, "--output-format", "json", "--print-timeout", "30s")
 	if cfg.Workdir != "" {
 		cmd.Dir = cfg.Workdir
 	}

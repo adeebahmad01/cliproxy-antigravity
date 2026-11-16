@@ -200,7 +200,8 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, cfg.BinaryPath, "models")
+		binPath := resolveBinaryPath(cfg.BinaryPath)
+		cmd := exec.CommandContext(ctx, binPath, "models")
 		configureSysProcAttr(cmd)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -782,7 +783,8 @@ func newAgyCommand(ctx context.Context, cfg pluginConfig, opts agyOptions, promp
 	if err := validateBinaryPath(cfg.BinaryPath); err != nil {
 		return nil, pError("invalid_binary", err.Error(), http.StatusBadRequest)
 	}
-	cmd := exec.CommandContext(ctx, cfg.BinaryPath, agyArgs(cfg, opts)...)
+	binPath := resolveBinaryPath(cfg.BinaryPath)
+	cmd := exec.CommandContext(ctx, binPath, agyArgs(cfg, opts)...)
 	if cfg.Workdir != "" {
 		cmd.Dir = cfg.Workdir
 	}

@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-16
+
+### Added
+
+- Automatic binary resolution across standard installation directories when `binary_path` is not in `$PATH` (e.g. non-interactive launchd/GUI environments on macOS, Apple Silicon `/opt/homebrew/bin`, `~/.local/bin/agy`, `~/bin/agy`, user app data, snap, WinGet, Scoop, and Chocolatey).
+- User home directory (`~`) tilde expansion support in `binary_path` and `workdir` configurations.
+
 ## [0.2.1] - 2026-11-16
 
 ### Added

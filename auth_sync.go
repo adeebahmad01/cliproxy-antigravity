@@ -167,14 +167,15 @@ func sanitizeEmailForFilename(email string) string {
 }
 
 func expandHome(path string) string {
-	if strings.HasPrefix(path, "~/") || path == "~" {
+	trimmed := strings.TrimSpace(path)
+	if strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, `~\`) || trimmed == "~" {
 		home, err := os.UserHomeDir()
 		if err == nil && home != "" {
-			if path == "~" {
+			if trimmed == "~" {
 				return home
 			}
-			return filepath.Join(home, path[2:])
+			return filepath.Join(home, trimmed[2:])
 		}
 	}
-	return path
+	return trimmed
 }

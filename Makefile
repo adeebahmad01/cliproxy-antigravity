@@ -1,5 +1,5 @@
 BINARY := cliproxy-antigravity
-VERSION ?= 0.2.1
+VERSION ?= 0.2.2
 DIST ?= dist
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
