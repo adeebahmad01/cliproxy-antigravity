@@ -171,3 +171,45 @@ func TestRegistrationAdvertisesAuthProvider(t *testing.T) {
 		t.Fatal("plugin registration must advertise the auth_provider capability")
 	}
 }
+
+func accountsFromRoute(t *testing.T) []accountReport {
+	t.Helper()
+	resp := handleManagement(managementRequest{Method: "GET", Path: "/v0/management/agy/accounts"})
+	var report accountsReport
+	if err := json.Unmarshal(resp.Body, &report); err != nil {
+		t.Fatalf("decode accounts: %v (%s)", err, resp.Body)
+	}
+	return report.Accounts
+}
+
+// The accounts page must find auth files after a normal registration, and must follow the
+// auth-dir the host reports once an auth request carries it.
+func TestAccountsRouteUsesHostAuthDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	setAuthDir("")
+	t.Cleanup(func() { setAuthDir("") })
+	stubLimits(t, fixtureLimits(t), nil)
+
+	defaultDir := filepath.Join(home, ".cli-proxy-api")
+	_ = os.MkdirAll(defaultDir, 0o700)
+	_ = os.WriteFile(filepath.Join(defaultDir, "antigravity-a.json"), []byte(`{"type":"agy","email":"a@example.com"}`), 0o600)
+	reg, _ := json.Marshal(lifecycleRequest{ConfigYAML: []byte("enabled: true\n"), SchemaVersion: schemaVersion})
+	if _, err := handleMethod(methodPluginRegister, reg); err != nil {
+		t.Fatal(err)
+	}
+	if got := accountsFromRoute(t); len(got) != 1 || got[0].Email != "a@example.com" {
+		t.Fatalf("after register, accounts = %#v", got)
+	}
+
+	hostDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(hostDir, "antigravity-b.json"), []byte(`{"type":"agy","email":"b@example.com"}`), 0o600)
+	parse, _ := json.Marshal(map[string]any{"FileName": "antigravity-b.json", "RawJSON": []byte(`{"type":"agy"}`), "Host": map[string]any{"AuthDir": hostDir}})
+	if _, err := handleMethod(methodAuthParse, parse); err != nil {
+		t.Fatal(err)
+	}
+	if got := accountsFromRoute(t); len(got) != 1 || got[0].Email != "b@example.com" {
+		t.Fatalf("after host reported its auth-dir, accounts = %#v", got)
+	}
+}

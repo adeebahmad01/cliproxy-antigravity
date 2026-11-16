@@ -248,6 +248,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, pError("invalid_config", err.Error(), 400)
 		}
 		setConfig(cfg)
+		// The host only sends the plugin's own config section, so this is a best guess until a
+		// request carrying the host's auth-dir arrives (see rememberAuthDir).
+		if currentAuthDir() == "" {
+			setAuthDir(resolveAuthDir(req.ConfigYAML))
+		}
 		ensureAuthFile(req.ConfigYAML, cfg)
 		return okEnvelope(pluginRegistration())
 
@@ -397,6 +402,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, pError("invalid_request", "could not decode auth parse request: "+err.Error(), 400)
 		}
+		rememberAuthDir(req.Host.AuthDir)
 		return okEnvelope(parseAgyAuth(req))
 
 	case methodAuthLoginStart:
@@ -406,6 +412,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				return nil, pError("invalid_request", "could not decode login start request: "+err.Error(), 400)
 			}
 		}
+		rememberAuthDir(req.Host.AuthDir)
 		resp, err := startAgyLogin(currentConfig())
 		if err != nil {
 			return nil, pError("agy_login_failed", err.Error(), http.StatusBadGateway)
@@ -417,7 +424,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, pError("invalid_request", "could not decode login poll request: "+err.Error(), 400)
 		}
-		return okEnvelope(pollAgyLogin(req.State, nonEmpty(req.Host.AuthDir, currentAuthDir())))
+		rememberAuthDir(req.Host.AuthDir)
+		return okEnvelope(pollAgyLogin(req.State, currentAuthDir()))
 
 	case methodAuthRefresh:
 		var req authRefreshRequest
