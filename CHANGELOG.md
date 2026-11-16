@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-16
+
+### Fixed
+
+- Adding an account on macOS failed with "failed to generate authorization url": `agy` ignores `$BROWSER` there and wraps the sign-in link on screen, so the plugin saw a truncated URL with no `state`. The link is now read from `agy`'s OSC 8 hyperlink, which holds the complete URL.
+
 ## [0.3.0] - 2026-11-16
 
 ### Added

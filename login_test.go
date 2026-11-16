@@ -213,3 +213,16 @@ func TestAccountsRouteUsesHostAuthDir(t *testing.T) {
 		t.Fatalf("after host reported its auth-dir, accounts = %#v", got)
 	}
 }
+
+// On macOS agy ignores $BROWSER and wraps the visible link; only the OSC 8 target is complete.
+func TestFindLoginURLPrefersHyperlinkTarget(t *testing.T) {
+	full := "https://accounts.google.com/o/oauth2/auth?client_id=x&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&state=Abc123State"
+	raw := "Your browser should open automatically. If not:\r\n" +
+		"\x1b]8;id=1;" + full + "\x1b\\" + full[:78] + "\r\n" + full[78:] + "\x1b]8;;\x1b\\\r\n"
+	if got := findLoginURL([]byte(raw)); got != full {
+		t.Fatalf("findLoginURL = %q, want %q", got, full)
+	}
+	if got := findLoginURL([]byte("open " + full + "\n")); got != full {
+		t.Fatalf("findLoginURL without hyperlink = %q, want %q", got, full)
+	}
+}
