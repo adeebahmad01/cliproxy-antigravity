@@ -241,6 +241,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, pError("invalid_config", err.Error(), 400)
 		}
 		setConfig(cfg)
+		ensureAuthFile(req.ConfigYAML)
 		return okEnvelope(pluginRegistration())
 
 	case methodModelRegister:
