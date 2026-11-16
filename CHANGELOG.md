@@ -4,6 +4,15 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-16
+
+### Added
+
+- Auto-synchronization of Antigravity auth card to CLIProxyAPI's `auth-dir`:
+  - Automatically detects the active Antigravity OAuth identity from `~/.gemini/antigravity-cli/antigravity-oauth-token`.
+  - Provisions `antigravity-<email>.json` with type `agy` in `auth-dir` (or `~/.cli-proxy-api`) during plugin register and reconfigure.
+  - Automatically heals empty or missing credential files so CLIProxyAPI's management UI recognizes and displays the Antigravity provider card alongside Claude, Codex, and Opencode-go, complete with live quota management and refresh actions.
+
 ## [0.2.0] - 2026-11-16
 
 Requires CLIProxyAPI v8 (tested against v8.0.72).
