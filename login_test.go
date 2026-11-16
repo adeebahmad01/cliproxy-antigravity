@@ -164,3 +164,10 @@ func TestAccountsManagementRoutes(t *testing.T) {
 		t.Fatalf("resource prefix leaked account data: status %d", resp.StatusCode)
 	}
 }
+
+func TestRegistrationAdvertisesAuthProvider(t *testing.T) {
+	// Without this flag CLIProxyAPI never routes agy logins to the plugin ("provider_not_found").
+	if !pluginRegistration().Capabilities.AuthProvider {
+		t.Fatal("plugin registration must advertise the auth_provider capability")
+	}
+}

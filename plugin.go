@@ -468,6 +468,7 @@ func pluginRegistration() registration {
 			ExecutorOutputFormats: []string{"chat-completions"},
 			ManagementAPI:         true,
 			QuotaProvider:         true,
+			AuthProvider:          true,
 		},
 	}
 }
