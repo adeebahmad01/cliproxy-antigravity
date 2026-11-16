@@ -159,7 +159,10 @@ var loginSessions = struct {
 var (
 	ansiPattern     = regexp.MustCompile(`\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]`)
 	loginURLPattern = regexp.MustCompile(`https://accounts\.google\.com/o/oauth2/[^\s"'<>]+`)
-	oauthStateChars = regexp.MustCompile(`^[A-Za-z0-9._-]{1,256}$`)
+	// agy also wraps the link in an OSC 8 hyperlink. Its target is the only complete copy when
+	// the visible text is wrapped (seen on macOS, where agy wraps at about 80 columns).
+	loginLinkPattern = regexp.MustCompile(`\x1b\]8;[^;\x07\x1b]*;(https://accounts\.google\.com/o/oauth2/[^\s\x07\x1b"'<>]+)`)
+	oauthStateChars  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,256}$`)
 )
 
 func screenText(raw []byte) string {
@@ -307,7 +310,7 @@ func (s *loginSession) waitForURL(urlFile string) (string, error) {
 			return loginURLPattern.FindString(string(data)), nil
 		}
 		s.mu.Lock()
-		found := loginURLPattern.FindString(screenText(s.output))
+		found := findLoginURL(s.output)
 		s.mu.Unlock()
 		if found != "" {
 			return found, nil
@@ -320,6 +323,15 @@ func (s *loginSession) waitForURL(urlFile string) (string, error) {
 		case <-tick.C:
 		}
 	}
+}
+
+// findLoginURL returns the sign-in URL from agy's terminal output, preferring the OSC 8 link
+// target over the visible text, which may be wrapped.
+func findLoginURL(raw []byte) string {
+	if m := loginLinkPattern.FindSubmatch(raw); m != nil {
+		return string(m[1])
+	}
+	return loginURLPattern.FindString(screenText(raw))
 }
 
 // finish stops agy and forgets the session. Unless the account signed in, its home is removed.
