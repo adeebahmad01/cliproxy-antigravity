@@ -48,7 +48,7 @@ func TestEnsureAuthFileCreatesFile(t *testing.T) {
 	configYAML := []byte("auth-dir: " + tmpDir + "\n")
 
 	t.Setenv("ANTIGRAVITY_EMAIL", "test-user@example.com")
-	ensureAuthFile(configYAML)
+	ensureAuthFile(configYAML, defaultConfig())
 
 	expectedPath := filepath.Join(tmpDir, "antigravity-test-user@example.com.json")
 	data, err := os.ReadFile(expectedPath)
@@ -77,7 +77,7 @@ func TestEnsureAuthFileOverwritesEmptyCandidate(t *testing.T) {
 
 	configYAML := []byte("auth-dir: " + tmpDir + "\n")
 	t.Setenv("ANTIGRAVITY_EMAIL", "new-user@example.com")
-	ensureAuthFile(configYAML)
+	ensureAuthFile(configYAML, defaultConfig())
 
 	data, err := os.ReadFile(emptyFile)
 	if err != nil {
@@ -106,7 +106,7 @@ func TestEnsureAuthFileSkipsWhenValidExists(t *testing.T) {
 
 	configYAML := []byte("auth-dir: " + tmpDir + "\n")
 	t.Setenv("ANTIGRAVITY_EMAIL", "different@example.com")
-	ensureAuthFile(configYAML)
+	ensureAuthFile(configYAML, defaultConfig())
 
 	// Check that existing file wasn't replaced
 	data, err := os.ReadFile(existingFile)

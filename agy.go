@@ -788,6 +788,7 @@ func newAgyCommand(ctx context.Context, cfg pluginConfig, opts agyOptions, promp
 	if cfg.Workdir != "" {
 		cmd.Dir = cfg.Workdir
 	}
+	applyAccountEnv(cmd, cfg)
 	configureSysProcAttr(cmd)
 	cmd.Stdin = strings.NewReader(prompt)
 	return cmd, nil
@@ -967,7 +968,10 @@ func nonEmpty(value, fallback string) string {
 }
 
 func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
-	cfg := currentConfig()
+	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
+	if err != nil {
+		return executorResponse{}, err
+	}
 	opts := resolveExecutionOptions(req, cfg)
 	prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
 	if err != nil {
@@ -1002,7 +1006,11 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 
 func executeStream(req rpcExecutorRequest) {
 	streamID := req.StreamID
-	cfg := currentConfig()
+	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
+	if err != nil {
+		closePluginStream(streamID, err)
+		return
+	}
 	opts := resolveExecutionOptions(req, cfg)
 	opts.OutputFormat = "stream-json"
 

@@ -271,6 +271,7 @@ The prompt is piped directly to `agy`'s standard input rather than passed as a c
 | `limits_tracking` | `true` | Track Antigravity usage limits by running `agy /usage` (no tokens consumed). |
 | `limits_refresh_interval` | `1m` | How long cached limits stay fresh (minimum `10s`). Limits are also refreshed after any quota error. |
 | `enforce_limits` | `false` | Reject requests with HTTP 429 (`agy_quota_exhausted`, retryable) when the model's quota group is known to be exhausted, without starting `agy`. Off by default because paid plans may continue on AI credits after a limit is reached. |
+| `accounts_dir` | empty | Directory holding one agy home per account. Accounts added from the panel go here (`~/.agy-accounts` when empty). See [Multiple accounts](#multiple-accounts). |
 
 ### Usage limits
 
@@ -302,6 +303,64 @@ Antigravity groups models (for example *Gemini Models* and *Claude and GPT model
 Quota errors from `agy` are returned as HTTP 429 with `retryable` set from Antigravity's own error report, so CLIProxyAPI can cool down and retry correctly. When `enforce_limits` rejects a request, the error also carries `retry_after_seconds` until the bucket resets, which CLIProxyAPI turns into a `Retry-After` header.
 
 Errors use the codes CLIProxyAPI's routing pipeline understands: malformed client payloads are `request_scoped` (HTTP 400, no credential cooldown), and models `agy` does not recognise are `model_not_found` (HTTP 404). Streaming failures are reported through `host.stream.close` with a structured `error_detail`, so they keep their HTTP status instead of collapsing into a generic 500.
+
+### Multiple accounts
+
+agy keeps its login, settings and conversations in `$HOME/.gemini/antigravity-cli`. To use several Antigravity accounts, give each its own home directory. The plugin runs `agy` with `HOME` (and `USERPROFILE` on Windows) set to the home of the account CLIProxyAPI selected.
+
+#### Adding accounts from the CLIProxyAPI panel
+
+The plugin adds an **Antigravity accounts** entry to the management panel's sidebar. It lists every account with its usage limits and lets you add, disable and remove accounts:
+
+1. Click **Add account**, then **Open Google sign-in**, and sign in with the account to add.
+2. Google sends you to an `antigravity.google/oauth-callback` page. Copy that page's URL (or the code it shows) and paste it into the panel.
+
+An **Antigravity CLI** card also appears on the panel's OAuth login page. It runs the same flow, and you paste the URL into the panel's usual callback box.
+
+Behind the scenes the plugin starts the official `agy` sign-in in a new home under `accounts_dir` (default `~/.agy-accounts`) and types the pasted code into it. The tokens are exchanged and stored by `agy` itself; the plugin never sees them. CLIProxyAPI then saves an auth file pointing at the new home. Adding accounts from the panel requires Linux or macOS.
+
+The sidebar page reads the management key the panel saved in the browser. If you did not tick "remember password" when logging in to the panel, the page asks for the key once per tab.
+
+#### Adding accounts by hand
+
+1. Sign in to each account in its own home:
+
+   ```bash
+   mkdir -p ~/.agy-accounts/work ~/.agy-accounts/personal
+   HOME=~/.agy-accounts/work agy       # complete the login, then exit
+   HOME=~/.agy-accounts/personal agy
+   ```
+
+2. Point the plugin at the directory:
+
+   ```yaml
+   plugins:
+     configs:
+       cliproxy-antigravity:
+         accounts_dir: "~/.agy-accounts"
+   ```
+
+When the plugin is registered or reconfigured, it writes an `antigravity-<email>.json` auth file to CLIProxyAPI's `auth-dir` for every signed-in account that doesn't have one yet:
+
+```json
+{
+  "type": "agy",
+  "email": "work@example.com",
+  "label": "work@example.com",
+  "home": "/home/me/.agy-accounts/work",
+  "disabled": false
+}
+```
+
+You can also write these files yourself instead of using `accounts_dir`. An agy auth file without `home` uses the CLIProxyAPI process's own HOME. When `accounts_dir` is set, that default account gets an auth file only if it is signed in.
+
+CLIProxyAPI then treats the accounts like any other multi-credential provider. It picks one per request according to `routing.strategy` (round-robin by default), cools an account down when it returns 429, and shows a separate quota card for each account. Usage limits are tracked separately for each account.
+
+Things to know:
+
+- Conversations live in the home of the account that created them. Resuming a `conversation_id` only works if the request lands on that same account, so use `routing.strategy: fill-first` (or a single account) if you rely on resumption.
+- Model discovery (`agy models`) and `GET /v0/management/agy/limits` use the CLIProxyAPI process's HOME.
+- Each home has its own agy settings, MCP servers and plugins. The `workdir` is shared.
 
 ### Permission safety
 
