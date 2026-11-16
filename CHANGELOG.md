@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
 ### Added
 
 - Multiple Antigravity accounts: an `agy` auth file can set `home`, and the plugin runs `agy` with `HOME`/`USERPROFILE` set to that directory, so CLIProxyAPI rotates and cools down accounts per credential. Usage limits and `quota.fetch` are tracked per account.

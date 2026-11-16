@@ -150,11 +150,19 @@ var authDirState struct {
 	dir string
 }
 
-// setAuthDir remembers CLIProxyAPI's auth-dir from the last plugin configuration.
+// setAuthDir remembers where CLIProxyAPI keeps its auth files.
 func setAuthDir(dir string) {
 	authDirState.Lock()
 	authDirState.dir = dir
 	authDirState.Unlock()
+}
+
+// rememberAuthDir records the auth-dir the host reports with auth requests. It is authoritative,
+// unlike the guess made from the plugin's own config section at registration.
+func rememberAuthDir(dir string) {
+	if dir = strings.TrimSpace(dir); dir != "" {
+		setAuthDir(dir)
+	}
 }
 
 func currentAuthDir() string {

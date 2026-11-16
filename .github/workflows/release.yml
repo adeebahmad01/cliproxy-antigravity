@@ -75,7 +75,7 @@ jobs:
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="0.2.2"
+            VERSION="0.3.0"
           fi
           mkdir -p dist
           LIB_NAME="${PLUGIN_ID}.${{ matrix.ext }}"
