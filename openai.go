@@ -110,7 +110,8 @@ func buildPrompt(raw []byte, conversationID string, workdir string) (string, err
 	var b strings.Builder
 	if convID == "" {
 		b.WriteString("You are answering a request forwarded through an OpenAI-compatible chat-completions bridge to the official Antigravity CLI.\n")
-		b.WriteString("Follow the system and developer instructions in the conversation below, then answer the latest user request. Return only the assistant response.\n\n")
+		b.WriteString("Follow the system and developer instructions in the conversation below, then answer the latest user request. Return only the assistant response.\n")
+		b.WriteString("You have no filesystem, shell, network, or editor tools for this request: do not read files, run commands, or inspect the environment. Answer from the conversation text alone, and never leave the reply empty.\n\n")
 	}
 
 	for i, msg := range messages {
@@ -343,6 +344,19 @@ func extractToolCalls(response string) ([]openAIToolCall, bool) {
 	return calls, true
 }
 
+// emptyResponseError marks a turn where agy finished successfully without any
+// assistant text. The CLI usually spent that turn running its own built-in
+// tools, so the bridge has nothing to forward and an empty completion would make
+// clients retry the identical request in a loop. Retryable: a fresh attempt, or
+// a fallback model, can still answer.
+func emptyResponseError() error {
+	return pRetryableError(
+		"empty_assistant_response",
+		"agy returned no assistant text: it likely executed its own tools instead of answering. Retry the request or switch models.",
+		http.StatusBadGateway,
+	)
+}
+
 func newCallID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err == nil {
@@ -367,6 +381,9 @@ func estimateTokens(text string) int {
 func makeChatCompletion(requestedModel string, result agyResult) ([]byte, error) {
 	model := displayModel(requestedModel)
 	toolCalls, isToolCall := extractToolCalls(result.Response)
+	if !isToolCall && strings.TrimSpace(result.Response) == "" {
+		return nil, emptyResponseError()
+	}
 
 	var message map[string]any
 	var finishReason string
