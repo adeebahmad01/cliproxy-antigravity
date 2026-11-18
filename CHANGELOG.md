@@ -8,7 +8,7 @@ All notable changes to this project will be documented here.
 
 ### Fixed
 
-- Requests where `agy` spends its whole turn on built-in tools (`read_file`, `run_command`) instead of answering no longer return an empty completion with `finish_reason=stop`: the bridge now fails fast with a retryable 502 `empty_assistant_response` (streaming and non-streaming), so clients can retry or fall back to another model instead of looping on an identical empty reply. The bridge preamble also tells `agy` it has no filesystem/shell/network tools for the request and must never answer empty.
+- Requests where `agy` spends its whole turn on built-in tools (`read_file`, `run_command`) instead of answering no longer return an empty completion with `finish_reason=stop`: the bridge now fails fast with a retryable 502 `empty_assistant_response` for non-streaming requests. For streaming requests, the stream closes with the same `empty_assistant_response` error after the response has started, so clients can retry or fall back to another model instead of looping on an identical empty reply. The bridge preamble also tells `agy` it has no filesystem/shell/network tools for the request and must never answer empty.
 
 ### Changed
 
