@@ -103,7 +103,7 @@ jobs:
             -archive "dist/${ARCHIVE_NAME}" \
             -checksum "dist/${ARCHIVE_NAME}.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
