@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -119,6 +121,25 @@ func TestExtractToolCalls(t *testing.T) {
 	}
 	if !strings.Contains(calls[0].Function.Arguments, "2+2") {
 		t.Fatalf("call args = %q", calls[0].Function.Arguments)
+	}
+}
+
+func TestMakeChatCompletionRejectsEmptyResponse(t *testing.T) {
+	for _, response := range []string{"", "   \n\t "} {
+		_, err := makeChatCompletion("agy/gemini-4-argon-high", agyResult{
+			Status:   "SUCCESS",
+			Response: response,
+		})
+		if err == nil {
+			t.Fatalf("empty response %q produced a completion instead of an error", response)
+		}
+		var coded *pluginError
+		if !errors.As(err, &coded) || coded.Code != "empty_assistant_response" {
+			t.Fatalf("error = %v, want empty_assistant_response", err)
+		}
+		if coded.HTTPStatus != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", coded.HTTPStatus)
+		}
 	}
 }
 

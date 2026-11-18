@@ -987,7 +987,7 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 
 	payload, err := makeChatCompletion(req.Model, result)
 	if err != nil {
-		return executorResponse{}, pError("response_encoding_error", err.Error(), http.StatusInternalServerError)
+		return executorResponse{}, err
 	}
 	headers := http.Header{"Content-Type": []string{"application/json"}}
 	if result.ConversationID != "" {
@@ -1164,6 +1164,13 @@ func executeStream(req rpcExecutorRequest) {
 	}
 
 	toolCalls, isToolCall := extractToolCalls(fullResponse)
+	if !isToolCall && strings.TrimSpace(fullResponse) == "" {
+		// agy finished without text: it burned the turn on its own built-in tools.
+		// Failing here lets the client walk its fallback chain instead of retrying
+		// an identical empty completion.
+		closePluginStream(streamID, emptyResponseError())
+		return
+	}
 	if opts.HasTools && isToolCall {
 		// Emit tool_calls delta chunk
 		toolDelta := makeSSEChunk(completionID, created, model, map[string]any{
