@@ -4,12 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,10 +24,75 @@ jobs:
           go-version: "1.23.x"
           cache: false
       - name: Format check
-        run: test -z "$(gofmt -l *.go scripts/*.go)"
+        run: |
+          unformatted="$(gofmt -l *.go scripts/*.go)"
+          if [ -n "$unformatted" ]; then
+            echo "Run 'make fmt'. Unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: CGO_ENABLED=1 go vet ./...
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
       - name: Unit tests
-        run: CGO_ENABLED=1 go test -v ./...
+        run: CGO_ENABLED=1 go test -race -v ./...
       - name: Build dynamic plugin
-        run: CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/cliproxy-antigravity.so .
+        run: CGO_ENABLED=1 go build -buildmode=c-shared -o "$RUNNER_TEMP/cliproxy-antigravity.lib" .
       - name: ABI smoke test
-        run: python3 scripts/abi_smoke.py /tmp/cliproxy-antigravity.so
+        run: python3 scripts/abi_smoke.py "$RUNNER_TEMP/cliproxy-antigravity.lib"
+
+  # Cross-compile every release target so a platform-specific break shows up on
+  # the PR instead of on the tag.
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            extra_apt: gcc-aarch64-linux-gnu
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+          - os: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            cc: x86_64-w64-mingw32-gcc
+            extra_apt: gcc-mingw-w64-x86-64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Install cross-compiler
+        if: matrix.extra_apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.extra_apt }}
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.cc }}" ]; then
+            export CC="${{ matrix.cc }}"
+          fi
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildmode=c-shared -o "$RUNNER_TEMP/plugin.lib" .
