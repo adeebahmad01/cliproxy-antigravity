@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import os
 import pathlib
 import stat
 import sys
@@ -46,11 +47,13 @@ if [ "$1" = "models" ]; then
 fi
 format="text"
 slash=1
+conversation=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output-format) format="$2"; shift 2 ;;
     --print-timeout) shift 2 ;;
-    --model|--conversation|--effort) shift 2 ;;
+    --conversation) conversation="$2"; shift 2 ;;
+    --model|--effort) shift 2 ;;
     --sandbox|--dangerously-skip-permissions) shift ;;
     --disable-slash-commands) slash=0; shift ;;
     -p|--print|--prompt) prompt="$2"; shift 2 ;;
@@ -63,6 +66,14 @@ if [ "$slash" = "1" ] && [ "$stdin" = "/usage" ]; then
   exit 0
 fi
 if [ "$format" = "json" ]; then
+  case "$stdin" in
+    *"next turn"*)
+      if [ "$conversation" != "mock-conversation" ] || [ "$stdin" != "next turn" ]; then
+        printf 'wrong native conversation ID or prompt\\n' >&2
+        exit 1
+      fi
+      ;;
+  esac
   printf '%s\\n' '{"conversation_id":"mock-conversation","status":"SUCCESS","response":"mock response","usage":{"input_tokens":10,"output_tokens":3,"thinking_tokens":1,"cache_read_tokens":2,"total_tokens":13}}'
   exit 0
 fi
@@ -79,27 +90,28 @@ def main() -> int:
         return 2
 
     path = pathlib.Path(sys.argv[1]).resolve()
-    lib = ctypes.CDLL(str(path))
-    lib.cliproxy_plugin_init.argtypes = [ctypes.c_void_p, ctypes.POINTER(PluginAPI)]
-    lib.cliproxy_plugin_init.restype = ctypes.c_int
-
-    api = PluginAPI()
-    rc = lib.cliproxy_plugin_init(None, ctypes.byref(api))
-    if rc != 0 or api.abi_version != 1:
-        raise RuntimeError(f"plugin init failed: rc={rc}, abi={api.abi_version}")
-
-    def call(method: str, payload: dict) -> tuple[int, dict]:
-        raw = json.dumps(payload).encode()
-        array = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw) if raw else None
-        out = Buffer()
-        call_rc = api.call(method.encode(), array, len(raw), ctypes.byref(out))
-        data = ctypes.string_at(out.ptr, out.len) if out.ptr else b""
-        if out.ptr:
-            api.free_buffer(out.ptr, out.len)
-        return call_rc, json.loads(data)
-
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
+        os.environ.update(HOME=tmp, USERPROFILE=tmp, XDG_CONFIG_HOME=tmp, APPDATA=tmp)
+        lib = ctypes.CDLL(str(path))
+        lib.cliproxy_plugin_init.argtypes = [ctypes.c_void_p, ctypes.POINTER(PluginAPI)]
+        lib.cliproxy_plugin_init.restype = ctypes.c_int
+
+        api = PluginAPI()
+        rc = lib.cliproxy_plugin_init(None, ctypes.byref(api))
+        if rc != 0 or api.abi_version != 1:
+            raise RuntimeError(f"plugin init failed: rc={rc}, abi={api.abi_version}")
+
+        def call(method: str, payload: dict) -> tuple[int, dict]:
+            raw = json.dumps(payload).encode()
+            array = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw) if raw else None
+            out = Buffer()
+            call_rc = api.call(method.encode(), array, len(raw), ctypes.byref(out))
+            data = ctypes.string_at(out.ptr, out.len) if out.ptr else b""
+            if out.ptr:
+                api.free_buffer(out.ptr, out.len)
+            return call_rc, json.loads(data)
+
         mock_agy = make_mock_agy(root)
         config = f'binary_path: "{mock_agy}"\nprint_timeout: 30m\n'.encode()
         rc, registration = call(
@@ -155,8 +167,24 @@ def main() -> int:
             raise RuntimeError(f"unexpected assistant content: {content!r}")
         if openai_payload["usage"]["total_tokens"] != 13:
             raise RuntimeError(f"unexpected usage: {openai_payload['usage']}")
-        if openai_payload.get("conversation_id") != "mock-conversation":
+        conversation_id = openai_payload.get("conversation_id", "")
+        if not conversation_id.startswith("agy.v1."):
             raise RuntimeError(f"expected conversation_id in payload: {openai_payload}")
+
+        chat_request["conversation_id"] = conversation_id
+        chat_request["messages"] += [
+            {"role": "assistant", "content": "mock response"},
+            {"role": "user", "content": "next turn"},
+        ]
+        rc, execution = call(
+            "executor.execute",
+            {"Model": "agy/mock-model-high", "Payload": base64.b64encode(json.dumps(chat_request).encode()).decode()},
+        )
+        if rc != 0 or not execution.get("ok"):
+            raise RuntimeError(f"resume failed: {execution}")
+        resumed = json.loads(base64.b64decode(execution["result"]["Payload"]))
+        if resumed.get("conversation_id") != conversation_id:
+            raise RuntimeError(f"resume changed the conversation ID: {resumed}")
 
         # A client prompt must never be expanded as an agy slash command.
         slash_request = {"model": "agy/mock-model-high", "messages": [{"role": "user", "content": "/usage"}]}
@@ -194,7 +222,7 @@ def main() -> int:
         if rc != 0 or not quota.get("ok") or quota["result"]["groups"][0]["displayName"] != "Mock Models":
             raise RuntimeError(f"quota.fetch failed: {quota}")
 
-    api.shutdown()
+        api.shutdown()
     print(f"ABI smoke test passed: {result['metadata']['Name']} ({', '.join(model_ids)})")
     return 0
 

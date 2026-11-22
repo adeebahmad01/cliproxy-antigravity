@@ -15,6 +15,7 @@ env:
 jobs:
   test:
     name: Test
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -72,11 +73,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="0.3.2"
-          fi
+          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           LIB_NAME="${PLUGIN_ID}.${{ matrix.ext }}"
           ARCHIVE_NAME="${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
@@ -135,8 +132,15 @@ jobs:
           echo "Generated checksums.txt:"
           cat checksums.txt
           cd ..
+          awk -v header="## [${GITHUB_REF_NAME#v}]" '
+            index($0, header) == 1 { printing = 1; next }
+            printing && /^## / { exit }
+            printing { print }
+          ' CHANGELOG.md > dist/release-notes.md
           gh release create "${GITHUB_REF_NAME}" \
             dist/*.zip \
             dist/checksums.txt \
             --title "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --notes-file dist/release-notes.md \
             --generate-notes

@@ -154,10 +154,18 @@ func TestAccountsManagementRoutes(t *testing.T) {
 	if len(report.Accounts) != 1 || !report.Accounts[0].SignedIn || len(report.Accounts[0].Groups) != 2 {
 		t.Fatalf("report = %#v", report)
 	}
+	if resp.Headers.Get("Cache-Control") != "no-store" {
+		t.Fatal("account details must not be stored by HTTP caches")
+	}
 
 	page := handleManagement(managementRequest{Method: "GET", Path: "/v0/resource/plugins/cliproxy-antigravity/accounts"})
 	if page.StatusCode != http.StatusOK || !strings.HasPrefix(page.Headers.Get("Content-Type"), "text/html") {
 		t.Fatalf("page status=%d headers=%v", page.StatusCode, page.Headers)
+	}
+	for _, private := range []string{"a@example.com", home, `type="password"`} {
+		if strings.Contains(string(page.Body), private) {
+			t.Fatalf("public page contained %q", private)
+		}
 	}
 	// Account data must never be reachable through the unauthenticated resource prefix.
 	if resp := handleManagement(managementRequest{Method: "GET", Path: "/v0/resource/plugins/cliproxy-antigravity/agy/accounts"}); resp.StatusCode != http.StatusNotFound {

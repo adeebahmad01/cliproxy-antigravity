@@ -40,7 +40,8 @@ type authData struct {
 	Disabled         bool
 	StorageJSON      []byte
 	Metadata         map[string]any
-	NextRefreshAfter time.Time `json:",omitempty"`
+	Attributes       map[string]string `json:",omitempty"`
+	NextRefreshAfter time.Time         `json:",omitempty"`
 }
 
 type hostConfigSummary struct {
@@ -112,6 +113,13 @@ func agyAuthData(fileName string, meta map[string]any) authData {
 		label, _ = meta["email"].(string)
 	}
 	disabled, _ := meta["disabled"].(bool)
+	var attributes map[string]string
+	rawHome, _ := meta["home"].(string)
+	if home, err := validateWorkdir(rawHome); err == nil {
+		if fingerprint := sessionHome(home); fingerprint != "" {
+			attributes = map[string]string{sessionHomeAttr: fingerprint}
+		}
+	}
 	return authData{
 		Provider:    providerID,
 		FileName:    fileName,
@@ -119,6 +127,7 @@ func agyAuthData(fileName string, meta map[string]any) authData {
 		Disabled:    disabled,
 		StorageJSON: raw,
 		Metadata:    meta,
+		Attributes:  attributes,
 		// agy refreshes its own tokens; there is nothing for the host to refresh.
 		NextRefreshAfter: time.Now().Add(24 * time.Hour).UTC(),
 	}
