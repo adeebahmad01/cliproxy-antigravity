@@ -11,7 +11,7 @@ import (
 const (
 	pluginID      = "cliproxy-antigravity"
 	providerID    = "agy"
-	pluginVersion = "0.3.2"
+	pluginVersion = "0.4.0"
 	schemaVersion = 6
 )
 
@@ -21,6 +21,9 @@ const (
 	methodModelRegister         = "model.register"
 	methodModelStatic           = "model.static"
 	methodModelRoute            = "model.route"
+	methodSchedulerPick         = "scheduler.pick"
+	methodInterceptBefore       = "request.intercept_before"
+	methodInterceptAfter        = "request.intercept_after"
 	methodExecutorIdentifier    = "executor.identifier"
 	methodExecutorExecute       = "executor.execute"
 	methodExecutorExecuteStream = "executor.execute_stream"
@@ -132,16 +135,19 @@ type configField struct {
 }
 
 type registrationCapability struct {
-	ModelRegistrar        bool     `json:"model_registrar"`
-	ModelProvider         bool     `json:"model_provider"`
-	ModelRouter           bool     `json:"model_router"`
-	Executor              bool     `json:"executor"`
-	ExecutorModelScope    string   `json:"executor_model_scope"`
-	ExecutorInputFormats  []string `json:"executor_input_formats"`
-	ExecutorOutputFormats []string `json:"executor_output_formats"`
-	ManagementAPI         bool     `json:"management_api"`
-	QuotaProvider         bool     `json:"quota_provider"`
-	AuthProvider          bool     `json:"auth_provider"`
+	Scheduler                 bool     `json:"scheduler"`
+	SchedulerAcrossPriorities bool     `json:"scheduler_across_priorities"`
+	RequestInterceptor        bool     `json:"request_interceptor"`
+	ModelRegistrar            bool     `json:"model_registrar"`
+	ModelProvider             bool     `json:"model_provider"`
+	ModelRouter               bool     `json:"model_router"`
+	Executor                  bool     `json:"executor"`
+	ExecutorModelScope        string   `json:"executor_model_scope"`
+	ExecutorInputFormats      []string `json:"executor_input_formats"`
+	ExecutorOutputFormats     []string `json:"executor_output_formats"`
+	ManagementAPI             bool     `json:"management_api"`
+	QuotaProvider             bool     `json:"quota_provider"`
+	AuthProvider              bool     `json:"auth_provider"`
 }
 
 type identifierResponse struct {
@@ -190,11 +196,15 @@ type rpcExecutorRequest struct {
 type modelRouteRequest struct {
 	RequestedModel     string
 	AvailableProviders []string
+	Headers            http.Header
+	Body               []byte
+	Metadata           map[string]any
 }
 
 type modelRouteResponse struct {
 	Handled    bool
 	TargetKind string
+	Target     string `json:",omitempty"`
 	Reason     string
 }
 
@@ -271,6 +281,29 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okEnvelope(routeModel(req))
 
+	case methodSchedulerPick:
+		var req schedulerRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, pError("invalid_request", "could not decode scheduler request: "+err.Error(), 400)
+		}
+		pick, err := pickConversationAccount(req)
+		if err != nil {
+			return nil, err
+		}
+		return okEnvelope(pick)
+
+	case methodInterceptBefore:
+		var req struct{ Body []byte }
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, pError("invalid_request", "could not decode interceptor request: "+err.Error(), 400)
+		}
+		return okEnvelope(struct {
+			Headers http.Header `json:",omitempty"`
+		}{conversationRoutingHeaders(req.Body)})
+
+	case methodInterceptAfter:
+		return okEnvelope(struct{}{})
+
 	case methodExecutorIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerID})
 
@@ -293,23 +326,22 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if strings.TrimSpace(req.StreamID) == "" {
 			return nil, pError("stream_unavailable", "CLIProxyAPI did not provide a plugin stream ID", 500)
 		}
-		cfg, err := withAccount(currentConfig(), req.AuthMetadata)
+		run, err := prepareAgyExecution(req)
 		if err != nil {
 			return nil, err
 		}
-		opts := resolveExecutionOptions(req, cfg)
-		if _, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir); err != nil {
+		if err := checkModelLimits(run.cfg, run.opts.NativeModel); err != nil {
 			return nil, err
 		}
-		if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
-			return nil, err
-		}
-		go executeStream(req)
+		run.opts.OutputFormat = "stream-json"
+		go executeStream(req, run)
 		headers := http.Header{"Content-Type": []string{"text/event-stream"}}
-		if opts.ConversationID != "" {
-			headers.Set("X-AGY-Conversation-ID", opts.ConversationID)
+		if run.session.NativeID != "" {
+			if id := run.session.clientID(); id != "" {
+				headers.Set(conversationHeader, id)
+			}
 		}
-		mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
+		mergeHeaders(headers, limitHeaders(run.cfg, run.opts.NativeModel))
 		return okEnvelope(executorStreamResponse{Headers: headers})
 
 	case methodExecutorCountTokens:
@@ -317,13 +349,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, pError("invalid_request", "could not decode count-tokens request: "+err.Error(), 400)
 		}
-		cfg := currentConfig()
-		opts := resolveExecutionOptions(req, cfg)
-		prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
+		run, err := prepareAgyExecution(req)
 		if err != nil {
 			return nil, err
 		}
-		estimated := estimateTokens(prompt)
+		estimated := estimateTokens(run.prompt)
 		payload, _ := json.Marshal(map[string]int{"total_tokens": estimated})
 		return okEnvelope(executorResponse{Payload: payload, Headers: http.Header{"Content-Type": []string{"application/json"}}})
 
@@ -467,16 +497,19 @@ func pluginRegistration() registration {
 			},
 		},
 		Capabilities: registrationCapability{
-			ModelRegistrar:        true,
-			ModelProvider:         true,
-			ModelRouter:           true,
-			Executor:              true,
-			ExecutorModelScope:    "static",
-			ExecutorInputFormats:  []string{"chat-completions"},
-			ExecutorOutputFormats: []string{"chat-completions"},
-			ManagementAPI:         true,
-			QuotaProvider:         true,
-			AuthProvider:          true,
+			Scheduler:                 true,
+			SchedulerAcrossPriorities: true,
+			RequestInterceptor:        true,
+			ModelRegistrar:            true,
+			ModelProvider:             true,
+			ModelRouter:               true,
+			Executor:                  true,
+			ExecutorModelScope:        "static",
+			ExecutorInputFormats:      []string{"chat-completions"},
+			ExecutorOutputFormats:     []string{"chat-completions"},
+			ManagementAPI:             true,
+			QuotaProvider:             true,
+			AuthProvider:              true,
 		},
 	}
 }

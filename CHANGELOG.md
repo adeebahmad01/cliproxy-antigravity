@@ -4,6 +4,22 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
+### Added
+
+- Account-bound Antigravity conversation IDs keep native resumes on the originating account while new chats follow the host's routing strategy. Chat Completions clients can opt in to continuing on another account by replaying a transcript or summary.
+- **Hide email addresses** on the Antigravity accounts page also hides account filenames and home paths. The setting stays in the browser.
+
+### Changed
+
+- The accounts page no longer prompts for a second management key. A compatible panel reuses its existing login; private account data and account actions still require authentication.
+- Older raw conversation IDs cannot be resumed on managed accounts because they do not identify the owning account. Omit the old ID and send the chat history to start a new session.
+
+### Fixed
+
+- Chat Completions streams no longer double-frame SSE chunks or send a duplicate `[DONE]` event.
+
 ## [0.3.2] - 2026-11-19
 
 ### Fixed

@@ -243,11 +243,20 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	return cloneModels(models)
 }
 
-// routeModel sends requests for agy models straight to this plugin's executor. agy manages its
-// own login, so there is no CLIProxyAPI auth record for the host's credential scheduler to pick.
-// When an agy auth record does exist, the normal auth path is left in charge.
+// routeModel lets the host pick an account when agy credentials exist, or
+// uses the local agy login otherwise.
 func routeModel(req modelRouteRequest) modelRouteResponse {
-	if containsFold(req.AvailableProviders, providerID) {
+	hasAgy := containsFold(req.AvailableProviders, providerID)
+	id := requestConversationID(readConversationFields(req.Body), req.Headers, req.Metadata)
+	if strings.HasPrefix(id, conversationPrefix) {
+		// A native session must not silently route to a different provider.
+		// The executor rejects managed IDs if only the direct route is available.
+		if hasAgy {
+			return modelRouteResponse{Handled: true, TargetKind: "provider", Target: providerID}
+		}
+		return modelRouteResponse{Handled: true, TargetKind: "self"}
+	}
+	if hasAgy {
 		return modelRouteResponse{}
 	}
 	model := strings.TrimSpace(req.RequestedModel)
@@ -686,35 +695,11 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		effort = ""
 	}
 
-	// Conversation ID
-	convID := strings.TrimSpace(chatReq.ConversationID)
-	if convID == "" {
-		convID = strings.TrimSpace(chatReq.SessionID)
-	}
-	if convID == "" && req.Headers != nil {
-		if val := req.Headers.Get("X-AGY-Conversation-ID"); val != "" {
-			convID = strings.TrimSpace(val)
-		} else if val := req.Headers.Get("X-Conversation-ID"); val != "" {
-			convID = strings.TrimSpace(val)
-		} else if val := req.Headers.Get("Conversation-ID"); val != "" {
-			convID = strings.TrimSpace(val)
-		}
-	}
-	if convID == "" && req.Metadata != nil {
-		if val, ok := req.Metadata["conversation_id"].(string); ok && val != "" {
-			convID = strings.TrimSpace(val)
-		} else if val, ok := req.Metadata["agy_conversation_id"].(string); ok && val != "" {
-			convID = strings.TrimSpace(val)
-		} else if val, ok := req.Metadata["session_id"].(string); ok && val != "" {
-			convID = strings.TrimSpace(val)
-		}
-	}
-
 	nativeModel := resolveNativeModel(requestedModel, cfg)
 
 	return agyOptions{
 		NativeModel:     nativeModel,
-		ConversationID:  convID,
+		ConversationID:  requestConversationID(chatReq.conversationFields, req.Headers, req.Metadata),
 		ReasoningEffort: effort,
 		HasTools:        len(chatReq.Tools) > 0,
 	}
@@ -967,23 +952,57 @@ func nonEmpty(value, fallback string) string {
 	return fallback
 }
 
-func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
+type agyExecution struct {
+	cfg     pluginConfig
+	opts    agyOptions
+	prompt  string
+	session conversationRef
+}
+
+func prepareAgyExecution(req rpcExecutorRequest) (agyExecution, error) {
 	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
 	if err != nil {
-		return executorResponse{}, err
+		return agyExecution{}, err
 	}
 	opts := resolveExecutionOptions(req, cfg)
-	prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
+	session := conversationRef{Home: sessionHome(cfg.AccountHome), Managed: req.AuthID != ""}
+	nativeID, handoff, err := resolveConversation(opts.ConversationID, req.Headers, session)
+	if err != nil {
+		return agyExecution{}, err
+	}
+	opts.ConversationID = nativeID
+	session.NativeID = nativeID
+	chatReq, err := decodeChatRequest(req.Payload)
+	if err != nil {
+		return agyExecution{}, err
+	}
+	if handoff {
+		if err := addHandoffContext(&chatReq); err != nil {
+			return agyExecution{}, err
+		}
+	}
+	prompt, err := buildChatPrompt(chatReq, nativeID, cfg.Workdir)
+	if err != nil {
+		return agyExecution{}, err
+	}
+	return agyExecution{cfg: cfg, opts: opts, prompt: prompt, session: session}, nil
+}
+
+func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
+	run, err := prepareAgyExecution(req)
 	if err != nil {
 		return executorResponse{}, err
 	}
+	cfg, opts := run.cfg, run.opts
 	if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
 		return executorResponse{}, err
 	}
-	result, _, err := runAgyJSON(cfg, opts, prompt)
+	result, _, err := runAgyJSON(cfg, opts, run.prompt)
 	if err != nil {
 		return executorResponse{}, err
 	}
+	run.session.NativeID = nonEmpty(result.ConversationID, run.session.NativeID)
+	result.ConversationID = run.session.clientID()
 
 	payload, err := makeChatCompletion(req.Model, result)
 	if err != nil {
@@ -991,7 +1010,7 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	}
 	headers := http.Header{"Content-Type": []string{"application/json"}}
 	if result.ConversationID != "" {
-		headers.Set("X-AGY-Conversation-ID", result.ConversationID)
+		headers.Set(conversationHeader, result.ConversationID)
 	}
 	mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
 	return executorResponse{
@@ -1004,25 +1023,13 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	}, nil
 }
 
-func executeStream(req rpcExecutorRequest) {
+func executeStream(req rpcExecutorRequest, run agyExecution) {
 	streamID := req.StreamID
-	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
-	if err != nil {
-		closePluginStream(streamID, err)
-		return
-	}
-	opts := resolveExecutionOptions(req, cfg)
-	opts.OutputFormat = "stream-json"
-
-	prompt, err := buildPrompt(req.Payload, opts.ConversationID, cfg.Workdir)
-	if err != nil {
-		closePluginStream(streamID, err)
-		return
-	}
+	cfg, opts := run.cfg, run.opts
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(cfg))
 	defer cancel()
-	cmd, err := newAgyCommand(ctx, cfg, opts, prompt)
+	cmd, err := newAgyCommand(ctx, cfg, opts, run.prompt)
 	if err != nil {
 		closePluginStream(streamID, err)
 		return
@@ -1044,12 +1051,43 @@ func executeStream(req rpcExecutorRequest) {
 	completionID := newCompletionID()
 	created := time.Now().Unix()
 	model := displayModel(req.Model)
-	conversationID := opts.ConversationID
+	session := run.session
+	conversationID := session.clientID()
+	updateConversationID := func(nativeID string) {
+		if nativeID = strings.TrimSpace(nativeID); nativeID != "" && nativeID != session.NativeID {
+			session.NativeID = nativeID
+			conversationID = session.clientID()
+		}
+	}
 
-	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"role": "assistant"}, nil, nil, conversationID)); err != nil {
-		killProcessTree(cmd)
-		_ = cmd.Wait()
-		return
+	// Don't commit a stream before actual output. A CLI error during startup can
+	// then still reach the host's retry path for new chats.
+	path, _ := req.Metadata["request_path"].(string)
+	// The OpenAI HTTP handlers frame plain JSON chunks and send [DONE].
+	// Other entrypoints may translate these chunks as SSE, so keep that framing.
+	rawChunks := path == "/v1/chat/completions" || path == "/v1/completions"
+	sendChunk := func(delta map[string]any, finish *string, usage map[string]any) error {
+		chunk := makeChatChunk(completionID, created, model, delta, finish, usage, conversationID)
+		if !rawChunks {
+			chunk = append(append([]byte("data: "), chunk...), '\n', '\n')
+		}
+		return emitPluginStreamChunk(streamID, chunk)
+	}
+	finishStream := func() {
+		if !rawChunks {
+			_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
+		}
+		closePluginStream(streamID, nil)
+	}
+	sentRole := false
+	emit := func(delta map[string]any, finish *string, usage map[string]any) error {
+		if !sentRole {
+			if err := sendChunk(map[string]any{"role": "assistant"}, nil, nil); err != nil {
+				return err
+			}
+			sentRole = true
+		}
+		return sendChunk(delta, finish, usage)
 	}
 
 	scanner := bufio.NewScanner(stdout)
@@ -1074,9 +1112,7 @@ func executeStream(req rpcExecutorRequest) {
 
 		switch event.Event {
 		case "init":
-			if event.ConversationID != "" {
-				conversationID = event.ConversationID
-			}
+			updateConversationID(event.ConversationID)
 		case "step_update":
 			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 				streamedText.WriteString(event.StepUpdate.TextDelta)
@@ -1096,8 +1132,7 @@ func executeStream(req rpcExecutorRequest) {
 
 				pending := streamedText.String()[emittedLen:]
 				emittedLen = streamedText.Len()
-				payload := makeSSEChunk(completionID, created, model, map[string]any{"content": pending}, nil, nil, conversationID)
-				if err := emitPluginStreamChunk(streamID, payload); err != nil {
+				if err := emit(map[string]any{"content": pending}, nil, nil); err != nil {
 					killProcessTree(cmd)
 					_ = cmd.Wait()
 					return
@@ -1107,9 +1142,7 @@ func executeStream(req rpcExecutorRequest) {
 			if event.Result != nil {
 				copyResult := *event.Result
 				terminal = &copyResult
-				if copyResult.ConversationID != "" {
-					conversationID = copyResult.ConversationID
-				}
+				updateConversationID(copyResult.ConversationID)
 			}
 		case "error":
 			streamError = strings.TrimSpace(event.Message)
@@ -1119,9 +1152,7 @@ func executeStream(req rpcExecutorRequest) {
 		default:
 			if event.Status != "" {
 				terminal = &agyResult{Status: event.Status, Response: event.Response, Error: event.Error, Usage: event.Usage, ConversationID: event.ConversationID}
-				if event.ConversationID != "" {
-					conversationID = event.ConversationID
-				}
+				updateConversationID(event.ConversationID)
 			}
 		}
 	}
@@ -1173,45 +1204,39 @@ func executeStream(req rpcExecutorRequest) {
 	}
 	if opts.HasTools && isToolCall {
 		// Emit tool_calls delta chunk
-		toolDelta := makeSSEChunk(completionID, created, model, map[string]any{
+		_ = emit(map[string]any{
 			"tool_calls": toolCalls,
-		}, nil, nil, conversationID)
-		_ = emitPluginStreamChunk(streamID, toolDelta)
+		}, nil, nil)
 
 		// The finish chunk and the usage chunk must stay separate: a usage chunk has empty choices.
 		finishReason := "tool_calls"
-		_ = emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, &finishReason, nil, conversationID))
+		_ = emit(map[string]any{}, &finishReason, nil)
 		if requestWantsUsage(req.Payload) {
-			_ = emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, nil, openAIUsage(terminal.Usage), conversationID))
+			_ = emit(map[string]any{}, nil, openAIUsage(terminal.Usage))
 		}
-		_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
-		closePluginStream(streamID, nil)
+		finishStream()
 		return
 	}
 
 	// If it was buffered thinking it was a tool call but turned out not to be
 	if streamedText.Len() > emittedLen {
-		payload := makeSSEChunk(completionID, created, model, map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil, conversationID)
-		_ = emitPluginStreamChunk(streamID, payload)
+		_ = emit(map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil)
 	} else if streamedText.Len() == 0 && terminal.Response != "" {
-		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{"content": terminal.Response}, nil, nil, conversationID)); err != nil {
+		if err := emit(map[string]any{"content": terminal.Response}, nil, nil); err != nil {
 			return
 		}
 	}
 
 	finish := "stop"
-	if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, &finish, nil, conversationID)); err != nil {
+	if err := emit(map[string]any{}, &finish, nil); err != nil {
 		return
 	}
 	if requestWantsUsage(req.Payload) {
-		if err := emitPluginStreamChunk(streamID, makeSSEChunk(completionID, created, model, map[string]any{}, nil, openAIUsage(terminal.Usage), conversationID)); err != nil {
+		if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
 			return
 		}
 	}
-	if err := emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n")); err != nil {
-		return
-	}
-	closePluginStream(streamID, nil)
+	finishStream()
 }
 
 type toolPrefixState int

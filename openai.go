@@ -25,8 +25,8 @@ type chatCompletionRequest struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
-	ConversationID  string `json:"conversation_id,omitempty"`
-	SessionID       string `json:"session_id,omitempty"`
+	conversationFields
+	ReplaySummary string `json:"agy_replay_summary,omitempty"`
 }
 
 type chatMessage struct {
@@ -68,20 +68,21 @@ func decodeChatRequest(raw []byte) (chatCompletionRequest, error) {
 	return req, nil
 }
 
-func buildPrompt(raw []byte, conversationID string, workdir string) (string, error) {
-	req, err := decodeChatRequest(raw)
-	if err != nil {
-		return "", err
+func addHandoffContext(req *chatCompletionRequest) error {
+	if summary := strings.TrimSpace(req.ReplaySummary); summary != "" {
+		content, _ := json.Marshal("Summary of the prior conversation:\n" + summary)
+		req.Messages = append([]chatMessage{{Role: "user", Content: content}}, req.Messages...)
+		return nil
 	}
-
-	convID := strings.TrimSpace(conversationID)
-	if convID == "" {
-		convID = strings.TrimSpace(req.ConversationID)
-		if convID == "" {
-			convID = strings.TrimSpace(req.SessionID)
+	for _, msg := range req.Messages[:len(req.Messages)-1] {
+		if strings.EqualFold(strings.TrimSpace(msg.Role), "assistant") {
+			return nil
 		}
 	}
+	return pError(errorCodeRequestScoped, "Continuing on another account requires earlier chat messages or an agy_replay_summary, not just the latest turn.", http.StatusBadRequest)
+}
 
+func buildChatPrompt(req chatCompletionRequest, convID, workdir string) (string, error) {
 	messages := req.Messages
 	if convID != "" {
 		// When resuming an existing conversation, only include messages after the last
@@ -454,7 +455,7 @@ func newCompletionID() string {
 	return fmt.Sprintf("chatcmpl-agy-%d", time.Now().UnixNano())
 }
 
-func makeSSEChunk(id string, created int64, model string, delta map[string]any, finishReason *string, usage map[string]any, conversationID string) []byte {
+func makeChatChunk(id string, created int64, model string, delta map[string]any, finishReason *string, usage map[string]any, conversationID string) []byte {
 	choice := map[string]any{
 		"index": 0,
 		"delta": delta,
@@ -479,5 +480,5 @@ func makeSSEChunk(id string, created int64, model string, delta map[string]any, 
 		body["usage"] = usage
 	}
 	raw, _ := json.Marshal(body)
-	return append(append([]byte("data: "), raw...), []byte("\n\n")...)
+	return raw
 }

@@ -405,7 +405,9 @@ func handleManagement(req managementRequest) managementResponse {
 	switch path {
 	case limitsManagementPath:
 	case accountsManagementPath:
-		return jsonManagementResponse(http.StatusOK, listAccounts(currentConfig(), currentAuthDir(), refresh))
+		resp := jsonManagementResponse(http.StatusOK, listAccounts(currentConfig(), currentAuthDir(), refresh))
+		resp.Headers.Set("Cache-Control", "no-store")
+		return resp
 	default:
 		return jsonManagementResponse(http.StatusNotFound, map[string]string{"error": "unknown cliproxy-antigravity management route"})
 	}

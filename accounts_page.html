@@ -28,22 +28,24 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
   button.danger { color: var(--danger); }
   button:disabled { opacity: .5; cursor: default; }
-  input { font: inherit; width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px;
-          background: var(--bg); color: var(--fg); }
-  .toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
+  input[type="text"] { font: inherit; min-width: 0; flex: 1; padding: 7px 10px; border: 1px solid var(--border);
+                       border-radius: 6px; background: var(--bg); color: var(--fg); }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .privacy { display: inline-flex; gap: 6px; align-items: center; margin-inline-start: auto; }
+  .summary { color: var(--muted); margin: 0 0 12px; }
   .panel { border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
   .panel h2 { font-size: 15px; margin: 0 0 8px; }
   .panel ol { margin: 0 0 12px; padding-left: 20px; }
   .panel li { margin-bottom: 6px; }
-  .row { display: flex; gap: 8px; align-items: center; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .accounts { display: grid; gap: 12px; }
   .account { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
-  .account header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-  .account .who { font-weight: 600; word-break: break-all; }
-  .account .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .account header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+  .account .who { font-weight: 600; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   .badge { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; margin-left: 6px; font-weight: 500; }
   .badge.ok { color: var(--ok); } .badge.off { color: var(--muted); } .badge.bad { color: var(--danger); }
-  .groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-top: 12px; }
+  .groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 10px; margin-top: 12px; }
   .group { font-size: 13px; }
   .group .name { font-weight: 600; margin-bottom: 4px; }
   .bucket { display: grid; grid-template-columns: 56px 1fr 52px; gap: 8px; align-items: center; color: var(--muted); }
@@ -56,28 +58,30 @@
   .err { color: var(--danger); font-size: 12px; margin-top: 8px; }
   .hidden { display: none !important; }
   .empty-state { color: var(--muted); padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 8px; }
+  details { margin: 20px 0 0; color: var(--muted); }
+  summary { cursor: pointer; color: var(--fg); }
+  details p { max-width: 70ch; }
+  dialog.panel { max-width: min(420px, calc(100% - 24px)); margin: auto; color: var(--fg); }
+  dialog::backdrop { background: rgb(0 0 0 / 45%); }
   a { color: var(--accent); }
 </style>
 </head>
 <body>
 <h1>Antigravity accounts</h1>
-<p class="lead">Each account runs the official agy CLI in its own home directory. CLIProxyAPI rotates requests between enabled accounts.</p>
+<p class="lead">Manage the accounts CLIProxyAPI uses to run Antigravity requests and check each account’s usage limits.</p>
 
-<div id="message" class="msg hidden"></div>
-
-<div id="keyPanel" class="panel hidden">
-  <h2>Management key</h2>
-  <p>This page could not read the management key from the CLIProxyAPI panel. Enter it to continue. It is kept only for this browser tab.</p>
-  <form id="keyForm" class="row">
-    <input id="keyInput" type="password" autocomplete="off" placeholder="Management key">
-    <button class="primary" type="submit">Continue</button>
-  </form>
-</div>
-
-<div id="main" class="hidden">
+<main>
   <div class="toolbar">
-    <button id="addBtn" class="primary">Add account</button>
-    <button id="refreshBtn">Refresh limits</button>
+    <button id="addBtn" class="primary" disabled>Add account</button>
+    <button id="refreshBtn" disabled>Refresh limits</button>
+    <label class="privacy"><input id="privacyToggle" type="checkbox"> Hide email addresses</label>
+  </div>
+
+  <div id="message" class="msg hidden" role="status"></div>
+  <div id="accessNote" class="panel hidden">
+    <h2>Connect to CLIProxyAPI</h2>
+    <p>Account details and controls are available from the Antigravity accounts sidebar after signing in to the management panel.</p>
+    <a href="/management.html" target="_top">Open the management panel</a>
   </div>
 
   <div id="addPanel" class="panel hidden">
@@ -87,26 +91,54 @@
       <li>Google then shows an authorization code. Copy it and paste it here.</li>
     </ol>
     <form id="codeForm" class="row">
-      <input id="codeInput" autocomplete="off" placeholder="Authorization code">
-      <button id="codeBtn" class="primary" type="submit">Add</button>
+      <input id="codeInput" type="text" aria-label="Authorization code or callback URL" autocomplete="off" placeholder="Authorization code or callback URL">
+      <button id="codeBtn" class="primary" type="submit" disabled>Add</button>
       <button id="cancelBtn" type="button">Cancel</button>
     </form>
-    <div id="addStatus" class="meta" style="margin-top:8px"></div>
+    <div id="addStatus" class="meta" role="status" style="margin-top:8px"></div>
   </div>
 
+  <p id="summary" class="summary" role="status"></p>
   <div id="accounts" class="accounts"></div>
-</div>
+
+  <dialog id="removeDialog" class="panel" aria-labelledby="removeTitle" aria-describedby="removeHelp">
+    <h2 id="removeTitle">Remove account?</h2>
+    <p id="removeHelp">This removes the credential from CLIProxyAPI but keeps the agy home and its sign-in. If this account is imported automatically, it can return after reconfiguration. Disable it instead to keep it out of rotation.</p>
+    <form method="dialog" class="row">
+      <button value="keep" autofocus>Keep account</button>
+      <button value="remove" class="danger">Remove account</button>
+    </form>
+  </dialog>
+
+  <details>
+    <summary>How multiple accounts work</summary>
+    <p>Each account has its own sign-in, settings, conversations, and usage limits. New chats follow CLIProxyAPI’s routing strategy. By default, round-robin spreads requests across eligible accounts of the same priority; it does not split token usage equally.</p>
+    <p>When your chat client sends back a conversation ID, that chat stays on its original account. A client can continue it on another account by starting a new session with the chat history or a summary. This page manages accounts, not chats.</p>
+  </details>
+</main>
 
 <script>
 (() => {
   const PROVIDER = 'agy';
   const AUTH_STORE = 'cli-proxy-auth';
   const ENC_PREFIX = 'enc::v1::';
+  const PRIVACY_STORE = 'agy-accounts-hide-email';
   const $ = (id) => document.getElementById(id);
-  let key = '';
-  let login = null; // { state, timer }
+  const parentOrigin = window.parent !== window
+    ? new URLSearchParams(location.hash.slice(1)).get('agy-panel')
+    : null;
+  let login = null;
+  let report = null;
+  let message = null;
+  let pendingRemoval = null;
+  let loading = false;
+  let mutating = false;
+  let disconnected = false;
+  let hideEmail = false;
+  try { hideEmail = localStorage.getItem(PRIVACY_STORE) === '1'; } catch (_) {}
+  $('privacyToggle').checked = hideEmail;
 
-  // The CLIProxyAPI panel keeps its key in localStorage, lightly obfuscated (XOR with host + user agent).
+  // Compatibility for older same-origin panels with "remember password" enabled.
   function deobfuscate(raw) {
     if (!raw || !raw.startsWith(ENC_PREFIX)) return raw;
     const salt = new TextEncoder().encode(`cli-proxy-api-webui::secure-storage|${location.host}|${navigator.userAgent}`);
@@ -119,38 +151,116 @@
     try {
       const raw = deobfuscate(localStorage.getItem(AUTH_STORE));
       if (raw) {
-        const data = JSON.parse(raw);
-        const k = (data && (data.state || data).managementKey) || '';
-        if (k) return k;
+        const parsed = JSON.parse(raw);
+        const data = parsed.state || parsed;
+        if (data.apiBase && new URL(data.apiBase).origin !== location.origin) return '';
+        if (typeof data.managementKey === 'string' && data.managementKey) return data.managementKey;
       }
     } catch (_) {}
     try {
       const legacy = deobfuscate(localStorage.getItem('managementKey'));
-      if (legacy) { try { return JSON.parse(legacy); } catch (_) { return legacy; } }
+      if (legacy) {
+        try {
+          const value = JSON.parse(legacy);
+          return typeof value === 'string' ? value : '';
+        } catch (_) { return legacy; }
+      }
     } catch (_) {}
     return '';
   }
 
-  async function api(method, path, body) {
-    const res = await fetch(new URL(path, location.origin), {
+  function requestError(status, detail) {
+    const error = new Error(detail || 'The accounts request failed.');
+    error.auth = status === 401 || status === 403;
+    return error;
+  }
+
+  // Send one request over a private reply port. The panel uses its own existing
+  // management connection; neither the page nor the port receives its key.
+  function panelRequest(action, params) {
+    return new Promise((resolve, reject) => {
+      const channel = new MessageChannel();
+      const finish = (callback, value) => {
+        clearTimeout(timeout);
+        channel.port1.close();
+        callback(value);
+      };
+      const timeout = setTimeout(() => finish(reject, new Error('The management panel did not respond.')), 60_000);
+      channel.port1.onmessage = ({ data }) => {
+        if (data.ok) finish(resolve, data.data);
+        else finish(reject, requestError(data.status, data.error));
+      };
+      try {
+        window.parent.postMessage({ protocol: 'agy-accounts/v1', action, ...params }, parentOrigin, [channel.port2]);
+      } catch (error) {
+        channel.port2.close();
+        finish(reject, error);
+      }
+    });
+  }
+
+  async function directRequest(method, path, body) {
+    const key = panelKey();
+    if (!key) throw requestError(401);
+    const res = await fetch(path, {
       method,
+      cache: 'no-store',
       headers: { 'Authorization': 'Bearer ' + key, ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
     let data = null;
     try { data = await res.json(); } catch (_) {}
-    if (res.status === 401 || res.status === 403) {
-      const err = new Error('The management key was rejected.'); err.auth = true; throw err;
-    }
-    if (!res.ok) throw new Error((data && (data.error || data.message)) || `${method} ${path} failed (${res.status})`);
+    if (!res.ok) throw requestError(res.status, (data && (data.message || data.error)) || `Request failed (${res.status}).`);
     return data;
   }
 
-  function showMessage(text, kind) {
+  function request(action, params = {}) {
+    if (parentOrigin) return panelRequest(action, params);
+    // Legacy panel fallback. Account mutations still use the host's protected APIs.
+    switch (action) {
+      case 'list':
+        return directRequest('GET', '/v0/management/agy/accounts' + (params.refresh ? '?refresh=1' : ''));
+      case 'set-disabled':
+        return directRequest('PATCH', '/v8/management/credentials/status', { name: params.file, disabled: params.disabled });
+      case 'remove':
+        return directRequest('DELETE', '/v8/management/credentials?name=' + encodeURIComponent(params.file));
+      case 'start-login':
+        return directRequest('GET', '/v8/management/oauth/auth-url?provider=' + PROVIDER);
+      case 'submit-code': {
+        const value = /^https?:\/\//i.test(params.value) ? { redirect_url: params.value } : { code: params.value };
+        return directRequest('POST', '/v8/management/oauth/callback', { provider: PROVIDER, state: params.state, ...value });
+      }
+      case 'poll-login':
+        return directRequest('GET', '/v8/management/oauth/status?state=' + encodeURIComponent(params.state));
+      case 'cancel-login':
+        return directRequest('DELETE', '/v8/management/oauth/session?state=' + encodeURIComponent(params.state));
+    }
+  }
+
+  function showMessage(text = '', kind = '', detail = '') {
+    message = { text, kind, detail };
+    renderMessage();
+  }
+
+  function renderMessage() {
     const el = $('message');
-    el.textContent = text;
-    el.className = 'msg ' + (kind || '');
-    if (!text) el.classList.add('hidden');
+    el.textContent = message ? [message.text, hideEmail ? '' : message.detail].filter(Boolean).join(' ') : '';
+    el.className = 'msg ' + (message?.kind || '');
+    el.classList.toggle('hidden', !el.textContent);
+  }
+
+  function disconnect() {
+    disconnected = true;
+    report = null;
+    if ($('removeDialog').open) $('removeDialog').close('keep');
+    endLogin();
+    showMessage('');
+    render();
+  }
+
+  function reportError(text, error) {
+    if (error.auth) disconnect();
+    else showMessage(text, 'error', error.message);
   }
 
   function el(tag, attrs, ...children) {
@@ -171,169 +281,234 @@
     if (frac !== null && frac <= 0) fill.className = 'empty'; else if (frac !== null && frac < 0.2) fill.className = 'low';
     const reset = b.reset_time ? 'Resets ' + new Date(b.reset_time).toLocaleString() : '';
     const row = el('div', { class: 'bucket', title: disabled ? 'Not limited' : reset },
-      el('span', {}, b.window || b.id || ''), el('div', { class: 'bar' }, fill), el('span', {}, disabled ? 'off' : pct));
+      el('span', {}, quotaLabel(b.window || b.id)), el('div', { class: 'bar' }, fill), el('span', {}, disabled ? 'off' : pct));
     return row;
   }
 
-  function accountCard(acc) {
-    const status = acc.disabled ? el('span', { class: 'badge off' }, 'disabled')
-      : acc.signed_in ? el('span', { class: 'badge ok' }, 'active')
-      : el('span', { class: 'badge bad' }, 'not signed in');
-    const toggle = el('button', { onclick: () => setDisabled(acc, !acc.disabled) }, acc.disabled ? 'Enable' : 'Disable');
-    const remove = el('button', { class: 'danger', onclick: () => removeAccount(acc) }, 'Remove');
+  function quotaLabel(value) {
+    const label = value || '';
+    return hideEmail ? label.replace(/\S+@\S+/g, '[hidden]') : label;
+  }
+
+  function accountLabel(acc, index) {
+    return hideEmail ? `Account ${index + 1}` : (acc.email || acc.file);
+  }
+
+  function accountCard(acc, index) {
+    const who = accountLabel(acc, index);
+    const status = acc.disabled ? el('span', { class: 'badge off' }, 'Disabled')
+      : acc.signed_in ? el('span', { class: 'badge ok' }, 'Enabled')
+      : el('span', { class: 'badge bad' }, 'Not signed in');
+    const action = acc.disabled ? 'Enable' : 'Disable';
+    const toggle = el('button', { 'aria-label': `${action} ${who}`, onclick: () => setDisabled(acc, !acc.disabled) }, action);
+    const remove = el('button', { class: 'danger', 'aria-label': `Remove ${who}`, onclick: () => askToRemove(acc, index) }, 'Remove');
+    toggle.disabled = remove.disabled = loading || mutating;
     const groups = el('div', { class: 'groups' });
     for (const g of acc.groups || []) {
-      groups.append(el('div', { class: 'group' }, el('div', { class: 'name' }, g.name), ...(g.buckets || []).map(bucketRow)));
+      groups.append(el('div', { class: 'group' }, el('div', { class: 'name' }, quotaLabel(g.name)), ...(g.buckets || []).map(bucketRow)));
     }
     return el('div', { class: 'account' },
       el('header', {},
         el('div', {},
-          el('div', { class: 'who' }, acc.email || acc.file, status),
-          el('div', { class: 'meta' }, acc.home ? 'Home: ' + acc.home : 'Home: CLIProxyAPI user home', ' · ', acc.file)),
+          el('div', { class: 'who' }, el('span', {}, who), status),
+          hideEmail ? null : el('div', { class: 'meta' }, acc.home ? 'Home: ' + acc.home : 'Home: CLIProxyAPI user home', ' · ', acc.file)),
         el('div', { class: 'row' }, toggle, remove)),
-      (acc.groups && acc.groups.length) ? groups : null,
-      acc.error ? el('div', { class: 'err' }, acc.error) : null);
+      groups.children.length ? groups : null,
+      acc.fetched_at && !acc.error ? el('div', { class: 'meta' }, 'Limits checked ' + new Date(acc.fetched_at).toLocaleString()) : null,
+      acc.error ? el('div', { class: 'err' },
+        groups.children.length ? 'Could not refresh limits. Showing previous values. ' : 'Account details unavailable. ',
+        hideEmail ? '' : acc.error) : null);
+  }
+
+  function render() {
+    const list = $('accounts');
+    $('accessNote').classList.toggle('hidden', !disconnected);
+    $('addBtn').disabled = disconnected || !report || loading || mutating || Boolean(login);
+    $('refreshBtn').disabled = disconnected || loading || mutating;
+    $('refreshBtn').textContent = loading ? 'Refreshing…' : 'Refresh limits';
+    list.setAttribute('aria-busy', String(loading));
+    if (!report) {
+      $('summary').textContent = loading && !disconnected ? 'Loading accounts…' : '';
+      list.replaceChildren();
+      return;
+    }
+    const { accounts, tracking } = report;
+    const disabled = accounts.filter((account) => account.disabled).length;
+    const enabled = accounts.filter((account) => !account.disabled && account.signed_in).length;
+    $('summary').textContent = accounts.length
+      ? `${enabled} enabled · ${disabled} disabled · ${accounts.length - disabled - enabled} not signed in` +
+        (tracking ? '' : ' · Usage tracking is off')
+      : '';
+    list.replaceChildren(...(accounts.length
+      ? accounts.map(accountCard)
+      : [el('div', { class: 'empty-state' }, 'No Antigravity accounts yet. Click “Add account” to sign one in.')]));
   }
 
   async function load(refresh) {
-    const list = $('accounts');
-    // Limits come from running agy for every account, which takes a few seconds.
-    const loading = el('div', { class: 'empty-state' }, refresh ? 'Refreshing usage limits…' : 'Loading accounts…');
-    if (!list.children.length || refresh) list.replaceChildren(loading);
+    if (loading || disconnected) return;
+    loading = true;
+    render();
     try {
-      const data = await api('GET', '/v0/management/agy/accounts' + (refresh ? '?refresh=1' : ''));
-      list.replaceChildren();
-      if (!data.accounts.length) {
-        list.append(el('div', { class: 'empty-state' }, 'No Antigravity accounts yet. Click "Add account" to sign one in.'));
-      }
-      for (const acc of data.accounts) list.append(accountCard(acc));
-    } catch (e) {
-      if (e.auth) return askKey(e.message);
-      showMessage(e.message, 'error');
+      const nextReport = await request('list', { refresh });
+      if (!Array.isArray(nextReport?.accounts)) throw new Error('Unexpected response from CLIProxyAPI.');
+      if (!disconnected) report = nextReport;
+    } catch (error) {
+      reportError('Could not load accounts.', error);
+    } finally {
+      loading = false;
+      render();
     }
   }
 
-  async function setDisabled(acc, disabled) {
+  async function mutate(action, params, success, failure, update) {
+    if (mutating || loading || disconnected) return;
+    mutating = true;
+    render();
     try {
-      await api('PATCH', '/v0/management/auth-files/status', { name: acc.file, disabled });
-      showMessage('');
-      load(false);
-    } catch (e) { showMessage(e.message, 'error'); }
+      await request(action, params);
+      if (disconnected) return;
+      update();
+      showMessage(success, 'ok');
+      await load(false);
+    } catch (error) {
+      reportError(failure, error);
+    } finally {
+      mutating = false;
+      render();
+    }
   }
 
-  async function removeAccount(acc) {
-    const who = acc.email || acc.file;
-    if (!confirm(`Remove ${who} from CLIProxyAPI?\n\nThe auth file is deleted. The account's agy home${acc.home ? ' (' + acc.home + ')' : ''} is kept on disk.`)) return;
-    try {
-      await api('DELETE', '/v0/management/auth-files?name=' + encodeURIComponent(acc.file));
-      showMessage(`Removed ${who}.`, 'ok');
-      load(false);
-    } catch (e) { showMessage(e.message, 'error'); }
+  function setDisabled(acc, disabled) {
+    return mutate('set-disabled', { file: acc.file, disabled },
+      disabled ? 'Account disabled.' : 'Account enabled.', 'Could not change account status.', () => {
+        acc.disabled = disabled;
+        if (disabled) { acc.groups = []; acc.fetched_at = ''; }
+      });
+  }
+
+  function askToRemove(acc, index) {
+    pendingRemoval = acc;
+    $('removeTitle').textContent = `Remove ${accountLabel(acc, index)}?`;
+    $('removeDialog').returnValue = '';
+    $('removeDialog').showModal();
+  }
+
+  function confirmRemoval() {
+    const acc = pendingRemoval;
+    pendingRemoval = null;
+    $('removeTitle').textContent = 'Remove account?';
+    if (!acc || $('removeDialog').returnValue !== 'remove') return;
+    return mutate('remove', { file: acc.file }, 'Account removed.', 'Could not remove the account.', () => {
+      report.accounts = report.accounts.filter((account) => account !== acc);
+    });
   }
 
   async function startLogin() {
+    if (login || !report || loading || mutating || disconnected) return;
+    const attempt = { state: '', timer: null };
+    login = attempt;
     showMessage('');
-    $('addBtn').disabled = true;
+    render();
     $('addStatus').textContent = 'Starting agy sign-in…';
     $('addPanel').classList.remove('hidden');
     $('loginLink').classList.add('hidden');
+    $('codeInput').disabled = $('codeBtn').disabled = true;
     try {
-      const data = await api('GET', '/v8/management/oauth/auth-url?provider=' + PROVIDER);
-      if (!data || !data.url || !data.state) throw new Error((data && data.error) || 'CLIProxyAPI did not return a sign-in link');
-      login = { state: data.state, timer: null };
-      $('loginLink').href = data.url;
+      const data = await request('start-login');
+      attempt.state = data?.state;
+      if (login !== attempt) return cancelSession(attempt.state);
+      if (!data?.url || !attempt.state) throw new Error('CLIProxyAPI did not return a sign-in link.');
+      const url = new URL(data.url);
+      if (url.protocol !== 'https:') throw new Error('The sign-in link must use HTTPS.');
+      $('loginLink').href = url.href;
       $('loginLink').classList.remove('hidden');
       $('addStatus').textContent = 'Waiting for you to sign in.';
-      $('codeInput').value = '';
-      $('codeInput').focus();
-    } catch (e) {
+      $('codeInput').disabled = $('codeBtn').disabled = false;
+      $('loginLink').focus();
+    } catch (error) {
+      if (login !== attempt) return;
       endLogin();
-      if (e.auth) return askKey(e.message);
-      showMessage(e.message, 'error');
+      reportError('Could not start sign-in.', error);
+      void cancelSession(attempt.state);
     }
   }
 
   async function submitCode(ev) {
     ev.preventDefault();
-    if (!login) return;
+    const attempt = login;
+    if (!attempt?.state || $('codeBtn').disabled) return;
     const value = $('codeInput').value.trim();
     if (!value) return;
-    const body = { provider: PROVIDER, state: login.state };
-    // A pasted callback URL still works; the host extracts the code from it.
-    if (/^https?:\/\//i.test(value)) body.redirect_url = value; else body.code = value;
-    $('codeBtn').disabled = true;
+    $('codeInput').disabled = $('codeBtn').disabled = true;
     try {
-      await api('POST', '/v8/management/oauth/callback', body);
+      await request('submit-code', { state: attempt.state, value });
+      if (login !== attempt) return;
+      $('codeInput').value = '';
       $('addStatus').textContent = 'Signing in with agy…';
-      pollLogin();
-    } catch (e) {
-      $('codeBtn').disabled = false;
-      showMessage(e.message, 'error');
+      void pollLogin(attempt);
+    } catch (error) {
+      if (login !== attempt) return;
+      $('codeInput').disabled = $('codeBtn').disabled = false;
+      reportError('Could not submit the authorization code.', error);
     }
   }
 
-  async function pollLogin() {
-    if (!login) return;
+  async function pollLogin(attempt) {
+    if (login !== attempt) return;
     try {
-      const data = await api('GET', '/v8/management/oauth/status?state=' + encodeURIComponent(login.state));
+      const data = await request('poll-login', { state: attempt.state });
+      if (login !== attempt) return;
       if (data.status === 'ok') {
         endLogin();
         showMessage('Account added.', 'ok');
-        return load(true);
+        return load(false);
       }
       if (data.status === 'error') {
         endLogin();
-        return showMessage(data.error || 'Sign-in failed.', 'error');
+        return showMessage('Sign-in failed.', 'error', data.error);
       }
-    } catch (e) {
+    } catch (error) {
+      if (login !== attempt) return;
       endLogin();
-      return showMessage(e.message, 'error');
+      reportError('Could not check sign-in status.', error);
+      return cancelSession(attempt.state);
     }
-    login.timer = setTimeout(pollLogin, 2000);
+    attempt.timer = setTimeout(() => pollLogin(attempt), 2000);
   }
 
   function endLogin() {
-    if (login && login.timer) clearTimeout(login.timer);
+    if (login?.timer) clearTimeout(login.timer);
     login = null;
     $('addPanel').classList.add('hidden');
-    $('addBtn').disabled = false;
-    $('codeBtn').disabled = false;
+    $('codeInput').value = '';
+    $('loginLink').removeAttribute('href');
+    render();
   }
 
-  async function cancelLogin() {
-    const state = login && login.state;
-    endLogin();
-    if (state) { try { await api('DELETE', '/v8/management/oauth/session?state=' + encodeURIComponent(state)); } catch (_) {} }
+  async function cancelSession(state) {
+    if (state && !disconnected) {
+      try { await request('cancel-login', { state }); } catch (_) {}
+    }
   }
 
-  function askKey(reason) {
-    $('main').classList.add('hidden');
-    $('keyPanel').classList.remove('hidden');
-    if (reason) showMessage(reason, 'error');
-    $('keyInput').focus();
-  }
-
-  function start() {
-    $('keyPanel').classList.add('hidden');
-    $('main').classList.remove('hidden');
-    showMessage('');
-    load(false);
-  }
-
-  $('keyForm').addEventListener('submit', (ev) => {
-    ev.preventDefault();
-    key = $('keyInput').value.trim();
-    if (!key) return;
-    sessionStorage.setItem('agy-accounts-key', key);
-    start();
+  $('privacyToggle').addEventListener('change', () => {
+    hideEmail = $('privacyToggle').checked;
+    try { localStorage.setItem(PRIVACY_STORE, hideEmail ? '1' : '0'); } catch (_) {}
+    renderMessage();
+    render();
   });
   $('addBtn').addEventListener('click', startLogin);
-  $('refreshBtn').addEventListener('click', () => load(true));
+  $('refreshBtn').addEventListener('click', () => { showMessage(''); void load(true); });
   $('codeForm').addEventListener('submit', submitCode);
-  $('cancelBtn').addEventListener('click', cancelLogin);
-
-  key = panelKey() || sessionStorage.getItem('agy-accounts-key') || '';
-  if (key) start(); else askKey('');
+  $('removeDialog').addEventListener('close', confirmRemoval);
+  $('cancelBtn').addEventListener('click', async () => {
+    const state = login?.state;
+    endLogin();
+    await cancelSession(state);
+  });
+  try { sessionStorage.removeItem('agy-accounts-key'); } catch (_) {}
+  if (parentOrigin || panelKey()) void load(false);
+  else disconnect();
 })();
 </script>
 </body>
