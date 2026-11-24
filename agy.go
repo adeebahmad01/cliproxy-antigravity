@@ -1173,7 +1173,7 @@ func prepareAgyExecution(req rpcExecutorRequest) (agyExecution, error) {
 		}
 		run.prompt = fileHandoffPrompt(path, len(staged))
 		run.stagedBytes = len(staged)
-		run.cleanup = func() { _ = os.Remove(path) }
+		run.cleanup = func() { removeStagedPrompt(path) }
 	}
 	return run, nil
 }
@@ -1185,6 +1185,9 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	}
 	cfg, opts := run.cfg, run.opts
 	if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
+		if run.cleanup != nil {
+			run.cleanup()
+		}
 		return executorResponse{}, err
 	}
 	result, _, err := runAgyJSON(cfg, opts, run.prompt)

@@ -196,35 +196,93 @@ func writeToolInstruction(b *strings.Builder, tools []json.RawMessage) {
 	b.WriteString("Do not execute local commands for client tools; the client application will run them and return the result.\n\n")
 }
 
-// promptStagingDir returns the private staging directory. The prompt is staged
-// outside workdir so it never shows up in the repository, in the model's repo
-// tools, or in a commit.
+// promptStagingDir returns the staging root. Every turn gets its own directory
+// inside it, so one staged prompt can never be listed, replaced, or deleted via a
+// predictable name.
 func promptStagingDir() string {
+	if stagingDirOverride != "" {
+		return stagingDirOverride
+	}
 	return filepath.Join(os.TempDir(), "cliproxy-prompts")
 }
 
-// writePromptFile stages an oversized prompt. The path is random per request so
-// two identical requests cannot delete each other's file.
-func writePromptFile(prompt string) (string, error) {
+// stagingDirOverride lets tests isolate the staging root.
+var stagingDirOverride string
+
+// ensurePrivateStagingDir creates the staging root and refuses to use one another
+// local user could control. MkdirAll keeps an existing directory's mode and owner,
+// so a shared /tmp entry created first by someone else would otherwise be accepted.
+func ensurePrivateStagingDir() (string, error) {
 	dir := promptStagingDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	// Sweep files left behind by a crashed turn.
-	if entries, err := os.ReadDir(dir); err == nil {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("staging path %s is not a directory", dir)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return "", fmt.Errorf("staging directory %s has permissions %04o, want 0700", dir, perm)
+	}
+	if owner, ok := fileOwnerID(info); ok && !stagingOwnedByCurrentUser(owner) {
+		return "", fmt.Errorf("staging directory %s is owned by uid %d", dir, owner)
+	}
+	return dir, nil
+}
+
+// writePromptFile stages an oversized prompt in its own private directory and
+// returns the file path. The caller removes the directory when the turn ends.
+func writePromptFile(prompt string) (string, error) {
+	base, err := ensurePrivateStagingDir()
+	if err != nil {
+		return "", err
+	}
+	// Sweep directories left behind by a crashed turn.
+	if entries, readErr := os.ReadDir(base); readErr == nil {
 		for _, entry := range entries {
 			if info, statErr := entry.Info(); statErr == nil && time.Since(info.ModTime()) > time.Hour {
-				_ = os.Remove(filepath.Join(dir, entry.Name()))
+				_ = os.RemoveAll(filepath.Join(base, entry.Name()))
 			}
 		}
 	}
-	sum := sha256.Sum256([]byte(prompt))
-	name := "prompt_" + hex.EncodeToString(sum[:8]) + "_" + newCallID() + ".txt"
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(prompt), 0o600); err != nil {
+	dir, err := os.MkdirTemp(base, "turn-")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "prompt.txt")
+	// O_EXCL: never follow or reuse a file someone else placed here.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	if _, err := file.WriteString(prompt); err != nil {
+		_ = file.Close()
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.RemoveAll(dir)
 		return "", err
 	}
 	return path, nil
+}
+
+// removeStagedPrompt deletes the staged turn directory that holds path.
+func removeStagedPrompt(path string) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	dir := filepath.Dir(path)
+	// Only clean up directories this plugin created.
+	if filepath.Dir(dir) == promptStagingDir() && strings.HasPrefix(filepath.Base(dir), "turn-") {
+		_ = os.RemoveAll(dir)
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // fileHandoffPrompt is the short inline prompt sent when the request is staged.

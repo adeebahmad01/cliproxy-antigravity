@@ -331,6 +331,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		if err := checkModelLimits(run.cfg, run.opts.NativeModel); err != nil {
+			if run.cleanup != nil {
+				run.cleanup()
+			}
 			return nil, err
 		}
 		run.opts.OutputFormat = "stream-json"
@@ -356,6 +359,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		run, err := prepareAgyExecution(req)
 		if err != nil {
 			return nil, err
+		}
+		// The staged file holds the full conversation; this path never runs agy.
+		if run.cleanup != nil {
+			defer run.cleanup()
 		}
 		// Token counting must reflect the conversation, not the short handoff that
 		// replaced an oversized prompt.
