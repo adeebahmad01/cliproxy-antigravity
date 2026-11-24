@@ -361,43 +361,51 @@ func jsonValueEnd(s string, start int) int {
 	return -1
 }
 
-// fencedToolCallJSON pulls the JSON payload out of a fenced tool_calls block.
-// Candidates are tried from most to least permissive so embedded ``` fences
-// inside string arguments do not truncate the payload.
-func fencedToolCallJSON(text string) string {
-	// ```tool_calls may be preceded by prose ("Here is the call:"), but ```json is
-	// only a tool payload when it opens the response: otherwise an ordinary
-	// explanation that embeds an example ```json block would be parsed as a call.
-	start := -1
-	if idx := strings.Index(text, "```tool_calls"); idx >= 0 {
-		start = idx + len("```tool_calls")
-	} else if strings.HasPrefix(text, "```json") {
-		start = len("```json")
-	}
-	if start < 0 {
-		return ""
-	}
+// payloadAfterFence returns the JSON payload that starts inside the fence whose
+// body begins at start. A fence that closes before any JSON container means the
+// block has no payload ("```json null```" followed by prose), so the search stops
+// there instead of picking up whatever follows.
+func payloadAfterFence(text string, start int) string {
 	body := text[start:]
 	brace := strings.IndexAny(body, "[{")
 	fence := strings.Index(body, "```")
-	// The fence closed before any JSON container: the payload is not a JSON value
-	// ("```json null```" followed by prose), so do not search past the fence.
 	if fence >= 0 && (brace < 0 || fence < brace) {
 		return ""
 	}
 	if brace >= 0 {
 		if end := jsonValueEnd(body, brace); end > 0 {
-			if candidate := strings.TrimSpace(body[brace:end]); candidate != "" {
-				return candidate
-			}
+			return strings.TrimSpace(body[brace:end])
 		}
 	}
-	// Fall back to the last closing fence: correct when the arguments contain no
-	// balanced JSON the scanner could follow.
-	if endIdx := strings.LastIndex(body, "```"); endIdx >= 0 {
-		return strings.TrimSpace(body[:endIdx])
-	}
 	return ""
+}
+
+// fencedToolCallPayloads returns fenced candidates in priority order: a leading
+// ```json fence first, then a ```tool_calls block. A ```tool_calls marker inside
+// a string argument of the leading payload would otherwise become the start
+// point, while a leading example block followed by a genuine tool_calls fence
+// still gets its call recovered by the second candidate.
+func fencedToolCallPayloads(text string) []string {
+	var out []string
+	add := func(payload string) {
+		payload = strings.TrimSpace(payload)
+		if payload == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == payload {
+				return
+			}
+		}
+		out = append(out, payload)
+	}
+	if strings.HasPrefix(text, "```json") {
+		add(payloadAfterFence(text, len("```json")))
+	}
+	if idx := strings.Index(text, "```tool_calls"); idx >= 0 {
+		add(payloadAfterFence(text, idx+len("```tool_calls")))
+	}
+	return out
 }
 
 // normalizeArguments renders tool arguments as the JSON text clients expect. Some
@@ -448,11 +456,7 @@ func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) 
 			blocks = append(blocks, trimmed)
 		}
 	}
-	if fenced := fencedToolCallJSON(trimmed); fenced != "" {
-		if len(blocks) == 0 || fenced != blocks[0] {
-			blocks = append(blocks, fenced)
-		}
-	}
+	blocks = append(blocks, fencedToolCallPayloads(trimmed)...)
 
 	var candidates []toolCallCandidate
 	for _, block := range blocks {

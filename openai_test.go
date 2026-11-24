@@ -386,3 +386,29 @@ func TestBareCandidateFailureFallsBackToFence(t *testing.T) {
 		}
 	}
 }
+
+// A ```tool_calls marker inside a string argument of a leading ```json payload
+// must not become the start point.
+func TestLeadingJSONFenceWithToolCallsMarkerInArguments(t *testing.T) {
+	response := "```json\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"echo ```tool_calls {}\"}}]\n```"
+	calls, ok := extractToolCalls(response, false)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("leading json payload with a marker in its arguments was dropped: ok=%v", ok)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments invalid: %v", err)
+	}
+	if args["command"] != "echo ```tool_calls {}" {
+		t.Fatalf("command = %v", args["command"])
+	}
+}
+
+// A leading example block followed by a genuine tool_calls fence still resolves.
+func TestLeadingJSONExampleThenRealToolCallsFence(t *testing.T) {
+	response := "```json\n{\"note\":\"example only\"}\n```\n\nHere is the call:\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```"
+	calls, ok := extractToolCalls(response, false)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+		t.Fatalf("genuine fence after a leading example block was lost: ok=%v calls=%v", ok, calls)
+	}
+}
