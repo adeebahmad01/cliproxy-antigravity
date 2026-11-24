@@ -115,6 +115,12 @@ func buildChatPrompt(req chatCompletionRequest, convID, workdir string) (string,
 		b.WriteString("You have no filesystem, shell, network, or editor tools for this request: do not read files, run commands, or inspect the environment. Answer from the conversation text alone, and never leave the reply empty.\n\n")
 	}
 
+	// The client-tools contract goes first: agy caps the inline prompt and truncates
+	// from the tail, so a trailing instruction block is the first thing to be lost.
+	if len(req.Tools) > 0 {
+		writeToolInstruction(&b, req.Tools)
+	}
+
 	for i, msg := range messages {
 		role := strings.TrimSpace(strings.ToLower(msg.Role))
 		if role == "" {
@@ -151,19 +157,21 @@ func buildChatPrompt(req chatCompletionRequest, convID, workdir string) (string,
 		}
 	}
 
-	if len(req.Tools) > 0 {
-		b.WriteString("\n[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]\n")
-		b.WriteString("The client application has provided the following tools:\n")
-		for _, tool := range req.Tools {
-			b.Write(tool)
-			b.WriteByte('\n')
-		}
-		b.WriteString("\nIf a client tool call is needed, reply ONLY with a JSON block in this exact markdown code fence:\n")
-		b.WriteString("```tool_calls\n[\n  {\n    \"name\": \"tool_name\",\n    \"arguments\": { ... }\n  }\n]\n```\n")
-		b.WriteString("If no tool call is needed, provide your regular assistant response without the ```tool_calls code block.\n")
-		b.WriteString("Do not execute local commands for client tools; the client application will run them and return the result.\n")
-	}
 	return b.String(), nil
+}
+
+// writeToolInstruction renders the client-side tool calling contract.
+func writeToolInstruction(b *strings.Builder, tools []json.RawMessage) {
+	b.WriteString("[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]\n")
+	b.WriteString("The client application has provided the following tools:\n")
+	for _, tool := range tools {
+		b.Write(tool)
+		b.WriteByte('\n')
+	}
+	b.WriteString("\nIf a client tool call is needed, reply ONLY with a JSON block in this exact markdown code fence:\n")
+	b.WriteString("```tool_calls\n[\n  {\n    \"name\": \"tool_name\",\n    \"arguments\": { ... }\n  }\n]\n```\n")
+	b.WriteString("If no tool call is needed, provide your regular assistant response without the ```tool_calls code block.\n")
+	b.WriteString("Do not execute local commands for client tools; the client application will run them and return the result.\n\n")
 }
 
 func stageImage(dataURLOrPath string, workdir string) (string, error) {
