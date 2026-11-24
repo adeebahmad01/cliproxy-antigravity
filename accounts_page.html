@@ -121,7 +121,8 @@
 (() => {
   const PROVIDER = 'agy';
   const AUTH_STORE = 'cli-proxy-auth';
-  const ENC_PREFIX = 'enc::v1::';
+  const ENC_PREFIX = 'enc::v2::';
+  const LEGACY_ENC_PREFIX = 'enc::v1::';
   const PRIVACY_STORE = 'agy-accounts-hide-email';
   const $ = (id) => document.getElementById(id);
   const parentOrigin = window.parent !== window
@@ -138,11 +139,14 @@
   try { hideEmail = localStorage.getItem(PRIVACY_STORE) === '1'; } catch (_) {}
   $('privacyToggle').checked = hideEmail;
 
-  // Compatibility for older same-origin panels with "remember password" enabled.
+  // Compatibility for same-origin panels with "remember password" enabled.
   function deobfuscate(raw) {
-    if (!raw || !raw.startsWith(ENC_PREFIX)) return raw;
-    const salt = new TextEncoder().encode(`cli-proxy-api-webui::secure-storage|${location.host}|${navigator.userAgent}`);
-    const bin = atob(raw.slice(ENC_PREFIX.length));
+    if (!raw) return raw;
+    const legacy = raw.startsWith(LEGACY_ENC_PREFIX);
+    if (!legacy && !raw.startsWith(ENC_PREFIX)) return raw;
+    const salt = new TextEncoder().encode(
+      `cli-proxy-api-webui::secure-storage|${location.host}${legacy ? '|' + navigator.userAgent : ''}`);
+    const bin = atob(raw.slice((legacy ? LEGACY_ENC_PREFIX : ENC_PREFIX).length));
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) ^ salt[i % salt.length];
     return new TextDecoder().decode(bytes);
