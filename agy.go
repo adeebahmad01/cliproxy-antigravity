@@ -1230,15 +1230,24 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	}
 	if opts.HasTools && isToolCall {
 		// Emit tool_calls delta chunk
-		_ = emit(map[string]any{
+		if err := emit(map[string]any{
 			"tool_calls": toolCalls,
-		}, nil, nil)
+		}, nil, nil); err != nil {
+			closePluginStream(streamID, err)
+			return
+		}
 
 		// The finish chunk and the usage chunk must stay separate: a usage chunk has empty choices.
 		finishReason := "tool_calls"
-		_ = emit(map[string]any{}, &finishReason, nil)
+		if err := emit(map[string]any{}, &finishReason, nil); err != nil {
+			closePluginStream(streamID, err)
+			return
+		}
 		if requestWantsUsage(req.Payload) {
-			_ = emit(map[string]any{}, nil, openAIUsage(terminal.Usage))
+			if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
+				closePluginStream(streamID, err)
+				return
+			}
 		}
 		finishStream()
 		return
@@ -1255,10 +1264,12 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 
 	finish := "stop"
 	if err := emit(map[string]any{}, &finish, nil); err != nil {
+		closePluginStream(streamID, err)
 		return
 	}
 	if requestWantsUsage(req.Payload) {
 		if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
+			closePluginStream(streamID, err)
 			return
 		}
 	}
