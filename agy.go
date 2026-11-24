@@ -1100,10 +1100,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		return emitPluginStreamChunk(streamID, chunk)
 	}
 	finishStream := func() {
-		if !rawChunks {
-			_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
-		}
-		closePluginStream(streamID, nil)
+		finishPluginStream(streamID, rawChunks, emitPluginStreamChunk, closePluginStream)
 	}
 	sentRole := false
 	emit := func(delta map[string]any, finish *string, usage map[string]any) error {
@@ -1311,6 +1308,18 @@ func toolCallPrefixState(text string) toolPrefixState {
 		return toolPrefixPending
 	}
 	return toolPrefixNone
+}
+
+// finishPluginStream emits the SSE [DONE] sentinel on translated routes and closes
+// the stream, propagating any emission failure to closeStream.
+func finishPluginStream(streamID string, rawChunks bool, emitChunk func(string, []byte) error, closeStream func(string, error)) {
+	if !rawChunks {
+		if err := emitChunk(streamID, []byte("data: [DONE]\n\n")); err != nil {
+			closeStream(streamID, err)
+			return
+		}
+	}
+	closeStream(streamID, nil)
 }
 
 func emitPluginStreamChunk(streamID string, payload []byte) error {
