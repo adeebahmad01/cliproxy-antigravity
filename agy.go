@@ -264,13 +264,16 @@ func routeModel(req modelRouteRequest) modelRouteResponse {
 }
 
 func mergeDiscoveredNativeMap(nativeByID, mapping map[string]string) {
+	// Pass 1: record direct mappings. Pass 2: normalize derived base slugs so
+	// map iteration order never lets a display label overwrite a clean base slug.
 	for id, native := range mapping {
 		nativeByID[id] = native
-		// Also map unprefixed and antigravity/ prefixes
 		slug := strings.TrimPrefix(id, "agy/")
 		nativeByID[slug] = native
 		nativeByID["antigravity/"+slug] = native
-
+	}
+	for id := range mapping {
+		slug := strings.TrimPrefix(id, "agy/")
 		baseSlug := stripEffortSuffix(slug)
 		if baseSlug != slug {
 			nativeByID[baseSlug] = baseSlug
@@ -376,11 +379,11 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 		baseSlug := stripEffortSuffix(slug)
 		if baseSlug != slug {
 			baseID := "agy/" + baseSlug
+			baseName := stripEffortLabel(name)
+			if baseName == "" || baseName == baseSlug || looksLikeModelSlug(baseName) {
+				baseName = humanizeModelName(baseSlug)
+			}
 			if _, exists := byID[baseID]; !exists {
-				baseName := stripEffortLabel(name)
-				if baseName == "" || baseName == baseSlug || looksLikeModelSlug(baseName) {
-					baseName = humanizeModelName(baseSlug)
-				}
 				byID[baseID] = modelInfo{
 					ID:                         baseID,
 					Object:                     "model",
@@ -391,9 +394,9 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 					SupportedGenerationMethods: []string{"chat"},
 					UserDefined:                true,
 				}
-				nativeByID[baseID] = baseSlug
-				nativeByID[baseName] = baseSlug
 			}
+			nativeByID[baseID] = baseSlug
+			nativeByID[baseName] = baseSlug
 		}
 	}
 

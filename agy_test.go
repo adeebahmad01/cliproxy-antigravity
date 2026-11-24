@@ -71,14 +71,23 @@ claude-sonnet-4-6
 		t.Fatalf("unexpected humanized Name for raw claude slug: %q", rawByID["agy/claude-sonnet-4-6"].Name)
 	}
 
-	// Label-only output must keep clean baseSlug in nativeByID rather than the variant label.
-	_, labelMapping := parseAgyModelLines("* Gemini 4 Hydrogen (XHigh)\n")
-	for i := 0; i < 20; i++ {
-		nativeByID := map[string]string{}
-		mergeDiscoveredNativeMap(nativeByID, labelMapping)
-		for _, key := range []string{"gemini-4-hydrogen", "agy/gemini-4-hydrogen", "antigravity/gemini-4-hydrogen"} {
-			if got := nativeByID[key]; got != "gemini-4-hydrogen" {
-				t.Fatalf("nativeByID[%q] = %q, want %q", key, got, "gemini-4-hydrogen")
+	// Label-only output must keep clean baseSlug in nativeByID regardless of line or map order.
+	for _, lines := range []string{
+		"* Gemini 4 Hydrogen (XHigh)\n",
+		"* Gemini 4 Hydrogen\n* Gemini 4 Hydrogen (XHigh)\n",
+		"* Gemini 4 Hydrogen (XHigh)\n* Gemini 4 Hydrogen\n",
+	} {
+		_, labelMapping := parseAgyModelLines(lines)
+		if got := labelMapping["agy/gemini-4-hydrogen"]; got != "gemini-4-hydrogen" {
+			t.Fatalf("parseAgyModelLines(%q) mapping[\"agy/gemini-4-hydrogen\"] = %q, want %q", lines, got, "gemini-4-hydrogen")
+		}
+		for i := 0; i < 20; i++ {
+			nativeByID := map[string]string{}
+			mergeDiscoveredNativeMap(nativeByID, labelMapping)
+			for _, key := range []string{"gemini-4-hydrogen", "agy/gemini-4-hydrogen", "antigravity/gemini-4-hydrogen"} {
+				if got := nativeByID[key]; got != "gemini-4-hydrogen" {
+					t.Fatalf("lines %q: nativeByID[%q] = %q, want %q", lines, key, got, "gemini-4-hydrogen")
+				}
 			}
 		}
 	}
