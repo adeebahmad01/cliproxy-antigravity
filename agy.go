@@ -121,29 +121,72 @@ type modelCatalogDiskCache struct {
 	NativeByID map[string]string `json:"native_by_id"`
 }
 
-func modelCatalogCachePath() string {
-	if dir, err := os.UserCacheDir(); err == nil && dir != "" {
-		return filepath.Join(dir, pluginID, "models.json")
+// modelCacheDirOverride lets tests point the cache at a temporary directory; the
+// platform cache root differs per OS, so redirecting $HOME/XDG_CACHE_HOME is not
+// portable.
+var modelCacheDirOverride string
+
+// modelCatalogCachePath returns the cached catalog path. It reports false when no
+// per-user cache directory exists: falling back to os.TempDir() would put a
+// predictable path in a shared directory where another local user could pre-create
+// a symlink or FIFO for the plugin to follow or block on.
+func modelCatalogCachePath() (string, bool) {
+	if modelCacheDirOverride != "" {
+		return filepath.Join(modelCacheDirOverride, pluginID, "models.json"), true
 	}
-	return filepath.Join(os.TempDir(), pluginID, "models.json")
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
+		return "", false
+	}
+	return filepath.Join(dir, pluginID, "models.json"), true
 }
 
 // writeModelCatalogCache persists a discovery. Only call it after `agy models`
 // exited successfully; a partial catalog would otherwise outlive the failure.
 func writeModelCatalogCache(cfg pluginConfig, models []modelInfo, nativeByID map[string]string) {
-	path := modelCatalogCachePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	path, ok := modelCatalogCachePath()
+	if !ok {
 		return
 	}
 	payload, err := json.Marshal(modelCatalogDiskCache{BinaryPath: cfg.BinaryPath, Models: models, NativeByID: nativeByID})
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, payload, 0o600)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	// Write beside the target and rename: a partial write must not destroy the
+	// last valid catalog.
+	tmp, err := os.CreateTemp(dir, "models-*.json")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(payload); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+	}
 }
 
 func readModelCatalogCache(cfg pluginConfig) ([]modelInfo, map[string]string) {
-	payload, err := os.ReadFile(modelCatalogCachePath())
+	path, ok := modelCatalogCachePath()
+	if !ok {
+		return nil, nil
+	}
+	payload, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil
 	}
