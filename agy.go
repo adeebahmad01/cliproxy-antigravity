@@ -218,21 +218,7 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 			for _, m := range discovered {
 				models = append(models, m)
 			}
-			for id, native := range mapping {
-				nativeByID[id] = native
-				// Also map unprefixed and antigravity/ prefixes
-				slug := strings.TrimPrefix(id, "agy/")
-				nativeByID[slug] = native
-				nativeByID["antigravity/"+slug] = native
-
-				baseSlug := stripEffortSuffix(slug)
-				if baseSlug != slug {
-					baseNative := stripEffortSuffix(native)
-					nativeByID[baseSlug] = baseNative
-					nativeByID["agy/"+baseSlug] = baseNative
-					nativeByID["antigravity/"+baseSlug] = baseNative
-				}
-			}
+			mergeDiscoveredNativeMap(nativeByID, mapping)
 		}
 	}
 
@@ -265,14 +251,33 @@ func routeModel(req modelRouteRequest) modelRouteResponse {
 	}
 	model, _ = splitColonEffortSuffix(model)
 	lower := strings.ToLower(model)
+	baseModel := stripEffortSuffix(model)
 	// antigravity/ is only claimed when the built-in Antigravity provider is not configured.
 	owned := strings.HasPrefix(lower, "agy/") ||
 		strings.HasPrefix(lower, "antigravity/") && !containsFold(req.AvailableProviders, "antigravity") ||
-		catalogHasModel(model)
+		catalogHasModel(model) ||
+		(baseModel != model && catalogHasModel(baseModel))
 	if !owned {
 		return modelRouteResponse{}
 	}
 	return modelRouteResponse{Handled: true, TargetKind: "self", Reason: "agy model served by the local Antigravity CLI"}
+}
+
+func mergeDiscoveredNativeMap(nativeByID, mapping map[string]string) {
+	for id, native := range mapping {
+		nativeByID[id] = native
+		// Also map unprefixed and antigravity/ prefixes
+		slug := strings.TrimPrefix(id, "agy/")
+		nativeByID[slug] = native
+		nativeByID["antigravity/"+slug] = native
+
+		baseSlug := stripEffortSuffix(slug)
+		if baseSlug != slug {
+			nativeByID[baseSlug] = baseSlug
+			nativeByID["agy/"+baseSlug] = baseSlug
+			nativeByID["antigravity/"+baseSlug] = baseSlug
+		}
+	}
 }
 
 // catalogHasModel checks the last published catalog without running agy, since routing is on the request path.
