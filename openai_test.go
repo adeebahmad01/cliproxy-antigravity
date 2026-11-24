@@ -717,3 +717,19 @@ func TestWritePromptFileIsolatesEachTurn(t *testing.T) {
 		t.Fatalf("staging root not empty: %v", entries)
 	}
 }
+
+func TestIsPathUnder(t *testing.T) {
+	base := filepath.Join(string(filepath.Separator), "home", "user")
+	cases := map[string]bool{
+		filepath.Join(base, "cliproxy-prompts"): true,
+		base:                                    true,
+		filepath.Join(base, "cliproxy-prompts", "x"):                         true,
+		filepath.Join(string(filepath.Separator), "tmp", "cliproxy-prompts"): false,
+		filepath.Join(string(filepath.Separator), "home", "user2"):           false,
+	}
+	for path, want := range cases {
+		if got := isPathUnder(path, base); got != want {
+			t.Fatalf("isPathUnder(%q, %q) = %v, want %v", path, base, got, want)
+		}
+	}
+}

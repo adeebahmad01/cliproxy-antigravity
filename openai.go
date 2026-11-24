@@ -844,3 +844,20 @@ func makeChatChunk(id string, created int64, model string, delta map[string]any,
 	raw, _ := json.Marshal(body)
 	return raw
 }
+
+// isPathUnder reports whether path is base or below it, comparing cleaned paths.
+func isPathUnder(path, base string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return false
+	}
+	absPath, absBase = filepath.Clean(absPath), filepath.Clean(absBase)
+	if absPath == absBase {
+		return true
+	}
+	return strings.HasPrefix(absPath, absBase+string(filepath.Separator))
+}
