@@ -335,3 +335,44 @@ func TestToolCallsFenceAllowsLeadingProse(t *testing.T) {
 		t.Fatalf("leading prose before the fence broke extraction: ok=%v", ok)
 	}
 }
+
+// A fenced payload that is not JSON ("```json null```") must not cause a search
+// past the closing fence into the prose that follows it.
+func TestFencedPayloadDoesNotLeakPastTheClosingFence(t *testing.T) {
+	response := "```json\nnull\n```\nExample: {\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}"
+	if calls, ok := extractToolCalls(response, false); ok {
+		t.Fatalf("prose after the closing fence became a tool call: %+v", calls)
+	}
+	if calls, ok := extractToolCalls(response, true); ok {
+		t.Fatalf("prose after the closing fence became a tool call: %+v", calls)
+	}
+}
+
+// A bare payload whose arguments contain a fence marker must survive: the fence
+// search would otherwise pick that marker up first.
+func TestBarePayloadWithFenceMarkerInArguments(t *testing.T) {
+	response := "[{\"name\":\"bash\",\"arguments\":{\"command\":\"echo ```json {}\"}}]"
+	calls, ok := extractToolCalls(response, true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("bare payload with a fence marker in its arguments was dropped: ok=%v", ok)
+	}
+	if calls[0].Function.Name != "bash" {
+		t.Fatalf("name = %q, want bash", calls[0].Function.Name)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments invalid: %v", err)
+	}
+	if args["command"] != "echo ```json {}" {
+		t.Fatalf("command = %v", args["command"])
+	}
+}
+
+// The fenced fallback still works when a bare candidate does not decode.
+func TestBareCandidateFailureFallsBackToFence(t *testing.T) {
+	response := "[not json]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```"
+	calls, ok := extractToolCalls(response, true)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+		t.Fatalf("fenced fallback lost after a bad bare candidate: ok=%v calls=%v", ok, calls)
+	}
+}

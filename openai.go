@@ -378,7 +378,14 @@ func fencedToolCallJSON(text string) string {
 		return ""
 	}
 	body := text[start:]
-	if brace := strings.IndexAny(body, "[{"); brace >= 0 {
+	brace := strings.IndexAny(body, "[{")
+	fence := strings.Index(body, "```")
+	// The fence closed before any JSON container: the payload is not a JSON value
+	// ("```json null```" followed by prose), so do not search past the fence.
+	if fence >= 0 && (brace < 0 || fence < brace) {
+		return ""
+	}
+	if brace >= 0 {
 		if end := jsonValueEnd(body, brace); end > 0 {
 			if candidate := strings.TrimSpace(body[brace:end]); candidate != "" {
 				return candidate
@@ -418,28 +425,40 @@ func normalizeArguments(raw json.RawMessage) string {
 
 func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) {
 	trimmed := strings.TrimSpace(response)
-	jsonBlock := fencedToolCallJSON(trimmed)
 
-	if jsonBlock == "" && allowBare && (strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")) {
+	// Candidates are tried in order. A bare payload leads when tools were declared
+	// and the response opens with a JSON container: its arguments may contain a
+	// fence marker ("echo ```json"), which would otherwise be mistaken for the
+	// payload terminator. The fenced form stays as fallback so a fenced block after
+	// prose is still recovered.
+	var blocks []string
+	if allowBare && (strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")) {
 		if end := jsonValueEnd(trimmed, 0); end > 0 {
-			jsonBlock = strings.TrimSpace(trimmed[:end])
+			blocks = append(blocks, strings.TrimSpace(trimmed[:end]))
 		} else {
-			jsonBlock = trimmed
+			blocks = append(blocks, trimmed)
 		}
 	}
-
-	if jsonBlock == "" {
-		return nil, false
+	if fenced := fencedToolCallJSON(trimmed); fenced != "" {
+		if len(blocks) == 0 || fenced != blocks[0] {
+			blocks = append(blocks, fenced)
+		}
 	}
 
 	var candidates []toolCallCandidate
-	if err := json.Unmarshal([]byte(jsonBlock), &candidates); err != nil {
-		var single toolCallCandidate
-		if errSingle := json.Unmarshal([]byte(jsonBlock), &single); errSingle == nil && single.Name != "" {
-			candidates = []toolCallCandidate{single}
-		} else {
-			return nil, false
+	for _, block := range blocks {
+		if block == "" {
+			continue
 		}
+		if err := json.Unmarshal([]byte(block), &candidates); err == nil {
+			break
+		}
+		var single toolCallCandidate
+		if errSingle := json.Unmarshal([]byte(block), &single); errSingle == nil && single.Name != "" {
+			candidates = []toolCallCandidate{single}
+			break
+		}
+		candidates = nil
 	}
 
 	if len(candidates) == 0 {
