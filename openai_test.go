@@ -121,7 +121,7 @@ func TestBuildPromptInjectsClientToolsInstruction(t *testing.T) {
 
 func TestExtractToolCalls(t *testing.T) {
 	textWithFence := "Here is the tool call:\n```tool_calls\n[\n  {\n    \"name\": \"calc\",\n    \"arguments\": {\"expr\": \"2+2\"}\n  }\n]\n```"
-	calls, ok := extractToolCalls(textWithFence)
+	calls, ok := extractToolCalls(textWithFence, true)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("failed to extract fenced tool calls: ok=%v, len=%d", ok, len(calls))
 	}
@@ -135,7 +135,7 @@ func TestExtractToolCalls(t *testing.T) {
 
 func TestMakeChatCompletionRejectsEmptyResponse(t *testing.T) {
 	for _, response := range []string{"", "   \n\t "} {
-		_, err := makeChatCompletion("agy/gemini-4-argon-high", agyResult{
+		_, err := makeChatCompletion("agy/gemini-4-argon-high", nil, agyResult{
 			Status:   "SUCCESS",
 			Response: response,
 		})
@@ -153,7 +153,7 @@ func TestMakeChatCompletionRejectsEmptyResponse(t *testing.T) {
 }
 
 func TestMakeChatCompletionMapsToolCalls(t *testing.T) {
-	raw, err := makeChatCompletion("gemini-3.8-flash-high", agyResult{
+	raw, err := makeChatCompletion("gemini-3.8-flash-high", nil, agyResult{
 		Status:   "SUCCESS",
 		Response: "```tool_calls\n[{\"name\":\"search\",\"arguments\":{\"query\":\"golang\"}}]\n```",
 	})
@@ -180,7 +180,7 @@ func TestMakeChatCompletionMapsToolCalls(t *testing.T) {
 }
 
 func TestMakeChatCompletionMapsUsageAndConversation(t *testing.T) {
-	raw, err := makeChatCompletion("agy/test", agyResult{
+	raw, err := makeChatCompletion("agy/test", nil, agyResult{
 		ConversationID: "conv-xyz-99",
 		Status:         "SUCCESS",
 		Response:       "done",
@@ -240,5 +240,175 @@ func TestBuildPromptPutsToolInstructionBeforeMessages(t *testing.T) {
 	}
 	if toolIdx > msgIdx {
 		t.Fatalf("tool instruction must precede the conversation so tail truncation cannot drop it")
+	}
+}
+
+// Models embed markdown fences inside string arguments, which used to cut the
+// fenced tool_calls payload at the first inner fence and degrade it to text.
+func TestExtractToolCallsWithEmbeddedFences(t *testing.T) {
+	response := "```tool_calls\n[\n  {\n    \"name\": \"subagent\",\n    \"arguments\": {\n" +
+		"      \"agent\": \"worker\",\n" +
+		"      \"task\": \"Please do this:\\n```bash\\nmake test\\n```\\nAnd also ```json\\n{\\\"a\\\":1}\\n```\\nthanks\"\n" +
+		"    }\n  }\n]\n```"
+	calls, ok := extractToolCalls(response, true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one recovered tool call, got ok=%v len=%d", ok, len(calls))
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments are not valid JSON: %v (%s)", err, calls[0].Function.Arguments)
+	}
+	if args["agent"] != "worker" {
+		t.Fatalf("agent = %v, want worker", args["agent"])
+	}
+}
+
+func TestExtractToolCallsUnquotesStringArguments(t *testing.T) {
+	calls, ok := extractToolCalls("```tool_calls\n[{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}]\n```", true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("ok=%v len=%d", ok, len(calls))
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments are not a JSON object: %v (raw=%s)", err, calls[0].Function.Arguments)
+	}
+	if args["command"] != "ls" {
+		t.Fatalf("command = %v, want ls", args["command"])
+	}
+}
+
+func TestExtractToolCallsUnfencedWithTrailingProse(t *testing.T) {
+	calls, ok := extractToolCalls("[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n\n以上是调用说明。", true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("bare payload with trailing prose was not recovered: ok=%v len=%d", ok, len(calls))
+	}
+
+	// Without declared tools a bare JSON body is ordinary text, not a tool call.
+	if _, ok := extractToolCalls("[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]", false); ok {
+		t.Fatalf("bare JSON must not become a tool call when no tools were declared")
+	}
+}
+
+func TestNormalizeArgumentsKeepsPlainObject(t *testing.T) {
+	if got := normalizeArguments(json.RawMessage(`{"command":"ls"}`)); got != `{"command":"ls"}` {
+		t.Fatalf("got %q", got)
+	}
+	if got := normalizeArguments(nil); got != "{}" {
+		t.Fatalf("nil arguments = %q, want {}", got)
+	}
+	if got := normalizeArguments(json.RawMessage(`"not json"`)); got != `"not json"` {
+		t.Fatalf("non-JSON string should be left alone, got %q", got)
+	}
+	if got := normalizeArguments(json.RawMessage(`"null"`)); got != "{}" {
+		t.Fatalf("quoted null arguments = %q, want {}", got)
+	}
+}
+
+func TestDeclaredToolNames(t *testing.T) {
+	payload := []byte(`{"tools":[{"type":"function","function":{"name":"bash"}},{"type":"function","function":{"name":"subagent"}}]}`)
+	got := declaredToolNames(payload)
+	if len(got) != 2 || got[0] != "bash" || got[1] != "subagent" {
+		t.Fatalf("declaredToolNames = %v", got)
+	}
+	if names := declaredToolNames([]byte(`{"model":"agy/default"}`)); len(names) != 0 {
+		t.Fatalf("expected no names, got %v", names)
+	}
+}
+
+// An ordinary answer that embeds an example ```json block must not be parsed as
+// a tool call just because the tools were declared.
+func TestFencedJSONOnlyCountsAtTheStart(t *testing.T) {
+	response := "Here is an example payload your API accepts:\n\n```json\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n```\n\nThat is all."
+	if calls, ok := extractToolCalls(response, true); ok {
+		t.Fatalf("embedded example block became a tool call: %+v", calls)
+	}
+
+	// The same payload at the start of the response is still accepted.
+	payload := "```json\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```"
+	calls, ok := extractToolCalls(payload, true)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+		t.Fatalf("leading ```json payload was not accepted: ok=%v calls=%v", ok, calls)
+	}
+}
+
+// ```tool_calls may still be preceded by prose.
+func TestToolCallsFenceAllowsLeadingProse(t *testing.T) {
+	calls, ok := extractToolCalls("Here is the call:\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```", true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("leading prose before the fence broke extraction: ok=%v", ok)
+	}
+}
+
+// A fenced payload that is not JSON ("```json null```") must not cause a search
+// past the closing fence into the prose that follows it.
+func TestFencedPayloadDoesNotLeakPastTheClosingFence(t *testing.T) {
+	response := "```json\nnull\n```\nExample: {\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}"
+	if calls, ok := extractToolCalls(response, false); ok {
+		t.Fatalf("prose after the closing fence became a tool call: %+v", calls)
+	}
+	if calls, ok := extractToolCalls(response, true); ok {
+		t.Fatalf("prose after the closing fence became a tool call: %+v", calls)
+	}
+}
+
+// A bare payload whose arguments contain a fence marker must survive: the fence
+// search would otherwise pick that marker up first.
+func TestBarePayloadWithFenceMarkerInArguments(t *testing.T) {
+	response := "[{\"name\":\"bash\",\"arguments\":{\"command\":\"echo ```json {}\"}}]"
+	calls, ok := extractToolCalls(response, true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("bare payload with a fence marker in its arguments was dropped: ok=%v", ok)
+	}
+	if calls[0].Function.Name != "bash" {
+		t.Fatalf("name = %q, want bash", calls[0].Function.Name)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments invalid: %v", err)
+	}
+	if args["command"] != "echo ```json {}" {
+		t.Fatalf("command = %v", args["command"])
+	}
+}
+
+// The fenced fallback still works when a bare candidate does not decode or carries no calls.
+func TestBareCandidateFailureFallsBackToFence(t *testing.T) {
+	cases := []string{
+		"[not json]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+		"[]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+		"[{}]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+		"[{\"name\":\"   \"}]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+	}
+	for _, response := range cases {
+		calls, ok := extractToolCalls(response, true)
+		if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+			t.Fatalf("fenced fallback lost for %q: ok=%v calls=%v", response, ok, calls)
+		}
+	}
+}
+
+// A ```tool_calls marker inside a string argument of a leading ```json payload
+// must not become the start point.
+func TestLeadingJSONFenceWithToolCallsMarkerInArguments(t *testing.T) {
+	response := "```json\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"echo ```tool_calls {}\"}}]\n```"
+	calls, ok := extractToolCalls(response, false)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("leading json payload with a marker in its arguments was dropped: ok=%v", ok)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments invalid: %v", err)
+	}
+	if args["command"] != "echo ```tool_calls {}" {
+		t.Fatalf("command = %v", args["command"])
+	}
+}
+
+// A leading example block followed by a genuine tool_calls fence still resolves.
+func TestLeadingJSONExampleThenRealToolCallsFence(t *testing.T) {
+	response := "```json\n{\"note\":\"example only\"}\n```\n\nHere is the call:\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```"
+	calls, ok := extractToolCalls(response, false)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+		t.Fatalf("genuine fence after a leading example block was lost: ok=%v calls=%v", ok, calls)
 	}
 }
