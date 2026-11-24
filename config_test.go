@@ -54,6 +54,28 @@ func TestParsePluginConfigRejectsBadReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestParsePluginConfigAcceptsExtendedReasoningEfforts(t *testing.T) {
+	cases := map[string]string{
+		"low":        "low",
+		"medium":     "medium",
+		"med":        "medium",
+		"high":       "high",
+		"xhigh":      "xhigh",
+		"x-high":     "xhigh",
+		"extra-high": "xhigh",
+		"max":        "max",
+	}
+	for input, want := range cases {
+		cfg, err := parsePluginConfig([]byte("reasoning_effort: " + input + "\n"))
+		if err != nil {
+			t.Fatalf("parsePluginConfig(%q) unexpected error: %v", input, err)
+		}
+		if cfg.DefaultReasoningEffort != want {
+			t.Fatalf("parsePluginConfig(%q).DefaultReasoningEffort = %q, want %q", input, cfg.DefaultReasoningEffort, want)
+		}
+	}
+}
+
 func TestParsePluginConfigSecurityValidations(t *testing.T) {
 	// Rejects arbitrary non-agy executables
 	badBinaries := []string{

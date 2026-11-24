@@ -38,7 +38,7 @@ Google Antigravity
 - Streaming responses through `agy --output-format stream-json`
 - Prompt streaming via stdin (avoiding OS `ARG_MAX` and command-line length limits)
 - Multi-turn conversation resumption through `agy --conversation <id>`
-- Reasoning effort control via `agy --effort` (`low`, `medium`, `high`)
+- Reasoning effort control via `agy --effort` (`low`, `medium`, `high`, `xhigh`, `max`)
 - Multimodal image support via automatic workspace staging
 - Client-side OpenAI `tools[]` calling emulation (`tool_calls`)
 - Built-in model name aliasing (`gemini-3.8-flash-high`, `gemini-3.8-flash-low`, etc.)
@@ -121,7 +121,7 @@ plugins:
       print_timeout: "30m"
       dangerously_skip_permissions: false
       sandbox: false
-      reasoning_effort: "high" # optional default: low | medium | high
+      reasoning_effort: "high" # optional default: low | medium | high | xhigh | max
       limits_tracking: true # track Antigravity usage limits via agy /usage
       limits_refresh_interval: "1m"
       enforce_limits: false # reject requests with 429 when the model's quota group is exhausted
@@ -257,11 +257,11 @@ Account-bound IDs are signed by this proxy. Keep its user-config `cliproxy-antig
 
 Reasoning effort can be configured via:
 
-1. **Embedded Model Suffix**: Selecting models like `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, or `gemini-3.8-flash-low` automatically splits the last part (`high`, `medium`, `low`) into reasoning effort and routes to the clean base model (`gemini-3.8-flash`).
-2. **Base Model Selection**: Selecting clean base models directly (e.g. `agy/gemini-3.8-flash`, `agy/gemini-3.1-pro`, `agy/gpt-oss-120b`) and configuring reasoning effort via UI selectors or request body (`"reasoning_effort": "low" | "medium" | "high"`).
-3. **Explicit Overrides**: CLIProxyAPI thinking suffixes such as `agy/gemini-3.8-flash(high)`, or colon suffixes such as `agy/gemini-3.8-flash:high` and `agy/default:high`.
+1. **Embedded Model Suffix**: Selecting models like `gemini-4-hydrogen-xhigh`, `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, or `gemini-3.8-flash-low` automatically splits the last part (`low`, `medium`, `high`, `xhigh`, `max`) into reasoning effort and routes to the clean base model (`gemini-4-hydrogen`, `gemini-3.8-flash`).
+2. **Base Model Selection**: Selecting clean base models directly (e.g. `agy/gemini-4-hydrogen`, `agy/gemini-3.8-flash`, `agy/gpt-oss-120b`) and configuring reasoning effort via UI selectors or request body (`"reasoning_effort": "low" | "medium" | "high" | "xhigh" | "max"`).
+3. **Explicit Overrides**: CLIProxyAPI thinking suffixes such as `agy/gemini-4-hydrogen(xhigh)`, or colon suffixes such as `agy/gemini-4-hydrogen:max`, `agy/gemini-3.8-flash:high`, and `agy/default:xhigh`.
 4. **Headers & Metadata**: Request headers (`X-AGY-Effort`, `X-Reasoning-Effort`) or metadata fields.
-5. **Intelligent Fallbacks**: If no effort is specified for models requiring an effort flag, sensible defaults (such as `high` for Gemini and `medium` for GPT-OSS) are applied automatically, while models that do not support reasoning effort (such as Claude) safely omit the flag.
+5. **Intelligent Fallbacks**: If no effort is specified for models requiring an effort flag, sensible defaults (such as `high` for Gemini and `medium` for GPT-OSS) are applied automatically, while models that do not support reasoning effort (such as Claude) safely omit the flag. Requested levels must be supported by the target model.
 
 ## How requests are executed
 
@@ -290,7 +290,7 @@ The prompt is piped directly to `agy`'s standard input rather than passed as a c
 | `print_timeout` | `30m` | Passed to `--print-timeout`. |
 | `dangerously_skip_permissions` | `false` | Adds `--dangerously-skip-permissions`. This auto-approves all Antigravity tool permission requests. |
 | `sandbox` | `false` | Adds Antigravity's `--sandbox` flag. |
-| `reasoning_effort` | empty | Default reasoning effort passed to `--effort` (`low`, `medium`, `high`). |
+| `reasoning_effort` | empty | Default reasoning effort passed to `--effort` (`low`, `medium`, `high`, `xhigh`, `max`). |
 | `limits_tracking` | `true` | Track Antigravity usage limits by running `agy /usage` (no tokens consumed). |
 | `limits_refresh_interval` | `1m` | How long cached limits stay fresh (minimum `10s`). Limits are also refreshed after any quota error. |
 | `enforce_limits` | `false` | Reject requests with HTTP 429 (`agy_quota_exhausted`, retryable) when the model's quota group is known to be exhausted, without starting `agy`. Off by default because paid plans may continue on AI credits after a limit is reached. |

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const usageFixture = `{"conversation_id":"","status":"SUCCESS","response":"...","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"usage","data":{"description":"Within each group, models share a weekly limit and a 5-hour limit.","groups":[{"name":"Gemini Models","description":"Models within this group: Gemini 3.8 Flash","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","description":"You have used some of your weekly limit.","window":"weekly","remaining_fraction":0.925955057144165,"reset_time":"2099-11-21T06:20:27Z"},{"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.9974474906921387,"reset_time":"2099-11-15T19:16:01Z"}]},{"name":"Claude and GPT models","description":"Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0,"reset_time":"2099-11-19T02:31:24Z"},{"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","disabled":true,"remaining_fraction":1}]}]}}}`
+const usageFixture = `{"conversation_id":"","status":"SUCCESS","response":"...","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"usage","data":{"description":"Within each group, models share a weekly limit and a 5-hour limit.","groups":[{"name":"Gemini Models","description":"Models within this group: Gemini 3.8 Flash, Gemini 4 Hydrogen (XHigh)","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","description":"You have used some of your weekly limit.","window":"weekly","remaining_fraction":0.925955057144165,"reset_time":"2099-11-21T06:20:27Z"},{"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":0.9974474906921387,"reset_time":"2099-11-15T19:16:01Z"}]},{"name":"Claude and GPT models","description":"Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0,"reset_time":"2099-11-19T02:31:24Z"},{"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","disabled":true,"remaining_fraction":1}]}]}}}`
 
 func fixtureLimits(t *testing.T) agyLimits {
 	t.Helper()
@@ -51,6 +51,9 @@ func TestGroupForModel(t *testing.T) {
 	tests := map[string]string{
 		"gemini-3.8-flash-high":    "Gemini Models",
 		"gemini-3.8-flash":         "Gemini Models",
+		"gemini-4-hydrogen-xhigh":  "Gemini Models",
+		"gemini-4-hydrogen-max":    "Gemini Models",
+		"gemini-4-hydrogen":        "Gemini Models",
 		"claude-sonnet-4-6":        "Claude and GPT models",
 		"claude-opus-4-6-thinking": "Claude and GPT models",
 		"gpt-oss-120b-medium":      "Claude and GPT models",

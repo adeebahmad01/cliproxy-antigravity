@@ -11,7 +11,7 @@ import (
 const (
 	pluginID      = "cliproxy-antigravity"
 	providerID    = "agy"
-	pluginVersion = "0.4.0"
+	pluginVersion = "0.5.0"
 	schemaVersion = 6
 )
 
@@ -489,7 +489,7 @@ func pluginRegistration() registration {
 				{Name: "print_timeout", Type: "string", Default: defaults.PrintTimeout, Description: "Antigravity print timeout, using Go/CLI duration syntax (default: 30m)."},
 				{Name: "dangerously_skip_permissions", Type: "boolean", Default: defaults.DangerouslySkipPermissions, Description: "Pass --dangerously-skip-permissions to agy. Disabled by default."},
 				{Name: "sandbox", Type: "boolean", Default: defaults.Sandbox, Description: "Pass --sandbox to agy when supported by the installed CLI."},
-				{Name: "reasoning_effort", Type: "enum", Default: defaults.DefaultReasoningEffort, EnumValues: []string{"low", "medium", "high"}, Description: "Default reasoning effort for agy sessions (low, medium, high). Empty uses the per-model default."},
+				{Name: "reasoning_effort", Type: "enum", Default: defaults.DefaultReasoningEffort, EnumValues: []string{"low", "medium", "high", "xhigh", "max"}, Description: "Default reasoning effort for agy sessions (low, medium, high, xhigh, max). Empty uses the per-model default."},
 				{Name: "limits_tracking", Type: "boolean", Default: defaults.LimitsTracking, Description: "Track Antigravity usage limits via agy /usage (default: true)."},
 				{Name: "limits_refresh_interval", Type: "string", Default: defaults.LimitsRefreshInterval, Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
 				{Name: "enforce_limits", Type: "boolean", Default: defaults.EnforceLimits, Description: "Reject requests with HTTP 429 when the quota group of the model is exhausted, without launching agy (default: false)."},

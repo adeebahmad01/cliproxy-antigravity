@@ -43,6 +43,7 @@ def make_mock_agy(root: pathlib.Path) -> pathlib.Path:
         """#!/bin/sh
 if [ "$1" = "models" ]; then
   printf 'mock-model-high\\tMock Model (High)\\n'
+  printf 'mock-model-xhigh\\tMock Model (XHigh)\\n'
   exit 0
 fi
 format="text"
@@ -126,7 +127,7 @@ def main() -> int:
         result = registration["result"]
         assert result["capabilities"]["executor_model_scope"] == "static"
         fields = {f["Name"]: f for f in result["metadata"]["ConfigFields"]}
-        if fields["reasoning_effort"]["Type"] != "enum" or fields["binary_path"]["Default"] != "agy":
+        if fields["reasoning_effort"]["Type"] != "enum" or fields["reasoning_effort"]["EnumValues"] != ["low", "medium", "high", "xhigh", "max"] or fields["binary_path"]["Default"] != "agy":
             raise RuntimeError(f"unexpected config field metadata: {fields}")
 
         if not result["capabilities"].get("model_router"):
@@ -136,13 +137,19 @@ def main() -> int:
         if rc != 0 or not model_response.get("ok"):
             raise RuntimeError(f"model registration failed: {model_response}")
         model_ids = [m["ID"] for m in model_response["result"]["Models"]]
-        if "agy/default" not in model_ids or "agy/mock-model-high" not in model_ids:
-            raise RuntimeError(f"expected default + discovered model: {model_ids}")
+        if "agy/default" not in model_ids or "agy/mock-model-high" not in model_ids or "agy/mock-model-xhigh" not in model_ids or "agy/mock-model" not in model_ids:
+            raise RuntimeError(f"expected default + discovered models: {model_ids}")
 
         # agy has no CLIProxyAPI auth record, so its models are routed straight to this executor.
         rc, route = call("model.route", {"RequestedModel": "agy/mock-model(high)"})
         if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
             raise RuntimeError(f"expected self route for agy model: {route}")
+        rc, route = call("model.route", {"RequestedModel": "agy/mock-model:xhigh"})
+        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
+            raise RuntimeError(f"expected self route for :xhigh agy model: {route}")
+        rc, route = call("model.route", {"RequestedModel": "gemini-3.8-flash:max"})
+        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
+            raise RuntimeError(f"expected self route for :max built-in model: {route}")
         rc, route = call("model.route", {"RequestedModel": "gpt-5.5"})
         if rc != 0 or route["result"]["Handled"]:
             raise RuntimeError(f"foreign model must not be routed: {route}")

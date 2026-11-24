@@ -12,16 +12,20 @@ func TestParseAgyModelLines(t *testing.T) {
 	models, mapping := parseAgyModelLines(`
 gemini-3.6-flash-high	Gemini 3.6 Flash (High)
 gemini-3.6-flash-medium    Gemini 3.6 Flash (Medium)
+gemini-4-hydrogen-xhigh	Gemini 4 Hydrogen (XHigh)
 * Claude Sonnet 4.6 (Thinking)
 `)
-	if len(models) != 4 {
-		t.Fatalf("len(models) = %d, want 4: %#v", len(models), models)
+	if len(models) != 6 {
+		t.Fatalf("len(models) = %d, want 6: %#v", len(models), models)
 	}
 	if mapping["agy/gemini-3.6-flash-high"] != "gemini-3.6-flash-high" {
 		t.Fatalf("unexpected mapping: %#v", mapping)
 	}
 	if mapping["agy/gemini-3.6-flash"] != "gemini-3.6-flash" {
 		t.Fatalf("base model mapping missing: %#v", mapping)
+	}
+	if mapping["agy/gemini-4-hydrogen-xhigh"] != "gemini-4-hydrogen-xhigh" || mapping["agy/gemini-4-hydrogen"] != "gemini-4-hydrogen" {
+		t.Fatalf("gemini-4-hydrogen mapping missing: %#v", mapping)
 	}
 	if mapping["agy/claude-sonnet-4-6-thinking"] != "Claude Sonnet 4.6 (Thinking)" {
 		t.Fatalf("legacy label mapping missing: %#v", mapping)
@@ -37,9 +41,16 @@ gemini-3.6-flash-medium    Gemini 3.6 Flash (Medium)
 	if byID["agy/gemini-3.6-flash"].Name != "Gemini 3.6 Flash" {
 		t.Fatalf("unexpected Name for base gemini-3.6-flash: %q", byID["agy/gemini-3.6-flash"].Name)
 	}
+	if byID["agy/gemini-4-hydrogen-xhigh"].Name != "Gemini 4 Hydrogen (XHigh)" {
+		t.Fatalf("unexpected Name for gemini-4-hydrogen-xhigh: %q", byID["agy/gemini-4-hydrogen-xhigh"].Name)
+	}
+	if byID["agy/gemini-4-hydrogen"].Name != "Gemini 4 Hydrogen" {
+		t.Fatalf("unexpected Name for base gemini-4-hydrogen: %q", byID["agy/gemini-4-hydrogen"].Name)
+	}
 
 	rawModels, _ := parseAgyModelLines(`
 gemini-3.8-flash-high
+gemini-4-hydrogen-max
 gpt-oss-120b-medium
 claude-sonnet-4-6
 `)
@@ -50,23 +61,52 @@ claude-sonnet-4-6
 	if rawByID["agy/gemini-3.8-flash"].Name != "Gemini 3.8 Flash" {
 		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gemini-3.8-flash"].Name)
 	}
+	if rawByID["agy/gemini-4-hydrogen"].Name != "Gemini 4 Hydrogen" || rawByID["agy/gemini-4-hydrogen-max"].Name != "Gemini 4 Hydrogen (Max)" {
+		t.Fatalf("unexpected humanized Name for raw max slug: %#v", rawByID)
+	}
 	if rawByID["agy/gpt-oss-120b"].Name != "GPT-OSS 120B" {
 		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gpt-oss-120b"].Name)
 	}
 	if rawByID["agy/claude-sonnet-4-6"].Name != "Claude Sonnet 4.6" {
 		t.Fatalf("unexpected humanized Name for raw claude slug: %q", rawByID["agy/claude-sonnet-4-6"].Name)
 	}
+
+	// Label-only output must keep clean baseSlug in nativeByID regardless of line or map order.
+	for _, lines := range []string{
+		"* Gemini 4 Hydrogen (XHigh)\n",
+		"* Gemini 4 Hydrogen\n* Gemini 4 Hydrogen (XHigh)\n",
+		"* Gemini 4 Hydrogen (XHigh)\n* Gemini 4 Hydrogen\n",
+	} {
+		_, labelMapping := parseAgyModelLines(lines)
+		if got := labelMapping["agy/gemini-4-hydrogen"]; got != "gemini-4-hydrogen" {
+			t.Fatalf("parseAgyModelLines(%q) mapping[\"agy/gemini-4-hydrogen\"] = %q, want %q", lines, got, "gemini-4-hydrogen")
+		}
+		for i := 0; i < 20; i++ {
+			nativeByID := map[string]string{}
+			mergeDiscoveredNativeMap(nativeByID, labelMapping)
+			for _, key := range []string{"gemini-4-hydrogen", "agy/gemini-4-hydrogen", "antigravity/gemini-4-hydrogen"} {
+				if got := nativeByID[key]; got != "gemini-4-hydrogen" {
+					t.Fatalf("lines %q: nativeByID[%q] = %q, want %q", lines, key, got, "gemini-4-hydrogen")
+				}
+			}
+		}
+	}
 }
 
 func TestHumanizeModelName(t *testing.T) {
 	tests := map[string]string{
-		"gemini-3.8-flash-high":    "Gemini 3.8 Flash (High)",
-		"gemini-3.8-flash":         "Gemini 3.8 Flash",
-		"gpt-oss-120b-medium":      "GPT-OSS 120B (Medium)",
-		"gpt-oss-120b":             "GPT-OSS 120B",
-		"claude-sonnet-4-6":        "Claude Sonnet 4.6",
-		"claude-opus-4-6-thinking": "Claude Opus 4.6 (Thinking)",
-		"default":                  "Antigravity CLI (default model)",
+		"gemini-3.8-flash-high":        "Gemini 3.8 Flash (High)",
+		"gemini-3.8-flash":             "Gemini 3.8 Flash",
+		"gemini-4-hydrogen-xhigh":      "Gemini 4 Hydrogen (XHigh)",
+		"gemini-4-hydrogen-x-high":     "Gemini 4 Hydrogen (XHigh)",
+		"gemini-4-hydrogen-extra-high": "Gemini 4 Hydrogen (XHigh)",
+		"gemini-4-hydrogen-max":        "Gemini 4 Hydrogen (Max)",
+		"gemini-4-hydrogen":            "Gemini 4 Hydrogen",
+		"gpt-oss-120b-medium":          "GPT-OSS 120B (Medium)",
+		"gpt-oss-120b":                 "GPT-OSS 120B",
+		"claude-sonnet-4-6":            "Claude Sonnet 4.6",
+		"claude-opus-4-6-thinking":     "Claude Opus 4.6 (Thinking)",
+		"default":                      "Antigravity CLI (default model)",
 	}
 	for slug, want := range tests {
 		got := humanizeModelName(slug)
@@ -112,20 +152,53 @@ func TestAgyArgs(t *testing.T) {
 
 func TestAgyArgsResolvesConflict(t *testing.T) {
 	cfg := defaultConfig()
-	opts := agyOptions{
-		NativeModel:     "gemini-3.8-flash-high",
-		ReasoningEffort: "low",
+	cases := []struct {
+		model  string
+		effort string
+		want   []string
+	}{
+		{
+			model:  "gemini-3.8-flash-high",
+			effort: "low",
+			want: []string{
+				"--output-format", "json",
+				"--print-timeout", "30m",
+				"--disable-slash-commands",
+				"--model", "gemini-3.8-flash",
+				"--effort", "low",
+			},
+		},
+		{
+			model:  "gemini-4-hydrogen-xhigh",
+			effort: "max",
+			want: []string{
+				"--output-format", "json",
+				"--print-timeout", "30m",
+				"--disable-slash-commands",
+				"--model", "gemini-4-hydrogen",
+				"--effort", "max",
+			},
+		},
+		{
+			model:  "gemini-4-hydrogen-max",
+			effort: "xhigh",
+			want: []string{
+				"--output-format", "json",
+				"--print-timeout", "30m",
+				"--disable-slash-commands",
+				"--model", "gemini-4-hydrogen",
+				"--effort", "xhigh",
+			},
+		},
 	}
-	got := agyArgs(cfg, opts)
-	want := []string{
-		"--output-format", "json",
-		"--print-timeout", "30m",
-		"--disable-slash-commands",
-		"--model", "gemini-3.8-flash",
-		"--effort", "low",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("agyArgs() = %#v, want %#v", got, want)
+	for _, tc := range cases {
+		got := agyArgs(cfg, agyOptions{
+			NativeModel:     tc.model,
+			ReasoningEffort: tc.effort,
+		})
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("agyArgs(%q, %q) = %#v, want %#v", tc.model, tc.effort, got, tc.want)
+		}
 	}
 }
 
@@ -293,6 +366,130 @@ func TestResolveExecutionOptions(t *testing.T) {
 	if opts11.ReasoningEffort != "medium" || opts11.NativeModel != "gemini-3.8-flash" {
 		t.Fatalf("expected payload effort on gemini-3.8-flash, got %q on %q", opts11.ReasoningEffort, opts11.NativeModel)
 	}
+
+	// 12. Extended effort levels (xhigh, max) across model suffix, colon override, paren suffix, payload, header, and alias normalization
+	extendedCases := []struct {
+		name       string
+		req        rpcExecutorRequest
+		wantModel  string
+		wantEffort string
+	}{
+		{
+			name: "dash xhigh suffix",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen-xhigh",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "xhigh",
+		},
+		{
+			name: "dash extra-high alias suffix",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen-extra-high",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "xhigh",
+		},
+		{
+			name: "dash max suffix",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen-max",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "max",
+		},
+		{
+			name: "colon xhigh on default",
+			req: rpcExecutorRequest{
+				Model:   "agy/default:xhigh",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			},
+			wantModel:  "",
+			wantEffort: "xhigh",
+		},
+		{
+			name: "colon max overrides dash suffix",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen-xhigh:max",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "max",
+		},
+		{
+			name: "paren xhigh suffix",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen(xhigh)",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "xhigh",
+		},
+		{
+			name: "paren max suffix",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen(max)",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "max",
+		},
+		{
+			name: "payload xhigh",
+			req: rpcExecutorRequest{
+				Model:   "agy/gemini-4-hydrogen",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`),
+			},
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "xhigh",
+		},
+		{
+			name: "header x-high alias",
+			req: func() rpcExecutorRequest {
+				h := http.Header{}
+				h.Set("X-AGY-Effort", "x-high")
+				return rpcExecutorRequest{
+					Model:   "agy/gemini-4-hydrogen",
+					Headers: h,
+					Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+				}
+			}(),
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "xhigh",
+		},
+		{
+			name: "header max",
+			req: func() rpcExecutorRequest {
+				h := http.Header{}
+				h.Set("X-Reasoning-Effort", "max")
+				return rpcExecutorRequest{
+					Model:   "agy/gemini-4-hydrogen",
+					Headers: h,
+					Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+				}
+			}(),
+			wantModel:  "gemini-4-hydrogen",
+			wantEffort: "max",
+		},
+		{
+			name: "claude clears max effort",
+			req: rpcExecutorRequest{
+				Model:   "agy/claude-opus-4-6-thinking",
+				Payload: []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max"}`),
+			},
+			wantModel:  "claude-opus-4-6-thinking",
+			wantEffort: "",
+		},
+	}
+	for _, tc := range extendedCases {
+		got := resolveExecutionOptions(tc.req, cfg)
+		if got.NativeModel != tc.wantModel || got.ReasoningEffort != tc.wantEffort {
+			t.Errorf("%s: got (model=%q, effort=%q), want (%q, %q)", tc.name, got.NativeModel, got.ReasoningEffort, tc.wantModel, tc.wantEffort)
+		}
+	}
 }
 
 func TestErrorEnvelopeCarriesRetryAfter(t *testing.T) {
@@ -321,6 +518,21 @@ func TestClassifyAgyErrorModelNotFoundUsesHostCode(t *testing.T) {
 	}
 }
 
+func TestClassifyAgyErrorUnsupportedEffortIsRequestScoped(t *testing.T) {
+	cases := []string{
+		`invalid model selection (--model "gemini-4-hydrogen" --effort "max"): gemini-4-hydrogen has no "max" effort (available: low, medium, high, xhigh)`,
+		`invalid model selection (--model "gemini-3.8-flash" --effort "xhigh"): gemini-3.8-flash has no "xhigh" effort (available: low, medium, high)`,
+		`invalid model selection (--model "gemini-4-hydrogen" --effort "invalid"): invalid --effort "invalid" (valid: low, medium, high, xhigh, max)`,
+		`invalid model selection (--model "claude-sonnet-4-6" --effort "max"): --effort is not supported for model "claude-sonnet-4-6"`,
+	}
+	for _, msg := range cases {
+		pe := asPluginError(classifyAgyError(errors.New(msg), ""))
+		if pe.Code != errorCodeRequestScoped || pe.HTTPStatus != http.StatusBadRequest {
+			t.Fatalf("classifyAgyError(%q) = %s/%d, want %s/400", msg, pe.Code, pe.HTTPStatus, errorCodeRequestScoped)
+		}
+	}
+}
+
 func TestParseAgyJSONOutputUsesTerminalLine(t *testing.T) {
 	got, err := parseAgyJSONOutput([]byte("diagnostic\n{\"status\":\"SUCCESS\",\"response\":\"ok\"}\n"))
 	if err != nil {
@@ -340,11 +552,21 @@ func TestRouteModel(t *testing.T) {
 	}{
 		{"agy/gemini-3.8-flash", nil, true},
 		{"agy/gemini-3.8-flash(high)", nil, true},
+		{"agy/gemini-4-hydrogen(xhigh)", nil, true},
 		{"agy/default:high", nil, true},
+		{"agy/default:xhigh", nil, true},
+		{"agy/default:max", nil, true},
 		{"gemini-3.8-flash-high", nil, true},
+		{"gemini-3.8-flash-xhigh", nil, true},
+		{"gemini-3.8-flash-max", nil, true},
+		{"gemini-3.8-flash-extra-high", nil, true},
+		{"gemini-3.8-flash:xhigh", nil, true},
+		{"gemini-3.8-flash:max", nil, true},
 		{"antigravity/gemini-3.8-flash", nil, true},
 		{"antigravity/gemini-3.8-flash", []string{"antigravity"}, false},
 		{"gpt-5.5", nil, false},
+		{"gpt-5.5-xhigh", nil, false},
+		{"gpt-5.5-max", nil, false},
 		{"agy/gemini-3.8-flash", []string{"agy"}, false},
 	}
 	for _, tc := range cases {

@@ -322,7 +322,7 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		case "reasoning_effort", "effort":
 			effort := normalizeEffort(value)
 			if effort == "" {
-				return pluginConfig{}, fmt.Errorf("line %d: invalid reasoning_effort %q: must be low, medium, or high", lineNo+1, value)
+				return pluginConfig{}, fmt.Errorf("line %d: invalid reasoning_effort %q: must be low, medium, high, xhigh, or max", lineNo+1, value)
 			}
 			cfg.DefaultReasoningEffort = effort
 		case "limits_tracking":

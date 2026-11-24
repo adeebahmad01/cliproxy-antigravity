@@ -218,21 +218,7 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 			for _, m := range discovered {
 				models = append(models, m)
 			}
-			for id, native := range mapping {
-				nativeByID[id] = native
-				// Also map unprefixed and antigravity/ prefixes
-				slug := strings.TrimPrefix(id, "agy/")
-				nativeByID[slug] = native
-				nativeByID["antigravity/"+slug] = native
-
-				baseSlug := stripEffortSuffix(slug)
-				if baseSlug != slug {
-					baseNative := stripEffortSuffix(native)
-					nativeByID[baseSlug] = baseNative
-					nativeByID["agy/"+baseSlug] = baseNative
-					nativeByID["antigravity/"+baseSlug] = baseNative
-				}
-			}
+			mergeDiscoveredNativeMap(nativeByID, mapping)
 		}
 	}
 
@@ -263,21 +249,38 @@ func routeModel(req modelRouteRequest) modelRouteResponse {
 	if open := strings.LastIndex(model, "("); open > 0 && strings.HasSuffix(model, ")") {
 		model = strings.TrimSpace(model[:open])
 	}
-	for _, suffix := range []string{":low", ":medium", ":med", ":high"} {
-		if strings.HasSuffix(strings.ToLower(model), suffix) {
-			model = model[:len(model)-len(suffix)]
-			break
-		}
-	}
+	model, _ = splitColonEffortSuffix(model)
 	lower := strings.ToLower(model)
+	baseModel := stripEffortSuffix(model)
 	// antigravity/ is only claimed when the built-in Antigravity provider is not configured.
 	owned := strings.HasPrefix(lower, "agy/") ||
 		strings.HasPrefix(lower, "antigravity/") && !containsFold(req.AvailableProviders, "antigravity") ||
-		catalogHasModel(model)
+		catalogHasModel(model) ||
+		(baseModel != model && catalogHasModel(baseModel))
 	if !owned {
 		return modelRouteResponse{}
 	}
 	return modelRouteResponse{Handled: true, TargetKind: "self", Reason: "agy model served by the local Antigravity CLI"}
+}
+
+func mergeDiscoveredNativeMap(nativeByID, mapping map[string]string) {
+	// Pass 1: record direct mappings. Pass 2: normalize derived base slugs so
+	// map iteration order never lets a display label overwrite a clean base slug.
+	for id, native := range mapping {
+		nativeByID[id] = native
+		slug := strings.TrimPrefix(id, "agy/")
+		nativeByID[slug] = native
+		nativeByID["antigravity/"+slug] = native
+	}
+	for id := range mapping {
+		slug := strings.TrimPrefix(id, "agy/")
+		baseSlug := stripEffortSuffix(slug)
+		if baseSlug != slug {
+			nativeByID[baseSlug] = baseSlug
+			nativeByID["agy/"+baseSlug] = baseSlug
+			nativeByID["antigravity/"+baseSlug] = baseSlug
+		}
+	}
 }
 
 // catalogHasModel checks the last published catalog without running agy, since routing is on the request path.
@@ -376,11 +379,11 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 		baseSlug := stripEffortSuffix(slug)
 		if baseSlug != slug {
 			baseID := "agy/" + baseSlug
+			baseName := stripEffortLabel(name)
+			if baseName == "" || baseName == baseSlug || looksLikeModelSlug(baseName) {
+				baseName = humanizeModelName(baseSlug)
+			}
 			if _, exists := byID[baseID]; !exists {
-				baseName := stripEffortLabel(name)
-				if baseName == "" || baseName == baseSlug || looksLikeModelSlug(baseName) {
-					baseName = humanizeModelName(baseSlug)
-				}
 				byID[baseID] = modelInfo{
 					ID:                         baseID,
 					Object:                     "model",
@@ -391,9 +394,9 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 					SupportedGenerationMethods: []string{"chat"},
 					UserDefined:                true,
 				}
-				nativeByID[baseID] = baseSlug
-				nativeByID[baseName] = baseSlug
 			}
+			nativeByID[baseID] = baseSlug
+			nativeByID[baseName] = baseSlug
 		}
 	}
 
@@ -460,14 +463,36 @@ func resolveNativeModel(model string, cfg pluginConfig) string {
 	return cleanModel
 }
 
+type effortSuffixSpec struct {
+	suffix    string
+	canonical string
+	label     string
+}
+
+// Ordered longest-suffix-first so multi-part suffixes like -extra-high and -x-high
+// match before -high.
+var effortDashSuffixes = []effortSuffixSpec{
+	{suffix: "-extra-high", canonical: "xhigh", label: " (XHigh)"},
+	{suffix: "-medium", canonical: "medium", label: " (Medium)"},
+	{suffix: "-x-high", canonical: "xhigh", label: " (XHigh)"},
+	{suffix: "-xhigh", canonical: "xhigh", label: " (XHigh)"},
+	{suffix: "-high", canonical: "high", label: " (High)"},
+	{suffix: "-low", canonical: "low", label: " (Low)"},
+	{suffix: "-med", canonical: "medium", label: " (Medium)"},
+	{suffix: "-max", canonical: "max", label: " (Max)"},
+}
+
+var effortParenLabels = []string{
+	"(extra-high)", "(extra high)", "(x-high)", "(xhigh)",
+	"(high)", "(medium)", "(med)", "(low)", "(max)", "(thinking)",
+}
+
 func stripEffortLabel(label string) string {
 	cleaned := strings.TrimSpace(label)
-	for _, suffix := range []string{
-		"(High)", "(Medium)", "(Med)", "(Low)", "(Thinking)",
-		"(high)", "(medium)", "(med)", "(low)", "(thinking)",
-	} {
-		if strings.HasSuffix(cleaned, suffix) {
-			return strings.TrimSpace(strings.TrimSuffix(cleaned, suffix))
+	lower := strings.ToLower(cleaned)
+	for _, suffix := range effortParenLabels {
+		if strings.HasSuffix(lower, suffix) {
+			return strings.TrimSpace(cleaned[:len(cleaned)-len(suffix)])
 		}
 	}
 	return cleaned
@@ -484,26 +509,18 @@ func humanizeModelName(slug string) string {
 
 	effortSuffix := ""
 	clean := raw
-	lower := strings.ToLower(raw)
-	switch {
-	case strings.HasSuffix(lower, "-high"):
-		effortSuffix = " (High)"
-		clean = raw[:len(raw)-5]
-	case strings.HasSuffix(lower, "-medium"):
-		effortSuffix = " (Medium)"
-		clean = raw[:len(raw)-7]
-	case strings.HasSuffix(lower, "-med"):
-		effortSuffix = " (Medium)"
-		clean = raw[:len(raw)-4]
-	case strings.HasSuffix(lower, "-low"):
-		effortSuffix = " (Low)"
-		clean = raw[:len(raw)-4]
-	case strings.HasSuffix(lower, "-thinking"):
-		effortSuffix = " (Thinking)"
-		clean = raw[:len(raw)-9]
-	case strings.HasSuffix(lower, "-thought"):
-		effortSuffix = " (Thinking)"
-		clean = raw[:len(raw)-8]
+	if base, _, label := splitEffortSuffix(raw); label != "" {
+		clean = base
+		effortSuffix = label
+	} else {
+		lower := strings.ToLower(raw)
+		for _, suffix := range []string{"-thinking", "-thought"} {
+			if strings.HasSuffix(lower, suffix) {
+				effortSuffix = " (Thinking)"
+				clean = raw[:len(raw)-len(suffix)]
+				break
+			}
+		}
 	}
 
 	parts := strings.Split(clean, "-")
@@ -563,34 +580,41 @@ func isDigits(s string) bool {
 	return true
 }
 
-func extractEffortSuffix(model string) string {
-	lower := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.HasSuffix(lower, "-low"):
-		return "low"
-	case strings.HasSuffix(lower, "-medium"), strings.HasSuffix(lower, "-med"):
-		return "medium"
-	case strings.HasSuffix(lower, "-high"):
-		return "high"
-	default:
-		return ""
+func splitEffortSuffix(model string) (base, effort, label string) {
+	trimmed := strings.TrimSpace(model)
+	lower := strings.ToLower(trimmed)
+	for _, spec := range effortDashSuffixes {
+		if strings.HasSuffix(lower, spec.suffix) && len(trimmed) > len(spec.suffix) {
+			return strings.TrimSpace(trimmed[:len(trimmed)-len(spec.suffix)]), spec.canonical, spec.label
+		}
 	}
+	return trimmed, "", ""
+}
+
+func splitColonEffortSuffix(model string) (base, effort string) {
+	trimmed := strings.TrimSpace(model)
+	colon := strings.LastIndexByte(trimmed, ':')
+	if colon <= 0 {
+		return trimmed, ""
+	}
+	candidate := trimmed[colon+1:]
+	if strings.ContainsAny(candidate, " \t") {
+		return trimmed, ""
+	}
+	if eff := normalizeEffort(candidate); eff != "" {
+		return strings.TrimSpace(trimmed[:colon]), eff
+	}
+	return trimmed, ""
+}
+
+func extractEffortSuffix(model string) string {
+	_, effort, _ := splitEffortSuffix(model)
+	return effort
 }
 
 func stripEffortSuffix(model string) string {
-	lower := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.HasSuffix(lower, "-low"):
-		return strings.TrimSpace(model[:len(model)-4])
-	case strings.HasSuffix(lower, "-medium"):
-		return strings.TrimSpace(model[:len(model)-7])
-	case strings.HasSuffix(lower, "-med"):
-		return strings.TrimSpace(model[:len(model)-4])
-	case strings.HasSuffix(lower, "-high"):
-		return strings.TrimSpace(model[:len(model)-5])
-	default:
-		return strings.TrimSpace(model)
-	}
+	base, _, _ := splitEffortSuffix(model)
+	return base
 }
 
 func supportsEffort(model string) bool {
@@ -636,15 +660,12 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		requestedModel = strings.TrimSpace(requestedModel[:open])
 	}
 
-	// 2. Check explicit model colon suffix override :low, :medium, :med, :high (e.g. model:high)
-	for _, suffix := range []string{":low", ":medium", ":med", ":high"} {
-		if strings.HasSuffix(strings.ToLower(requestedModel), suffix) {
-			if effort == "" {
-				effort = normalizeEffort(strings.TrimPrefix(suffix, ":"))
-			}
-			requestedModel = strings.TrimSpace(requestedModel[:len(requestedModel)-len(suffix)])
-			break
+	// 2. Check explicit model colon suffix override :low, :medium, :med, :high, :xhigh, :max (e.g. model:xhigh)
+	if base, colonEffort := splitColonEffortSuffix(requestedModel); colonEffort != "" {
+		if effort == "" {
+			effort = colonEffort
 		}
+		requestedModel = base
 	}
 
 	// 3. Split model name: if model has a reasoning effort suffix (e.g. -high, -medium, -low),
@@ -706,14 +727,17 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 }
 
 func normalizeEffort(s string) string {
-	lower := strings.ToLower(strings.TrimSpace(s))
-	switch lower {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "low":
 		return "low"
 	case "medium", "med":
 		return "medium"
 	case "high":
 		return "high"
+	case "xhigh", "x-high", "x_high", "extra-high", "extra_high", "extra high":
+		return "xhigh"
+	case "max":
+		return "max"
 	default:
 		return ""
 	}
@@ -929,6 +953,8 @@ func classifyAgyError(err error, stderr string) error {
 	case strings.Contains(lower, "quota"), strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "resource_exhausted"):
 		markLimitsStale()
 		return pRetryableError("agy_rate_limit", nonEmpty(msg, "Antigravity quota or rate limit reached"), http.StatusTooManyRequests)
+	case strings.Contains(lower, "invalid --effort"), (strings.Contains(lower, "has no ") && strings.Contains(lower, " effort")), strings.Contains(lower, "--effort is not supported"):
+		return pError(errorCodeRequestScoped, nonEmpty(msg, "Antigravity model does not support the requested reasoning effort"), http.StatusBadRequest)
 	case strings.Contains(lower, "invalid model selection"), strings.Contains(lower, "model") && (strings.Contains(lower, "not found") || strings.Contains(lower, "unknown") || strings.Contains(lower, "not recognized")):
 		return pError(errorCodeModelNotFound, nonEmpty(msg, "Antigravity model not found"), http.StatusNotFound)
 	case strings.Contains(lower, "sign in"), strings.Contains(lower, "login"), strings.Contains(lower, "authenticate"), strings.Contains(lower, "credential"):

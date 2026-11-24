@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
+### Added
+
+- Support for the `xhigh` and `max` reasoning effort levels in `reasoning_effort` configuration/enum metadata, request payloads, headers, metadata, and model suffixes (`-xhigh`, `-max`, `:xhigh`, `:max`, `(xhigh)`, `(max)`), including `(XHigh)` and `(Max)` model discovery and humanization.
+- Unsupported `--effort` selections reported by `agy` now return HTTP 400 (`request_scoped`) instead of cooling down the model as `model_not_found`.
+
 ### Fixed
 
 - The Antigravity accounts page can reuse remembered logins from CPAMC builds that use the `enc::v2::` storage format.
