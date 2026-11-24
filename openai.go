@@ -224,11 +224,10 @@ func ensurePrivateStagingDir() (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("staging path %s is not a directory", dir)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return "", fmt.Errorf("staging directory %s has permissions %04o, want 0700", dir, perm)
-	}
-	if owner, ok := fileOwnerID(info); ok && !stagingOwnedByCurrentUser(owner) {
-		return "", fmt.Errorf("staging directory %s is owned by uid %d", dir, owner)
+	// Privacy is validated per platform: Unix has mode bits and an owner uid, while
+	// Windows reports 0777 for every writable directory and relies on ACLs.
+	if err := validateStagingDirPrivacy(dir, info); err != nil {
+		return "", err
 	}
 	return dir, nil
 }

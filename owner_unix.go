@@ -3,19 +3,22 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 )
 
-// fileOwnerID reports the owning uid of a file on platforms that track it.
-func fileOwnerID(info os.FileInfo) (int, bool) {
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		return int(stat.Uid), true
+// validateStagingDirPrivacy rejects a staging root another local user could
+// control: MkdirAll keeps an existing directory's mode and owner, and a shared
+// /tmp entry created first by someone else would otherwise be accepted.
+func validateStagingDirPrivacy(dir string, info os.FileInfo) error {
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("staging directory %s has permissions %04o, want 0700", dir, perm)
 	}
-	return 0, false
-}
-
-// stagingOwnedByCurrentUser reports whether uid owns the current process's user.
-func stagingOwnedByCurrentUser(uid int) bool {
-	return uid == os.Getuid()
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		if uid := int(stat.Uid); uid != os.Getuid() {
+			return fmt.Errorf("staging directory %s is owned by uid %d, want %d", dir, uid, os.Getuid())
+		}
+	}
+	return nil
 }

@@ -671,6 +671,9 @@ func TestStagedPromptRemovedOnFailure(t *testing.T) {
 
 // A staging root another local user could control must be refused.
 func TestEnsurePrivateStagingDirRejectsLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows reports 0777 for every writable directory")
+	}
 	previous := stagingDirOverride
 	base := t.TempDir()
 	dir := filepath.Join(base, "cliproxy-prompts")
