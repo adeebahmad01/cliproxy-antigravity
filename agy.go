@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -108,6 +110,124 @@ type catalogState struct {
 
 var modelCatalog = catalogState{}
 
+// modelCatalogDiskCache is the last discovery that succeeded. `agy models` fails
+// while an account is rate limited, when the CLI times out, or on a transient
+// network error, and publishing a catalog without the discovered models makes
+// every agy/* request fail with an unknown model, so a failed refresh falls back
+// to the previous catalog and to this cache.
+type modelCatalogDiskCache struct {
+	BinaryPath string            `json:"binary_path"`
+	Models     []modelInfo       `json:"models"`
+	NativeByID map[string]string `json:"native_by_id"`
+}
+
+// modelCacheDirOverride lets tests point the cache at a temporary directory; the
+// platform cache root differs per OS, so redirecting $HOME/XDG_CACHE_HOME is not
+// portable.
+var modelCacheDirOverride string
+
+// modelCatalogCachePath returns the cached catalog path. It reports false when no
+// per-user cache directory exists: falling back to os.TempDir() would put a
+// predictable path in a shared directory where another local user could pre-create
+// a symlink or FIFO for the plugin to follow or block on.
+func modelCatalogCachePath() (string, bool) {
+	if modelCacheDirOverride != "" {
+		return filepath.Join(modelCacheDirOverride, pluginID, "models.json"), true
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
+		return "", false
+	}
+	return filepath.Join(dir, pluginID, "models.json"), true
+}
+
+// writeModelCatalogCache persists a discovery. Only call it after `agy models`
+// exited successfully; a partial catalog would otherwise outlive the failure.
+func writeModelCatalogCache(cfg pluginConfig, models []modelInfo, nativeByID map[string]string) {
+	path, ok := modelCatalogCachePath()
+	if !ok {
+		return
+	}
+	payload, err := json.Marshal(modelCatalogDiskCache{BinaryPath: cfg.BinaryPath, Models: models, NativeByID: nativeByID})
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	// Write beside the target and rename: a partial write must not destroy the
+	// last valid catalog.
+	tmp, err := os.CreateTemp(dir, "models-*.json")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(payload); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+	}
+}
+
+func readModelCatalogCache(cfg pluginConfig) ([]modelInfo, map[string]string) {
+	path, ok := modelCatalogCachePath()
+	if !ok {
+		return nil, nil
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	var cached modelCatalogDiskCache
+	if err := json.Unmarshal(payload, &cached); err != nil {
+		return nil, nil
+	}
+	if cached.BinaryPath != cfg.BinaryPath || len(cached.Models) == 0 {
+		return nil, nil
+	}
+	return cached.Models, cached.NativeByID
+}
+
+// mergeCatalogModels keeps the first entry per ID so a stale cache cannot shadow
+// a freshly discovered model.
+func mergeCatalogModels(primary, extra []modelInfo) []modelInfo {
+	seen := make(map[string]struct{}, len(primary))
+	merged := make([]modelInfo, 0, len(primary)+len(extra))
+	for _, group := range [][]modelInfo{primary, extra} {
+		for _, model := range group {
+			if _, ok := seen[model.ID]; ok {
+				continue
+			}
+			seen[model.ID] = struct{}{}
+			merged = append(merged, model)
+		}
+	}
+	return merged
+}
+
+func mergeCatalogMapping(primary, extra map[string]string) map[string]string {
+	merged := make(map[string]string, len(primary)+len(extra))
+	for key, value := range extra {
+		merged[key] = value
+	}
+	for key, value := range primary {
+		merged[key] = value
+	}
+	return merged
+}
+
 func invalidateModels() {
 	modelCatalog.Lock()
 	modelCatalog.fetchedAt = time.Time{}
@@ -180,6 +300,12 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		return cloneModels(modelCatalog.models)
 	}
 
+	// Keep the previous successful catalog in case this refresh fails.
+	previousModels := cloneModels(modelCatalog.models)
+	previousMapping := modelCatalog.nativeByID
+	previousCompatible := modelCatalog.binaryPath == cfg.BinaryPath
+
+	discoveryComplete := false
 	builtin := standardBuiltinModels()
 	models := append([]modelInfo(nil), builtin...)
 	nativeByID := map[string]string{
@@ -212,13 +338,31 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 
 		if err := cmd.Start(); err == nil {
 			activeProcesses.add(cmd)
-			_ = cmd.Wait()
+			waitErr := cmd.Wait()
 			activeProcesses.remove(cmd)
 			discovered, mapping := parseAgyModelLines(stdout.String())
-			for _, m := range discovered {
-				models = append(models, m)
+			// Only a clean exit means the listing is complete.
+			if waitErr == nil && len(discovered) > 0 {
+				for _, m := range discovered {
+					models = append(models, m)
+				}
+				mergeDiscoveredNativeMap(nativeByID, mapping)
+				discoveryComplete = true
 			}
-			mergeDiscoveredNativeMap(nativeByID, mapping)
+		}
+	}
+
+	switch {
+	case discoveryComplete:
+		writeModelCatalogCache(cfg, models, nativeByID)
+	default:
+		if previousCompatible && len(previousModels) > 0 {
+			models = mergeCatalogModels(models, previousModels)
+			nativeByID = mergeCatalogMapping(nativeByID, previousMapping)
+		}
+		if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
+			models = mergeCatalogModels(models, cachedModels)
+			nativeByID = mergeCatalogMapping(nativeByID, cachedMapping)
 		}
 	}
 

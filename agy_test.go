@@ -4,7 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -221,6 +225,10 @@ func TestAgyArgsClaudeOmitsEffort(t *testing.T) {
 }
 
 func TestResolveExecutionOptions(t *testing.T) {
+	useTempModelCache(t)
+	invalidateModels()
+	t.Cleanup(invalidateModels)
+
 	cfg := defaultConfig()
 	cfg.DefaultReasoningEffort = "low"
 
@@ -609,4 +617,123 @@ func TestFinishPluginStreamPropagatesDoneEmitError(t *testing.T) {
 	if gotCloseErr != nil {
 		t.Fatalf("raw stream close err = %v, want nil", gotCloseErr)
 	}
+}
+
+// useTempModelCache isolates the on-disk catalog cache for a test. The cache root
+// comes from os.UserCacheDir(), which honours different environment variables per
+// platform, so the path is overridden directly instead.
+func useTempModelCache(t *testing.T) {
+	t.Helper()
+	previous := modelCacheDirOverride
+	modelCacheDirOverride = t.TempDir()
+	t.Cleanup(func() { modelCacheDirOverride = previous })
+}
+
+func TestModelCatalogCacheRoundTrip(t *testing.T) {
+	useTempModelCache(t)
+	cfg := pluginConfig{BinaryPath: "agy"}
+	models := []modelInfo{{ID: "agy/gemini-4-neon", Name: "Neon"}, {ID: "agy/default", Name: "Default"}}
+	writeModelCatalogCache(cfg, models, map[string]string{"agy/gemini-4-neon": "gemini-4-neon"})
+
+	gotModels, gotMapping := readModelCatalogCache(cfg)
+	if len(gotModels) != 2 || gotModels[0].ID != "agy/gemini-4-neon" {
+		t.Fatalf("cached models = %+v", gotModels)
+	}
+	if gotMapping["agy/gemini-4-neon"] != "gemini-4-neon" {
+		t.Fatalf("cached mapping = %+v", gotMapping)
+	}
+
+	// A cache written for another binary must not apply.
+	if other, _ := readModelCatalogCache(pluginConfig{BinaryPath: "other-agy"}); other != nil {
+		t.Fatalf("cache leaked across binaries: %+v", other)
+	}
+}
+
+func TestMergeCatalogModelsPrefersPrimary(t *testing.T) {
+	primary := []modelInfo{{ID: "agy/default", Name: "fresh"}}
+	extra := []modelInfo{{ID: "agy/default", Name: "stale"}, {ID: "agy/gemini-4-neon", Name: "cached"}}
+	merged := mergeCatalogModels(primary, extra)
+	if len(merged) != 2 || merged[0].Name != "fresh" {
+		t.Fatalf("merged = %+v", merged)
+	}
+	mapping := mergeCatalogMapping(map[string]string{"agy/default": "fresh-native"}, map[string]string{"agy/default": "stale-native", "agy/other": "y"})
+	if mapping["agy/default"] != "fresh-native" || mapping["agy/other"] != "y" {
+		t.Fatalf("mapping = %+v", mapping)
+	}
+}
+
+// A rate-limited account makes `agy models` fail; the catalog must keep the
+// discovered models, otherwise every agy/* request 400s on an unknown model.
+func TestDiscoverModelsFallsBackToCachedCatalog(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub agy binary is a shell script")
+	}
+	useTempModelCache(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := pluginConfig{BinaryPath: bin}
+	writeModelCatalogCache(cfg, []modelInfo{{ID: "agy/gemini-4-neon", Name: "Neon"}},
+		map[string]string{"agy/gemini-4-neon": "gemini-4-neon"})
+
+	invalidateModels()
+	defer invalidateModels()
+	models := discoverModels(cfg)
+	for _, model := range models {
+		if model.ID == "agy/gemini-4-neon" {
+			return
+		}
+	}
+	t.Fatalf("cached model missing after a failed discovery: %+v", models)
+}
+
+func TestModelCatalogCacheSkipsDiskWithoutUserCacheDir(t *testing.T) {
+	previous := modelCacheDirOverride
+	modelCacheDirOverride = ""
+	t.Cleanup(func() { modelCacheDirOverride = previous })
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("HOME", "")
+	if os.Getenv("LOCALAPPDATA") != "" {
+		t.Setenv("LOCALAPPDATA", "")
+	}
+	if path, ok := modelCatalogCachePath(); ok {
+		t.Fatalf("expected no cache path without a user cache dir, got %q", path)
+	}
+	writeModelCatalogCache(pluginConfig{BinaryPath: "agy"}, []modelInfo{{ID: "agy/default"}}, nil)
+	if models, _ := readModelCatalogCache(pluginConfig{BinaryPath: "agy"}); models != nil {
+		t.Fatalf("expected no disk cache read, got %+v", models)
+	}
+}
+
+func TestWriteModelCatalogCacheKeepsOldFileOnInvalidPayload(t *testing.T) {
+	useTempModelCache(t)
+	cfg := pluginConfig{BinaryPath: "agy"}
+	writeModelCatalogCache(cfg, []modelInfo{{ID: "agy/default", Name: "first"}}, nil)
+	writeModelCatalogCache(cfg, []modelInfo{{ID: "agy/default", Name: "second"}}, nil)
+	models, _ := readModelCatalogCache(cfg)
+	if len(models) != 1 || models[0].Name != "second" {
+		t.Fatalf("cache = %+v, want the replaced entry", models)
+	}
+	// No temporary files may be left behind.
+	dir := filepath.Dir(mustCachePath(t))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "models-") && strings.HasSuffix(entry.Name(), ".json") {
+			t.Fatalf("temporary cache file left behind: %s", entry.Name())
+		}
+	}
+}
+
+func mustCachePath(t *testing.T) string {
+	t.Helper()
+	path, ok := modelCatalogCachePath()
+	if !ok {
+		t.Fatal("no cache path")
+	}
+	return path
 }
