@@ -168,6 +168,11 @@ func writeToolInstruction(b *strings.Builder, tools []json.RawMessage) {
 		b.Write(tool)
 		b.WriteByte('\n')
 	}
+	if names := toolNamesFromSpecs(tools); len(names) > 0 {
+		b.WriteString("\nCall tools by these exact names (case-sensitive), never a paraphrase such as \"Agent\" for \"subagent\": ")
+		b.WriteString(strings.Join(names, ", "))
+		b.WriteString("\n")
+	}
 	b.WriteString("\nIf a client tool call is needed, reply ONLY with a JSON block in this exact markdown code fence:\n")
 	b.WriteString("```tool_calls\n[\n  {\n    \"name\": \"tool_name\",\n    \"arguments\": { ... }\n  }\n]\n```\n")
 	b.WriteString("If no tool call is needed, provide your regular assistant response without the ```tool_calls code block.\n")
@@ -299,8 +304,13 @@ func declaredToolNames(payload []byte) []string {
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil
 	}
-	names := make([]string, 0, len(req.Tools))
-	for _, raw := range req.Tools {
+	return toolNamesFromSpecs(req.Tools)
+}
+
+// toolNamesFromSpecs extracts the advertised function names from tools[].
+func toolNamesFromSpecs(tools []json.RawMessage) []string {
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
 		var tool struct {
 			Function struct {
 				Name string `json:"name"`
@@ -440,6 +450,86 @@ func hasNamedToolCandidate(candidates []toolCallCandidate) bool {
 	return false
 }
 
+// toolNameAliases maps the human names models reach for onto the tool names
+// clients advertise. Keep this list explicit: guessing from substrings silently
+// rewrites calls the model meant as something else.
+var toolNameAliases = map[string]string{
+	"agent":     "subagent",
+	"task":      "subagent",
+	"subagent":  "subagent",
+	"delegate":  "subagent",
+	"command":   "bash",
+	"shell":     "bash",
+	"terminal":  "bash",
+	"readfile":  "read",
+	"writefile": "write",
+}
+
+func lastToolNameSegment(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	return strings.ToLower(trimmed[strings.LastIndexAny(trimmed, ":/.")+1:])
+}
+
+// resolveToolName snaps a model-emitted name onto one of the advertised tools.
+// Clients drop calls whose name they cannot resolve, so an unmatched "Agent" for
+// an advertised "subagent" silently loses the turn. Matching is deliberately
+// strict: exact, then case-insensitive, then an explicit alias, then an equal
+// trailing namespace segment ("tools:subagent" -> "subagent").
+func resolveToolName(name string, declared []string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" || len(declared) == 0 {
+		return trimmed
+	}
+	for _, candidate := range declared {
+		if candidate == trimmed {
+			return candidate
+		}
+	}
+	lowered := strings.ToLower(trimmed)
+	for _, candidate := range declared {
+		if strings.ToLower(candidate) == lowered {
+			return candidate
+		}
+	}
+	if alias, ok := toolNameAliases[lowered]; ok {
+		for _, candidate := range declared {
+			if strings.ToLower(candidate) == alias {
+				return candidate
+			}
+		}
+	}
+	segment := lastToolNameSegment(trimmed)
+	if segment != "" {
+		matched := ""
+		for _, candidate := range declared {
+			if lastToolNameSegment(candidate) == segment {
+				if matched != "" {
+					matched = "" // ambiguous, do not guess
+					break
+				}
+				matched = candidate
+			}
+		}
+		if matched != "" {
+			return matched
+		}
+	}
+	return trimmed
+}
+
+func normalizeToolCalls(calls []openAIToolCall, declared []string) []openAIToolCall {
+	if len(declared) == 0 {
+		return calls
+	}
+	for i := range calls {
+		calls[i].Function.Name = resolveToolName(calls[i].Function.Name, declared)
+	}
+	return calls
+}
+
 func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) {
 	trimmed := strings.TrimSpace(response)
 
@@ -539,6 +629,7 @@ func estimateTokens(text string) int {
 func makeChatCompletion(requestedModel string, declared []string, result agyResult) ([]byte, error) {
 	model := displayModel(requestedModel)
 	toolCalls, isToolCall := extractToolCalls(result.Response, len(declared) > 0)
+	toolCalls = normalizeToolCalls(toolCalls, declared)
 	if !isToolCall && strings.TrimSpace(result.Response) == "" {
 		return nil, emptyResponseError()
 	}

@@ -412,3 +412,71 @@ func TestLeadingJSONExampleThenRealToolCallsFence(t *testing.T) {
 		t.Fatalf("genuine fence after a leading example block was lost: ok=%v calls=%v", ok, calls)
 	}
 }
+
+func TestResolveToolNameIsStrict(t *testing.T) {
+	declared := []string{"read", "bash", "subagent", "codemode", "tools:search", "read-file"}
+	cases := map[string]string{
+		"subagent":      "subagent", // exact
+		"Bash":          "bash",     // case-insensitive
+		"Agent":         "subagent", // explicit alias
+		"agent":         "subagent",
+		"tools:search":  "tools:search",
+		"search":        "tools:search",  // delimiter-safe namespace match
+		"mcp:read-file": "read-file",     // namespace prefix over kebab-case tool name
+		"write-file":    "write-file",    // hyphenated tool names must not match on trailing word
+		"file":          "file",          // bare suffix after hyphen must not snap to read-file
+		"write_file":    "write_file",    // unknown stays untouched
+		"readSomething": "readSomething", // no suffix matching
+	}
+	for input, want := range cases {
+		if got := resolveToolName(input, declared); got != want {
+			t.Fatalf("resolveToolName(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestResolveToolNameSkipsAmbiguousNamespace(t *testing.T) {
+	declared := []string{"fs:read", "net:read"}
+	if got := resolveToolName("read", declared); got != "read" {
+		t.Fatalf("ambiguous segment match must not be guessed, got %q", got)
+	}
+}
+
+func TestNormalizeToolCallsRewritesAlias(t *testing.T) {
+	raw, err := makeChatCompletion("agy/test", []string{"read", "subagent"}, agyResult{
+		Status:   "SUCCESS",
+		Response: "```tool_calls\n[{\"name\":\"Agent\",\"arguments\":{\"agent\":\"scout\",\"task\":\"look\"}}]\n```",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []openAIToolCall `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Choices) == 0 || len(payload.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("no tool call in payload: %s", raw)
+	}
+	if got := payload.Choices[0].Message.ToolCalls[0].Function.Name; got != "subagent" {
+		t.Fatalf("tool name = %q, want subagent", got)
+	}
+}
+
+func TestToolInstructionPinsExactNames(t *testing.T) {
+	payload := []byte(`{"model":"agy/default","messages":[{"role":"user","content":"hi"}],
+      "tools":[{"type":"function","function":{"name":"subagent","description":"delegate"}},
+               {"type":"function","function":{"name":"bash","description":"run"}}]}`)
+	prompt, err := testChatPrompt(t, payload, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "never a paraphrase") || !strings.Contains(prompt, "subagent, bash") {
+		t.Fatalf("tool instruction does not pin exact names:\n%s", prompt[:400])
+	}
+}
