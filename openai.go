@@ -365,12 +365,14 @@ func jsonValueEnd(s string, start int) int {
 // Candidates are tried from most to least permissive so embedded ``` fences
 // inside string arguments do not truncate the payload.
 func fencedToolCallJSON(text string) string {
+	// ```tool_calls may be preceded by prose ("Here is the call:"), but ```json is
+	// only a tool payload when it opens the response: otherwise an ordinary
+	// explanation that embeds an example ```json block would be parsed as a call.
 	start := -1
-	for _, opener := range []string{"```tool_calls", "```json"} {
-		if idx := strings.Index(text, opener); idx >= 0 {
-			start = idx + len(opener)
-			break
-		}
+	if idx := strings.Index(text, "```tool_calls"); idx >= 0 {
+		start = idx + len("```tool_calls")
+	} else if strings.HasPrefix(text, "```json") {
+		start = len("```json")
 	}
 	if start < 0 {
 		return ""

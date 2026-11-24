@@ -311,3 +311,27 @@ func TestDeclaredToolNames(t *testing.T) {
 		t.Fatalf("expected no names, got %v", names)
 	}
 }
+
+// An ordinary answer that embeds an example ```json block must not be parsed as
+// a tool call just because the tools were declared.
+func TestFencedJSONOnlyCountsAtTheStart(t *testing.T) {
+	response := "Here is an example payload your API accepts:\n\n```json\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n```\n\nThat is all."
+	if calls, ok := extractToolCalls(response, true); ok {
+		t.Fatalf("embedded example block became a tool call: %+v", calls)
+	}
+
+	// The same payload at the start of the response is still accepted.
+	payload := "```json\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```"
+	calls, ok := extractToolCalls(payload, true)
+	if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+		t.Fatalf("leading ```json payload was not accepted: ok=%v calls=%v", ok, calls)
+	}
+}
+
+// ```tool_calls may still be preceded by prose.
+func TestToolCallsFenceAllowsLeadingProse(t *testing.T) {
+	calls, ok := extractToolCalls("Here is the call:\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```", true)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("leading prose before the fence broke extraction: ok=%v", ok)
+	}
+}
