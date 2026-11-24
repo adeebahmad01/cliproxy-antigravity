@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -108,6 +110,81 @@ type catalogState struct {
 
 var modelCatalog = catalogState{}
 
+// modelCatalogDiskCache is the last discovery that succeeded. `agy models` fails
+// while an account is rate limited, when the CLI times out, or on a transient
+// network error, and publishing a catalog without the discovered models makes
+// every agy/* request fail with an unknown model, so a failed refresh falls back
+// to the previous catalog and to this cache.
+type modelCatalogDiskCache struct {
+	BinaryPath string            `json:"binary_path"`
+	Models     []modelInfo       `json:"models"`
+	NativeByID map[string]string `json:"native_by_id"`
+}
+
+func modelCatalogCachePath() string {
+	if dir, err := os.UserCacheDir(); err == nil && dir != "" {
+		return filepath.Join(dir, pluginID, "models.json")
+	}
+	return filepath.Join(os.TempDir(), pluginID, "models.json")
+}
+
+// writeModelCatalogCache persists a discovery. Only call it after `agy models`
+// exited successfully; a partial catalog would otherwise outlive the failure.
+func writeModelCatalogCache(cfg pluginConfig, models []modelInfo, nativeByID map[string]string) {
+	path := modelCatalogCachePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	payload, err := json.Marshal(modelCatalogDiskCache{BinaryPath: cfg.BinaryPath, Models: models, NativeByID: nativeByID})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, payload, 0o600)
+}
+
+func readModelCatalogCache(cfg pluginConfig) ([]modelInfo, map[string]string) {
+	payload, err := os.ReadFile(modelCatalogCachePath())
+	if err != nil {
+		return nil, nil
+	}
+	var cached modelCatalogDiskCache
+	if err := json.Unmarshal(payload, &cached); err != nil {
+		return nil, nil
+	}
+	if cached.BinaryPath != cfg.BinaryPath || len(cached.Models) == 0 {
+		return nil, nil
+	}
+	return cached.Models, cached.NativeByID
+}
+
+// mergeCatalogModels keeps the first entry per ID so a stale cache cannot shadow
+// a freshly discovered model.
+func mergeCatalogModels(primary, extra []modelInfo) []modelInfo {
+	seen := make(map[string]struct{}, len(primary))
+	merged := make([]modelInfo, 0, len(primary)+len(extra))
+	for _, group := range [][]modelInfo{primary, extra} {
+		for _, model := range group {
+			if _, ok := seen[model.ID]; ok {
+				continue
+			}
+			seen[model.ID] = struct{}{}
+			merged = append(merged, model)
+		}
+	}
+	return merged
+}
+
+func mergeCatalogMapping(primary, extra map[string]string) map[string]string {
+	merged := make(map[string]string, len(primary)+len(extra))
+	for key, value := range extra {
+		merged[key] = value
+	}
+	for key, value := range primary {
+		merged[key] = value
+	}
+	return merged
+}
+
 func invalidateModels() {
 	modelCatalog.Lock()
 	modelCatalog.fetchedAt = time.Time{}
@@ -180,6 +257,12 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		return cloneModels(modelCatalog.models)
 	}
 
+	// Keep the previous successful catalog in case this refresh fails.
+	previousModels := cloneModels(modelCatalog.models)
+	previousMapping := modelCatalog.nativeByID
+	previousCompatible := modelCatalog.binaryPath == cfg.BinaryPath
+
+	discoveryComplete := false
 	builtin := standardBuiltinModels()
 	models := append([]modelInfo(nil), builtin...)
 	nativeByID := map[string]string{
@@ -212,13 +295,31 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 
 		if err := cmd.Start(); err == nil {
 			activeProcesses.add(cmd)
-			_ = cmd.Wait()
+			waitErr := cmd.Wait()
 			activeProcesses.remove(cmd)
 			discovered, mapping := parseAgyModelLines(stdout.String())
-			for _, m := range discovered {
-				models = append(models, m)
+			// Only a clean exit means the listing is complete.
+			if waitErr == nil && len(discovered) > 0 {
+				for _, m := range discovered {
+					models = append(models, m)
+				}
+				mergeDiscoveredNativeMap(nativeByID, mapping)
+				discoveryComplete = true
 			}
-			mergeDiscoveredNativeMap(nativeByID, mapping)
+		}
+	}
+
+	switch {
+	case discoveryComplete:
+		writeModelCatalogCache(cfg, models, nativeByID)
+	default:
+		if previousCompatible && len(previousModels) > 0 {
+			models = mergeCatalogModels(models, previousModels)
+			nativeByID = mergeCatalogMapping(nativeByID, previousMapping)
+		}
+		if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
+			models = mergeCatalogModels(models, cachedModels)
+			nativeByID = mergeCatalogMapping(nativeByID, cachedMapping)
 		}
 	}
 
