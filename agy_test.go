@@ -576,3 +576,37 @@ func TestRouteModel(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishPluginStreamPropagatesDoneEmitError(t *testing.T) {
+	wantErr := errors.New("broken pipe")
+	var gotCloseErr error
+	var emitted [][]byte
+
+	finishPluginStream("stream-1", false, func(_ string, payload []byte) error {
+		emitted = append(emitted, append([]byte(nil), payload...))
+		return wantErr
+	}, func(_ string, err error) {
+		gotCloseErr = err
+	})
+	if len(emitted) != 1 || string(emitted[0]) != "data: [DONE]\n\n" {
+		t.Fatalf("emitted = %q, want data: [DONE]\\n\\n", emitted)
+	}
+	if !errors.Is(gotCloseErr, wantErr) {
+		t.Fatalf("close err = %v, want %v", gotCloseErr, wantErr)
+	}
+
+	gotCloseErr = errors.New("unexpected")
+	emitted = nil
+	finishPluginStream("stream-2", true, func(_ string, payload []byte) error {
+		emitted = append(emitted, payload)
+		return wantErr
+	}, func(_ string, err error) {
+		gotCloseErr = err
+	})
+	if len(emitted) != 0 {
+		t.Fatalf("raw stream must not emit [DONE], got %q", emitted)
+	}
+	if gotCloseErr != nil {
+		t.Fatalf("raw stream close err = %v, want nil", gotCloseErr)
+	}
+}

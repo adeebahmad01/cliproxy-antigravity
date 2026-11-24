@@ -1100,10 +1100,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		return emitPluginStreamChunk(streamID, chunk)
 	}
 	finishStream := func() {
-		if !rawChunks {
-			_ = emitPluginStreamChunk(streamID, []byte("data: [DONE]\n\n"))
-		}
-		closePluginStream(streamID, nil)
+		finishPluginStream(streamID, rawChunks, emitPluginStreamChunk, closePluginStream)
 	}
 	sentRole := false
 	emit := func(delta map[string]any, finish *string, usage map[string]any) error {
@@ -1162,6 +1159,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 				pending := streamedText.String()[emittedLen:]
 				emittedLen = streamedText.Len()
 				if err := emit(map[string]any{"content": pending}, nil, nil); err != nil {
+					closePluginStream(streamID, err)
 					killProcessTree(cmd)
 					_ = cmd.Wait()
 					return
@@ -1233,15 +1231,24 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	}
 	if opts.HasTools && isToolCall {
 		// Emit tool_calls delta chunk
-		_ = emit(map[string]any{
+		if err := emit(map[string]any{
 			"tool_calls": toolCalls,
-		}, nil, nil)
+		}, nil, nil); err != nil {
+			closePluginStream(streamID, err)
+			return
+		}
 
 		// The finish chunk and the usage chunk must stay separate: a usage chunk has empty choices.
 		finishReason := "tool_calls"
-		_ = emit(map[string]any{}, &finishReason, nil)
+		if err := emit(map[string]any{}, &finishReason, nil); err != nil {
+			closePluginStream(streamID, err)
+			return
+		}
 		if requestWantsUsage(req.Payload) {
-			_ = emit(map[string]any{}, nil, openAIUsage(terminal.Usage))
+			if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
+				closePluginStream(streamID, err)
+				return
+			}
 		}
 		finishStream()
 		return
@@ -1249,19 +1256,25 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 
 	// If it was buffered thinking it was a tool call but turned out not to be
 	if streamedText.Len() > emittedLen {
-		_ = emit(map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil)
+		if err := emit(map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil); err != nil {
+			closePluginStream(streamID, err)
+			return
+		}
 	} else if streamedText.Len() == 0 && terminal.Response != "" {
 		if err := emit(map[string]any{"content": terminal.Response}, nil, nil); err != nil {
+			closePluginStream(streamID, err)
 			return
 		}
 	}
 
 	finish := "stop"
 	if err := emit(map[string]any{}, &finish, nil); err != nil {
+		closePluginStream(streamID, err)
 		return
 	}
 	if requestWantsUsage(req.Payload) {
 		if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
+			closePluginStream(streamID, err)
 			return
 		}
 	}
@@ -1298,6 +1311,18 @@ func toolCallPrefixState(text string) toolPrefixState {
 		return toolPrefixPending
 	}
 	return toolPrefixNone
+}
+
+// finishPluginStream emits the SSE [DONE] sentinel on translated routes and closes
+// the stream, propagating any emission failure to closeStream.
+func finishPluginStream(streamID string, rawChunks bool, emitChunk func(string, []byte) error, closeStream func(string, error)) {
+	if !rawChunks {
+		if err := emitChunk(streamID, []byte("data: [DONE]\n\n")); err != nil {
+			closeStream(streamID, err)
+			return
+		}
+	}
+	closeStream(streamID, nil)
 }
 
 func emitPluginStreamChunk(streamID string, payload []byte) error {
