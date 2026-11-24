@@ -289,24 +289,141 @@ func messageContentText(raw json.RawMessage, workdir string) (string, error) {
 	return strings.Join(parts, "\n"), nil
 }
 
-func extractToolCalls(response string) ([]openAIToolCall, bool) {
-	trimmed := strings.TrimSpace(response)
-	jsonBlock := ""
+// declaredToolNames lists the tool names the client advertised. Bare JSON tool
+// calls are only recovered when the request actually declared tools, so ordinary
+// prose that happens to start with "[" is never mistaken for a tool call.
+func declaredToolNames(payload []byte) []string {
+	var req struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(req.Tools))
+	for _, raw := range req.Tools {
+		var tool struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(raw, &tool); err == nil && strings.TrimSpace(tool.Function.Name) != "" {
+			names = append(names, tool.Function.Name)
+		}
+	}
+	return names
+}
 
-	// Check for ```tool_calls ... ```
-	const fenceStart = "```tool_calls"
-	if idx := strings.Index(trimmed, fenceStart); idx >= 0 {
-		rest := trimmed[idx+len(fenceStart):]
-		if endIdx := strings.Index(rest, "```"); endIdx >= 0 {
-			jsonBlock = strings.TrimSpace(rest[:endIdx])
+// jsonValueEnd returns the index just past the JSON object or array that starts
+// at start, honouring strings and escapes. Tool arguments often embed markdown
+// fences or braces, so the first "```" after the opening fence is not a safe
+// terminator.
+func jsonValueEnd(s string, start int) int {
+	if start < 0 || start >= len(s) {
+		return -1
+	}
+	var open, close byte
+	switch s[start] {
+	case '{':
+		open, close = '{', '}'
+	case '[':
+		open, close = '[', ']'
+	default:
+		return -1
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
 		}
-	} else if strings.HasPrefix(trimmed, "```json") {
-		rest := trimmed[7:]
-		if endIdx := strings.Index(rest, "```"); endIdx >= 0 {
-			jsonBlock = strings.TrimSpace(rest[:endIdx])
+		switch c {
+		case '"':
+			inString = true
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
 		}
-	} else if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
-		jsonBlock = trimmed
+	}
+	return -1
+}
+
+// fencedToolCallJSON pulls the JSON payload out of a fenced tool_calls block.
+// Candidates are tried from most to least permissive so embedded ``` fences
+// inside string arguments do not truncate the payload.
+func fencedToolCallJSON(text string) string {
+	start := -1
+	for _, opener := range []string{"```tool_calls", "```json"} {
+		if idx := strings.Index(text, opener); idx >= 0 {
+			start = idx + len(opener)
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	body := text[start:]
+	if brace := strings.IndexAny(body, "[{"); brace >= 0 {
+		if end := jsonValueEnd(body, brace); end > 0 {
+			if candidate := strings.TrimSpace(body[brace:end]); candidate != "" {
+				return candidate
+			}
+		}
+	}
+	// Fall back to the last closing fence: correct when the arguments contain no
+	// balanced JSON the scanner could follow.
+	if endIdx := strings.LastIndex(body, "```"); endIdx >= 0 {
+		return strings.TrimSpace(body[:endIdx])
+	}
+	return ""
+}
+
+// normalizeArguments renders tool arguments as the JSON text clients expect. Some
+// models double-encode them as a JSON string ({"command":"ls"} quoted), which
+// makes clients parse a string instead of an object and fail the call.
+func normalizeArguments(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "{}"
+	}
+	if strings.HasPrefix(trimmed, "\"") {
+		var inner string
+		if err := json.Unmarshal(raw, &inner); err == nil {
+			unquoted := strings.TrimSpace(inner)
+			if unquoted == "" {
+				return "{}"
+			}
+			if json.Valid([]byte(unquoted)) {
+				return unquoted
+			}
+		}
+	}
+	return trimmed
+}
+
+func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) {
+	trimmed := strings.TrimSpace(response)
+	jsonBlock := fencedToolCallJSON(trimmed)
+
+	if jsonBlock == "" && allowBare && (strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")) {
+		if end := jsonValueEnd(trimmed, 0); end > 0 {
+			jsonBlock = strings.TrimSpace(trimmed[:end])
+		} else {
+			jsonBlock = trimmed
+		}
 	}
 
 	if jsonBlock == "" {
@@ -332,10 +449,7 @@ func extractToolCalls(response string) ([]openAIToolCall, bool) {
 		if strings.TrimSpace(c.Name) == "" {
 			continue
 		}
-		args := string(c.Arguments)
-		if strings.TrimSpace(args) == "" || args == "null" {
-			args = "{}"
-		}
+		args := normalizeArguments(c.Arguments)
 		calls = append(calls, openAIToolCall{
 			Index: i,
 			ID:    fmt.Sprintf("call_%s_%d", newCallID(), i),
@@ -387,9 +501,9 @@ func estimateTokens(text string) int {
 	return (n + 3) / 4
 }
 
-func makeChatCompletion(requestedModel string, result agyResult) ([]byte, error) {
+func makeChatCompletion(requestedModel string, declared []string, result agyResult) ([]byte, error) {
 	model := displayModel(requestedModel)
-	toolCalls, isToolCall := extractToolCalls(result.Response)
+	toolCalls, isToolCall := extractToolCalls(result.Response, len(declared) > 0)
 	if !isToolCall && strings.TrimSpace(result.Response) == "" {
 		return nil, emptyResponseError()
 	}
