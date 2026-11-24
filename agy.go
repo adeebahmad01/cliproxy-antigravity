@@ -1114,7 +1114,10 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	}
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	// One NDJSON event carries a whole assistant turn, and a turn holding several
+	// large tool calls easily exceeds the 64KB default. 32MB keeps those events
+	// intact; bufio.Scanner drops lines beyond the limit instead of erroring.
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	var terminal *agyResult
 	var streamError string
 	var streamedText strings.Builder
