@@ -289,37 +289,189 @@ func messageContentText(raw json.RawMessage, workdir string) (string, error) {
 	return strings.Join(parts, "\n"), nil
 }
 
-func extractToolCalls(response string) ([]openAIToolCall, bool) {
+// declaredToolNames lists the tool names the client advertised. Bare JSON tool
+// calls are only recovered when the request actually declared tools, so ordinary
+// prose that happens to start with "[" is never mistaken for a tool call.
+func declaredToolNames(payload []byte) []string {
+	var req struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(req.Tools))
+	for _, raw := range req.Tools {
+		var tool struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(raw, &tool); err == nil && strings.TrimSpace(tool.Function.Name) != "" {
+			names = append(names, tool.Function.Name)
+		}
+	}
+	return names
+}
+
+// jsonValueEnd returns the index just past the JSON object or array that starts
+// at start, honouring strings and escapes. Tool arguments often embed markdown
+// fences or braces, so the first "```" after the opening fence is not a safe
+// terminator.
+func jsonValueEnd(s string, start int) int {
+	if start < 0 || start >= len(s) {
+		return -1
+	}
+	var open, close byte
+	switch s[start] {
+	case '{':
+		open, close = '{', '}'
+	case '[':
+		open, close = '[', ']'
+	default:
+		return -1
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// payloadAfterFence returns the JSON payload that starts inside the fence whose
+// body begins at start. A fence that closes before any JSON container means the
+// block has no payload ("```json null```" followed by prose), so the search stops
+// there instead of picking up whatever follows.
+func payloadAfterFence(text string, start int) string {
+	body := text[start:]
+	brace := strings.IndexAny(body, "[{")
+	fence := strings.Index(body, "```")
+	if fence >= 0 && (brace < 0 || fence < brace) {
+		return ""
+	}
+	if brace >= 0 {
+		if end := jsonValueEnd(body, brace); end > 0 {
+			return strings.TrimSpace(body[brace:end])
+		}
+	}
+	return ""
+}
+
+// fencedToolCallPayloads returns fenced candidates in priority order: a leading
+// ```json fence first, then a ```tool_calls block. A ```tool_calls marker inside
+// a string argument of the leading payload would otherwise become the start
+// point, while a leading example block followed by a genuine tool_calls fence
+// still gets its call recovered by the second candidate.
+func fencedToolCallPayloads(text string) []string {
+	var out []string
+	add := func(payload string) {
+		payload = strings.TrimSpace(payload)
+		if payload == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == payload {
+				return
+			}
+		}
+		out = append(out, payload)
+	}
+	if strings.HasPrefix(text, "```json") {
+		add(payloadAfterFence(text, len("```json")))
+	}
+	if idx := strings.Index(text, "```tool_calls"); idx >= 0 {
+		add(payloadAfterFence(text, idx+len("```tool_calls")))
+	}
+	return out
+}
+
+// normalizeArguments renders tool arguments as the JSON text clients expect. Some
+// models double-encode them as a JSON string ({"command":"ls"} quoted), which
+// makes clients parse a string instead of an object and fail the call.
+func normalizeArguments(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "{}"
+	}
+	if strings.HasPrefix(trimmed, "\"") {
+		var inner string
+		if err := json.Unmarshal(raw, &inner); err == nil {
+			unquoted := strings.TrimSpace(inner)
+			if unquoted == "" || unquoted == "null" {
+				return "{}"
+			}
+			if json.Valid([]byte(unquoted)) {
+				return unquoted
+			}
+		}
+	}
+	return trimmed
+}
+
+func hasNamedToolCandidate(candidates []toolCallCandidate) bool {
+	for _, c := range candidates {
+		if strings.TrimSpace(c.Name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) {
 	trimmed := strings.TrimSpace(response)
-	jsonBlock := ""
 
-	// Check for ```tool_calls ... ```
-	const fenceStart = "```tool_calls"
-	if idx := strings.Index(trimmed, fenceStart); idx >= 0 {
-		rest := trimmed[idx+len(fenceStart):]
-		if endIdx := strings.Index(rest, "```"); endIdx >= 0 {
-			jsonBlock = strings.TrimSpace(rest[:endIdx])
+	// Candidates are tried in order. A bare payload leads when tools were declared
+	// and the response opens with a JSON container: its arguments may contain a
+	// fence marker ("echo ```json"), which would otherwise be mistaken for the
+	// payload terminator. The fenced form stays as fallback so a fenced block after
+	// prose is still recovered.
+	var blocks []string
+	if allowBare && (strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")) {
+		if end := jsonValueEnd(trimmed, 0); end > 0 {
+			blocks = append(blocks, strings.TrimSpace(trimmed[:end]))
+		} else {
+			blocks = append(blocks, trimmed)
 		}
-	} else if strings.HasPrefix(trimmed, "```json") {
-		rest := trimmed[7:]
-		if endIdx := strings.Index(rest, "```"); endIdx >= 0 {
-			jsonBlock = strings.TrimSpace(rest[:endIdx])
-		}
-	} else if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
-		jsonBlock = trimmed
 	}
-
-	if jsonBlock == "" {
-		return nil, false
-	}
+	blocks = append(blocks, fencedToolCallPayloads(trimmed)...)
 
 	var candidates []toolCallCandidate
-	if err := json.Unmarshal([]byte(jsonBlock), &candidates); err != nil {
+	for _, block := range blocks {
+		if block == "" {
+			continue
+		}
+		var arr []toolCallCandidate
+		if err := json.Unmarshal([]byte(block), &arr); err == nil && hasNamedToolCandidate(arr) {
+			candidates = arr
+			break
+		}
 		var single toolCallCandidate
-		if errSingle := json.Unmarshal([]byte(jsonBlock), &single); errSingle == nil && single.Name != "" {
+		if errSingle := json.Unmarshal([]byte(block), &single); errSingle == nil && strings.TrimSpace(single.Name) != "" {
 			candidates = []toolCallCandidate{single}
-		} else {
-			return nil, false
+			break
 		}
 	}
 
@@ -332,10 +484,7 @@ func extractToolCalls(response string) ([]openAIToolCall, bool) {
 		if strings.TrimSpace(c.Name) == "" {
 			continue
 		}
-		args := string(c.Arguments)
-		if strings.TrimSpace(args) == "" || args == "null" {
-			args = "{}"
-		}
+		args := normalizeArguments(c.Arguments)
 		calls = append(calls, openAIToolCall{
 			Index: i,
 			ID:    fmt.Sprintf("call_%s_%d", newCallID(), i),
@@ -387,9 +536,9 @@ func estimateTokens(text string) int {
 	return (n + 3) / 4
 }
 
-func makeChatCompletion(requestedModel string, result agyResult) ([]byte, error) {
+func makeChatCompletion(requestedModel string, declared []string, result agyResult) ([]byte, error) {
 	model := displayModel(requestedModel)
-	toolCalls, isToolCall := extractToolCalls(result.Response)
+	toolCalls, isToolCall := extractToolCalls(result.Response, len(declared) > 0)
 	if !isToolCall && strings.TrimSpace(result.Response) == "" {
 		return nil, emptyResponseError()
 	}
