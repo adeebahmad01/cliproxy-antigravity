@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -648,6 +649,9 @@ func TestMergeCatalogModelsPrefersPrimary(t *testing.T) {
 // A rate-limited account makes `agy models` fail; the catalog must keep the
 // discovered models, otherwise every agy/* request 400s on an unknown model.
 func TestDiscoverModelsFallsBackToCachedCatalog(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub agy binary is a shell script")
+	}
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "agy")
