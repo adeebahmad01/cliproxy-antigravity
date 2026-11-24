@@ -470,7 +470,7 @@ func lastToolNameSegment(name string) string {
 	if trimmed == "" {
 		return ""
 	}
-	return strings.ToLower(trimmed[strings.LastIndexAny(trimmed, ":/.-")+1:])
+	return strings.ToLower(trimmed[strings.LastIndexAny(trimmed, ":/.")+1:])
 }
 
 // resolveToolName snaps a model-emitted name onto one of the advertised tools.

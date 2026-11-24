@@ -414,7 +414,7 @@ func TestLeadingJSONExampleThenRealToolCallsFence(t *testing.T) {
 }
 
 func TestResolveToolNameIsStrict(t *testing.T) {
-	declared := []string{"read", "bash", "subagent", "codemode", "tools:search"}
+	declared := []string{"read", "bash", "subagent", "codemode", "tools:search", "read-file"}
 	cases := map[string]string{
 		"subagent":      "subagent", // exact
 		"Bash":          "bash",     // case-insensitive
@@ -422,6 +422,9 @@ func TestResolveToolNameIsStrict(t *testing.T) {
 		"agent":         "subagent",
 		"tools:search":  "tools:search",
 		"search":        "tools:search",  // delimiter-safe namespace match
+		"mcp:read-file": "read-file",     // namespace prefix over kebab-case tool name
+		"write-file":    "write-file",    // hyphenated tool names must not match on trailing word
+		"file":          "file",          // bare suffix after hyphen must not snap to read-file
 		"write_file":    "write_file",    // unknown stays untouched
 		"readSomething": "readSomething", // no suffix matching
 	}
