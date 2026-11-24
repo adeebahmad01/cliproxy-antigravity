@@ -221,3 +221,24 @@ func TestMakeChatUsageChunkHasEmptyChoices(t *testing.T) {
 		t.Fatalf("unexpected usage chunk: %s", raw)
 	}
 }
+
+func TestBuildPromptPutsToolInstructionBeforeMessages(t *testing.T) {
+	payload := []byte(`{
+      "model":"agy/default",
+      "messages":[{"role":"user","content":"Hello"}],
+      "tools":[{"type":"function","function":{"name":"bash","description":"Run commands"}}]
+    }`)
+
+	prompt, err := testChatPrompt(t, payload, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolIdx := strings.Index(prompt, "[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]")
+	msgIdx := strings.Index(prompt, "--- message 1")
+	if toolIdx < 0 || msgIdx < 0 {
+		t.Fatalf("prompt is missing the tool instruction or the first message:\n%s", prompt[:200])
+	}
+	if toolIdx > msgIdx {
+		t.Fatalf("tool instruction must precede the conversation so tail truncation cannot drop it")
+	}
+}
