@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The Antigravity accounts page can reuse remembered logins from CPAMC builds that use the `enc::v2::` storage format.
+
 ## [0.4.0] - 2026-11-23
 
 ### Added

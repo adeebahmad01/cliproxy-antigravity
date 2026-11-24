@@ -342,7 +342,7 @@ An **Antigravity CLI** card also appears on the panel's OAuth login page. It run
 
 Behind the scenes the plugin starts the official `agy` sign-in in a new home under `accounts_dir` (default `~/.agy-accounts`) and types the pasted code into it. The tokens are exchanged and stored by `agy` itself; the plugin never sees them. CLIProxyAPI then saves an auth file pointing at the new home. Adding accounts from the panel requires Linux or macOS.
 
-The accounts page opens without a key prompt. Open it from the CLIProxyAPI sidebar to use your existing management-panel login, even with **Remember password** off (requires a panel build with accounts-page session support). Older panels can still load accounts if they have a remembered login on the same origin. Without an authenticated connection, the page shows the routing guide but does not load private account data or allow changes.
+The accounts page opens without a key prompt. A panel build with accounts-page session support can reuse the existing management-panel session even with **Remember password** off. Without that support, the accounts page requires a remembered login on the same origin; it accepts the current CPAMC `enc::v2::` storage format as well as the legacy format. Without an authenticated connection, the page shows the routing guide but does not load private account data or allow changes.
 
 Use **Hide email addresses** before sharing your screen. The page shows numbered accounts and hides auth filenames and home paths, which can also contain email addresses. The preference is kept in your browser; it does not redact the management API or change how accounts are stored.
 
