@@ -1159,6 +1159,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 				pending := streamedText.String()[emittedLen:]
 				emittedLen = streamedText.Len()
 				if err := emit(map[string]any{"content": pending}, nil, nil); err != nil {
+					closePluginStream(streamID, err)
 					killProcessTree(cmd)
 					_ = cmd.Wait()
 					return
@@ -1255,9 +1256,13 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 
 	// If it was buffered thinking it was a tool call but turned out not to be
 	if streamedText.Len() > emittedLen {
-		_ = emit(map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil)
+		if err := emit(map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil); err != nil {
+			closePluginStream(streamID, err)
+			return
+		}
 	} else if streamedText.Len() == 0 && terminal.Response != "" {
 		if err := emit(map[string]any{"content": terminal.Response}, nil, nil); err != nil {
+			closePluginStream(streamID, err)
 			return
 		}
 	}
