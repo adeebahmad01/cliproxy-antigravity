@@ -225,6 +225,10 @@ func TestAgyArgsClaudeOmitsEffort(t *testing.T) {
 }
 
 func TestResolveExecutionOptions(t *testing.T) {
+	useTempModelCache(t)
+	invalidateModels()
+	t.Cleanup(invalidateModels)
+
 	cfg := defaultConfig()
 	cfg.DefaultReasoningEffort = "low"
 
