@@ -412,7 +412,7 @@ func normalizeArguments(raw json.RawMessage) string {
 		var inner string
 		if err := json.Unmarshal(raw, &inner); err == nil {
 			unquoted := strings.TrimSpace(inner)
-			if unquoted == "" {
+			if unquoted == "" || unquoted == "null" {
 				return "{}"
 			}
 			if json.Valid([]byte(unquoted)) {
@@ -421,6 +421,15 @@ func normalizeArguments(raw json.RawMessage) string {
 		}
 	}
 	return trimmed
+}
+
+func hasNamedToolCandidate(candidates []toolCallCandidate) bool {
+	for _, c := range candidates {
+		if strings.TrimSpace(c.Name) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) {
@@ -450,15 +459,16 @@ func extractToolCalls(response string, allowBare bool) ([]openAIToolCall, bool) 
 		if block == "" {
 			continue
 		}
-		if err := json.Unmarshal([]byte(block), &candidates); err == nil {
+		var arr []toolCallCandidate
+		if err := json.Unmarshal([]byte(block), &arr); err == nil && hasNamedToolCandidate(arr) {
+			candidates = arr
 			break
 		}
 		var single toolCallCandidate
-		if errSingle := json.Unmarshal([]byte(block), &single); errSingle == nil && single.Name != "" {
+		if errSingle := json.Unmarshal([]byte(block), &single); errSingle == nil && strings.TrimSpace(single.Name) != "" {
 			candidates = []toolCallCandidate{single}
 			break
 		}
-		candidates = nil
 	}
 
 	if len(candidates) == 0 {

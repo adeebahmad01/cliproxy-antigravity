@@ -299,6 +299,9 @@ func TestNormalizeArgumentsKeepsPlainObject(t *testing.T) {
 	if got := normalizeArguments(json.RawMessage(`"not json"`)); got != `"not json"` {
 		t.Fatalf("non-JSON string should be left alone, got %q", got)
 	}
+	if got := normalizeArguments(json.RawMessage(`"null"`)); got != "{}" {
+		t.Fatalf("quoted null arguments = %q, want {}", got)
+	}
 }
 
 func TestDeclaredToolNames(t *testing.T) {
@@ -368,11 +371,18 @@ func TestBarePayloadWithFenceMarkerInArguments(t *testing.T) {
 	}
 }
 
-// The fenced fallback still works when a bare candidate does not decode.
+// The fenced fallback still works when a bare candidate does not decode or carries no calls.
 func TestBareCandidateFailureFallsBackToFence(t *testing.T) {
-	response := "[not json]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```"
-	calls, ok := extractToolCalls(response, true)
-	if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
-		t.Fatalf("fenced fallback lost after a bad bare candidate: ok=%v calls=%v", ok, calls)
+	cases := []string{
+		"[not json]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+		"[]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+		"[{}]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+		"[{\"name\":\"   \"}]\n\n```tool_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}]\n```",
+	}
+	for _, response := range cases {
+		calls, ok := extractToolCalls(response, true)
+		if !ok || len(calls) != 1 || calls[0].Function.Name != "bash" {
+			t.Fatalf("fenced fallback lost for %q: ok=%v calls=%v", response, ok, calls)
+		}
 	}
 }
