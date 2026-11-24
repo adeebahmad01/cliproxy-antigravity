@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -478,5 +480,153 @@ func TestToolInstructionPinsExactNames(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "never a paraphrase") || !strings.Contains(prompt, "subagent, bash") {
 		t.Fatalf("tool instruction does not pin exact names:\n%s", prompt[:400])
+	}
+}
+
+func stagedRequest(t *testing.T, promptBytes int) rpcExecutorRequest {
+	t.Helper()
+	blob := strings.Repeat("x", promptBytes)
+	payload := []byte(`{"model":"agy/default","messages":[{"role":"user","content":"` + blob + `"}]}`)
+	req := rpcExecutorRequest{Model: "agy/default", Payload: payload}
+	return req
+}
+
+func TestPrepareAgyExecutionStagesOnlyWhenConfigured(t *testing.T) {
+	setConfig(pluginConfig{BinaryPath: "agy", MaxPromptBytes: 200000})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	// Under the threshold: inline prompt, nothing staged, nothing to clean up.
+	run, err := prepareAgyExecution(stagedRequest(t, 1000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.stagedBytes != 0 || run.cleanup != nil {
+		t.Fatalf("small request was staged: %+v", run.stagedBytes)
+	}
+
+	// Over the threshold: staged, handoff prompt names the file, cleanup removes it.
+	run, err = prepareAgyExecution(stagedRequest(t, 220000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.stagedBytes <= 200000 {
+		t.Fatalf("stagedBytes = %d, want the full prompt size", run.stagedBytes)
+	}
+	if len(run.prompt) > 4096 {
+		t.Fatalf("handoff prompt is %d bytes, expected the short wrapper", len(run.prompt))
+	}
+	path := filepath.Join(promptStagingDir(), stagedFileName(t, run.prompt))
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("staged file missing: %v", err)
+	}
+	run.cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("staged file not removed: %v", err)
+	}
+}
+
+func stagedFileName(t *testing.T, handoff string) string {
+	t.Helper()
+	start := strings.Index(handoff, promptStagingDir())
+	if start < 0 {
+		t.Fatalf("handoff does not reference the staging dir: %s", handoff)
+	}
+	rest := handoff[start:]
+	end := strings.IndexAny(rest, " \n")
+	if end < 0 {
+		end = len(rest)
+	}
+	return filepath.Base(rest[:end])
+}
+
+// Staging is off by default: no threshold, no file, whatever the size.
+func TestPrepareAgyExecutionDoesNotStageByDefault(t *testing.T) {
+	setConfig(defaultConfig())
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+	run, err := prepareAgyExecution(stagedRequest(t, 220000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.stagedBytes != 0 || run.cleanup != nil {
+		t.Fatalf("default config staged a request: %+v", run.stagedBytes)
+	}
+}
+
+// The staged copy keeps the tool contract at the top (PR #26 ordering) and the
+// preamble permits reading exactly the one staged file.
+func TestStagedPromptKeepsContractAndReadPolicy(t *testing.T) {
+	payload := []byte(`{"model":"agy/default","messages":[{"role":"user","content":"hi"}],
+      "tools":[{"type":"function","function":{"name":"bash","description":"run"}}]}`)
+	req, err := decodeChatRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := buildChatPromptFor(req, "", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(staged, bridgeReadPolicyStaged) {
+		t.Fatal("staged prompt does not use the staged read policy")
+	}
+	if strings.Contains(staged, bridgeReadPolicy) {
+		t.Fatal("staged prompt still carries the no-read policy")
+	}
+	toolIdx := strings.Index(staged, "[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]")
+	msgIdx := strings.Index(staged, "--- message 1")
+	if toolIdx < 0 || msgIdx < 0 || toolIdx > msgIdx {
+		t.Fatalf("tool contract must lead the staged file (%d vs %d)", toolIdx, msgIdx)
+	}
+	if !strings.Contains(string(mustHandoff(t)), "Do not read any other file") {
+		t.Fatal("handoff does not forbid reading other files")
+	}
+}
+
+func mustHandoff(t *testing.T) string {
+	t.Helper()
+	return fileHandoffPrompt(filepath.Join(promptStagingDir(), "prompt_x.txt"), 1234)
+}
+
+// count_tokens must reflect the conversation, not the short handoff.
+func TestPromptForTokenCountUsesFullPromptWhenStaged(t *testing.T) {
+	setConfig(pluginConfig{BinaryPath: "agy", MaxPromptBytes: 200000})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+	req := stagedRequest(t, 220000)
+	run, err := prepareAgyExecution(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.cleanup != nil {
+		defer run.cleanup()
+	}
+	full := promptForTokenCount(req, run)
+	if len(full) <= len(run.prompt) {
+		t.Fatalf("token count prompt = %d bytes, want the full conversation (%d)", len(full), len(run.prompt))
+	}
+	if estimateTokens(full) <= estimateTokens(run.prompt) {
+		t.Fatal("estimated tokens were computed from the handoff")
+	}
+}
+
+// A staged file must be removed when agy fails as well, not only on success.
+func TestStagedPromptRemovedOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a shell script")
+	}
+	setConfig(pluginConfig{BinaryPath: bin, MaxPromptBytes: 4096})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	before, _ := os.ReadDir(promptStagingDir())
+	req := stagedRequest(t, 8000)
+	if _, err := executeNonStream(req); err == nil {
+		t.Fatal("expected the stubbed agy failure to surface")
+	}
+	after, _ := os.ReadDir(promptStagingDir())
+	if len(after) > len(before) {
+		t.Fatalf("staged file leaked after a failed turn: before=%d after=%d", len(before), len(after))
 	}
 }

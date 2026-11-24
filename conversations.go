@@ -17,6 +17,8 @@ import (
 const (
 	conversationPrefix = "agy.v1."
 	conversationHeader = "X-AGY-Conversation-ID"
+	// promptStagedHeader carries the staged prompt size on translated routes.
+	promptStagedHeader = "X-AGY-Prompt-Staged"
 	handoffHeader      = "X-AGY-Continue-On-Another-Account"
 	sessionHomeAttr    = "agy_session_home"
 )

@@ -342,6 +342,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			}
 		}
 		mergeHeaders(headers, limitHeaders(run.cfg, run.opts.NativeModel))
+		// Observable, not silent: the turn was staged to a file agy reads in full.
+		if run.stagedBytes > 0 {
+			headers.Set(promptStagedHeader, fmt.Sprintf("%d", run.stagedBytes))
+		}
 		return okEnvelope(executorStreamResponse{Headers: headers})
 
 	case methodExecutorCountTokens:
@@ -353,7 +357,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		estimated := estimateTokens(run.prompt)
+		// Token counting must reflect the conversation, not the short handoff that
+		// replaced an oversized prompt.
+		estimated := estimateTokens(promptForTokenCount(req, run))
 		payload, _ := json.Marshal(map[string]int{"total_tokens": estimated})
 		return okEnvelope(executorResponse{Payload: payload, Headers: http.Header{"Content-Type": []string{"application/json"}}})
 
@@ -493,6 +499,7 @@ func pluginRegistration() registration {
 				{Name: "limits_tracking", Type: "boolean", Default: defaults.LimitsTracking, Description: "Track Antigravity usage limits via agy /usage (default: true)."},
 				{Name: "limits_refresh_interval", Type: "string", Default: defaults.LimitsRefreshInterval, Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
 				{Name: "enforce_limits", Type: "boolean", Default: defaults.EnforceLimits, Description: "Reject requests with HTTP 429 when the quota group of the model is exhausted, without launching agy (default: false)."},
+				{Name: "max_prompt_bytes", Type: "integer", Default: defaults.MaxPromptBytes, Description: "Stage requests larger than this many bytes to a private temp file that agy reads in full, instead of letting agy truncate the prompt tail. Disabled by default; the truncation cap is agy-version dependent, so ~150000 is a conservative starting point."},
 				{Name: "accounts_dir", Type: "string", Default: defaults.AccountsDir, Description: "Directory with one agy home per account. Accounts added from the panel are created here (default ~/.agy-accounts), and every signed-in home in it gets its own CLIProxyAPI auth file. CLIProxyAPI rotates between the accounts."},
 			},
 		},
@@ -525,4 +532,25 @@ func okEnvelope(v any) ([]byte, error) {
 func mustErrorEnvelope(pe *pluginError) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: pe.envelopeError()})
 	return raw
+}
+
+// promptForTokenCount returns the prompt a staged turn actually represents: the
+// full conversation, not the short handoff that replaced it.
+func promptForTokenCount(req rpcExecutorRequest, run agyExecution) string {
+	if run.stagedBytes == 0 {
+		return run.prompt
+	}
+	var chatReq chatCompletionRequest
+	if err := json.Unmarshal(req.Payload, &chatReq); err != nil {
+		return run.prompt
+	}
+	nativeID, _, err := resolveConversation(run.opts.ConversationID, req.Headers, run.session)
+	if err != nil {
+		return run.prompt
+	}
+	full, err := buildChatPrompt(chatReq, nativeID, run.cfg.Workdir)
+	if err != nil {
+		return run.prompt
+	}
+	return full
 }
