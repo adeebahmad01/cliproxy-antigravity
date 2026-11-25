@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-25
+
 ### Changed
 
 - Enabled `max_prompt_bytes` (`150000` bytes, `max_prompt_action: stage`; set `max_prompt_bytes: 0` to disable) and `stream_keepalive_interval` (`15s`; set `0s` to disable) by default so large tool-heavy clients like Claude CLI do not hit silent `agy` inline prompt tail truncation out of the box.
