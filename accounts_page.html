@@ -506,15 +506,19 @@
   }
 
   async function copyLoginUrl() {
+    const attempt = login;
     const value = $('loginUrlInput').value;
-    if (!value) return;
+    if (!attempt || !value) return;
     let copied = false;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
+        if (login !== attempt) return;
         copied = true;
       }
-    } catch (_) {}
+    } catch (_) {
+      if (login !== attempt) return;
+    }
     if (!copied) {
       try {
         $('loginUrlInput').focus();

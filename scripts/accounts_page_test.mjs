@@ -132,3 +132,92 @@ test('shows and copies the raw sign-in URL and clears it on cancel', async () =>
   assert.equal(getElementById('loginUrlRow').classList.contains('hidden'), true);
   assert.equal(getElementById('copyLoginUrlBtn').textContent, 'Copy URL');
 });
+
+test('ignores stale copy completion after cancel and restart', async () => {
+  const urls = [
+    'https://accounts.google.com/o/oauth2/v2/auth?client_id=test&state=first',
+    'https://accounts.google.com/o/oauth2/v2/auth?client_id=test&state=second',
+  ];
+  let loginCall = 0;
+  let resolveCopy;
+  let execCommandCalls = 0;
+  const elements = new Map();
+  const makeEl = (id = '') => {
+    const classes = new Set();
+    const listeners = new Map();
+    return {
+      id,
+      value: '',
+      href: '',
+      textContent: '',
+      disabled: false,
+      checked: false,
+      open: false,
+      className: '',
+      classList: {
+        add: (...names) => names.forEach((n) => classes.add(n)),
+        remove: (...names) => names.forEach((n) => classes.delete(n)),
+        toggle: (name, force) => (force === undefined ? (classes.has(name) ? classes.delete(name) : classes.add(name)) : (force ? classes.add(name) : classes.delete(name))),
+        contains: (name) => classes.has(name),
+      },
+      addEventListener: (type, fn) => {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+      },
+      dispatch: async (type, ev = { preventDefault() {} }) => {
+        for (const fn of listeners.get(type) || []) await fn(ev);
+      },
+      removeAttribute(attr) { if (attr === 'href') this.href = ''; },
+      setAttribute() {},
+      replaceChildren() {},
+      append() {},
+      focus() {},
+      select() {},
+      close() {},
+    };
+  };
+  const getElementById = (id) => {
+    if (!elements.has(id)) elements.set(id, makeEl(id));
+    return elements.get(id);
+  };
+  const window = {};
+  window.parent = window;
+  runInNewContext(script, {
+    window, TextEncoder, TextDecoder, atob, URL, setTimeout, clearTimeout,
+    document: {
+      getElementById,
+      createElement: () => makeEl(),
+      createTextNode: (text) => text,
+      execCommand: () => { execCommandCalls += 1; return true; },
+    },
+    location: { host, origin },
+    navigator: {
+      userAgent,
+      clipboard: { writeText: () => new Promise((resolve) => { resolveCopy = resolve; }) },
+    },
+    localStorage: { getItem: (key) => (key === 'cli-proxy-auth' ? rememberedLogin(2, origin) : null) },
+    fetch: async (url) => {
+      if (url === '/v0/management/agy/accounts') return { ok: true, json: async () => ({ accounts: [] }) };
+      if (url === '/v8/management/oauth/auth-url?provider=agy') {
+        const nextUrl = urls[loginCall];
+        loginCall += 1;
+        return { ok: true, json: async () => ({ url: nextUrl, state: `st-${loginCall}` }) };
+      }
+      if (url.startsWith('/v8/management/oauth/session?state=')) return { ok: true, json: async () => ({ ok: true }) };
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  await new Promise(setImmediate);
+
+  await getElementById('addBtn').dispatch('click');
+  const pendingCopy = getElementById('copyLoginUrlBtn').dispatch('click');
+  await getElementById('cancelBtn').dispatch('click');
+  await getElementById('addBtn').dispatch('click');
+  assert.equal(getElementById('loginUrlInput').value, urls[1]);
+  assert.equal(getElementById('copyLoginUrlBtn').textContent, 'Copy URL');
+
+  resolveCopy();
+  await pendingCopy;
+  assert.equal(getElementById('copyLoginUrlBtn').textContent, 'Copy URL');
+  assert.equal(execCommandCalls, 0);
+});
