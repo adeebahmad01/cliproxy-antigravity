@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-26
+
+### Fixed
+
+- Omitted `--effort` for `gemini-pro-orchestrator*` models (`gemini-pro-orchestrator`, `gemini-pro-orchestrator-argon`, `gemini-pro-orchestrator-neon`) in `supportsEffort`, preventing `agy` 400 errors on every orchestrator request (#44).
+
 ## [0.7.0] - 2026-11-26
 
 ### Changed
