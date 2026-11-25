@@ -22,14 +22,15 @@
          font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   h1 { font-size: 20px; margin: 0 0 4px; }
   p.lead { margin: 0 0 20px; color: var(--muted); }
-  button { font: inherit; border: 1px solid var(--border); background: var(--card); color: var(--fg);
-           border-radius: 6px; padding: 6px 12px; cursor: pointer; }
-  button:hover { border-color: var(--muted); }
+  button, a.btn { font: inherit; border: 1px solid var(--border); background: var(--card); color: var(--fg);
+                  border-radius: 6px; padding: 6px 12px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+  button:hover, a.btn:hover { border-color: var(--muted); }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
   button.danger { color: var(--danger); }
   button:disabled { opacity: .5; cursor: default; }
   input[type="text"] { font: inherit; min-width: 0; flex: 1; padding: 7px 10px; border: 1px solid var(--border);
                        border-radius: 6px; background: var(--bg); color: var(--fg); }
+  input[readonly].url-input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
   .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
   .privacy { display: inline-flex; gap: 6px; align-items: center; margin-inline-start: auto; }
   .summary { color: var(--muted); margin: 0 0 12px; }
@@ -87,7 +88,14 @@
   <div id="addPanel" class="panel hidden">
     <h2>Add an Antigravity account</h2>
     <ol>
-      <li><a id="loginLink" href="#" target="_blank" rel="noopener noreferrer">Open Google sign-in</a> and sign in with the account you want to add.</li>
+      <li>
+        <div>Open the Google sign-in URL below (or copy it to open in another browser profile) and sign in with the account you want to add.</div>
+        <div id="loginUrlRow" class="row hidden" style="margin-top:8px">
+          <input id="loginUrlInput" class="url-input" type="text" readonly aria-label="Google sign-in URL" spellcheck="false">
+          <button id="copyLoginUrlBtn" type="button">Copy URL</button>
+          <a id="loginLink" class="btn" href="#" target="_blank" rel="noopener noreferrer">Open Google sign-in</a>
+        </div>
+      </li>
       <li>Google then shows an authorization code. Copy it and paste it here.</li>
     </ol>
     <form id="codeForm" class="row">
@@ -129,6 +137,7 @@
     ? new URLSearchParams(location.hash.slice(1)).get('agy-panel')
     : null;
   let login = null;
+  let copyTimer = null;
   let report = null;
   let message = null;
   let pendingRemoval = null;
@@ -415,7 +424,9 @@
     render();
     $('addStatus').textContent = 'Starting agy sign-in…';
     $('addPanel').classList.remove('hidden');
-    $('loginLink').classList.add('hidden');
+    $('loginUrlRow').classList.add('hidden');
+    $('loginUrlInput').value = '';
+    $('copyLoginUrlBtn').textContent = 'Copy URL';
     $('codeInput').disabled = $('codeBtn').disabled = true;
     try {
       const data = await request('start-login');
@@ -425,10 +436,11 @@
       const url = new URL(data.url);
       if (url.protocol !== 'https:') throw new Error('The sign-in link must use HTTPS.');
       $('loginLink').href = url.href;
-      $('loginLink').classList.remove('hidden');
+      $('loginUrlInput').value = url.href;
+      $('loginUrlRow').classList.remove('hidden');
       $('addStatus').textContent = 'Waiting for you to sign in.';
       $('codeInput').disabled = $('codeBtn').disabled = false;
-      $('loginLink').focus();
+      $('copyLoginUrlBtn').focus();
     } catch (error) {
       if (login !== attempt) return;
       endLogin();
@@ -482,11 +494,50 @@
 
   function endLogin() {
     if (login?.timer) clearTimeout(login.timer);
+    if (copyTimer) { clearTimeout(copyTimer); copyTimer = null; }
     login = null;
     $('addPanel').classList.add('hidden');
+    $('loginUrlRow').classList.add('hidden');
+    $('loginUrlInput').value = '';
+    $('copyLoginUrlBtn').textContent = 'Copy URL';
     $('codeInput').value = '';
     $('loginLink').removeAttribute('href');
     render();
+  }
+
+  async function copyLoginUrl() {
+    const attempt = login;
+    const value = $('loginUrlInput').value;
+    if (!attempt || !value) return;
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        if (login !== attempt) return;
+        copied = true;
+      }
+    } catch (_) {
+      if (login !== attempt) return;
+    }
+    if (!copied) {
+      try {
+        $('loginUrlInput').focus();
+        $('loginUrlInput').select();
+        copied = document.execCommand('copy');
+      } catch (_) {}
+    }
+    if (copied) {
+      $('copyLoginUrlBtn').textContent = 'Copied';
+      if (copyTimer) clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => {
+        copyTimer = null;
+        $('copyLoginUrlBtn').textContent = 'Copy URL';
+      }, 2000);
+    } else {
+      $('loginUrlInput').focus();
+      $('loginUrlInput').select();
+      showMessage('Could not copy automatically. Press Ctrl+C / Cmd+C to copy the selected URL.', 'error');
+    }
   }
 
   async function cancelSession(state) {
@@ -502,6 +553,8 @@
     render();
   });
   $('addBtn').addEventListener('click', startLogin);
+  $('copyLoginUrlBtn').addEventListener('click', copyLoginUrl);
+  $('loginUrlInput').addEventListener('click', () => $('loginUrlInput').select());
   $('refreshBtn').addEventListener('click', () => { showMessage(''); void load(true); });
   $('codeForm').addEventListener('submit', submitCode);
   $('removeDialog').addEventListener('close', confirmRemoval);

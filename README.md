@@ -342,7 +342,7 @@ agy keeps its login, settings and conversations in `$HOME/.gemini/antigravity-cl
 
 The plugin adds an **Antigravity accounts** entry to the management panel's sidebar. It lists every account with its usage limits and lets you add, disable and remove accounts:
 
-1. Click **Add account**, then **Open Google sign-in**, and sign in with the account to add.
+1. Click **Add account**, then copy the Google sign-in URL (for example to open it in another browser profile) or click **Open Google sign-in**, and sign in with the account to add.
 2. Google then shows an authorization code. Copy it and paste it into the panel.
 
 An **Antigravity CLI** card also appears on the panel's OAuth login page. It runs the same flow, but the panel's callback box there expects the full `antigravity.google/oauth-callback` URL rather than just the code, so the sidebar page is the easier way.
