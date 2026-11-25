@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -478,5 +480,256 @@ func TestToolInstructionPinsExactNames(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "never a paraphrase") || !strings.Contains(prompt, "subagent, bash") {
 		t.Fatalf("tool instruction does not pin exact names:\n%s", prompt[:400])
+	}
+}
+
+func stagedRequest(t *testing.T, promptBytes int) rpcExecutorRequest {
+	t.Helper()
+	blob := strings.Repeat("x", promptBytes)
+	payload := []byte(`{"model":"agy/default","messages":[{"role":"user","content":"` + blob + `"}]}`)
+	req := rpcExecutorRequest{Model: "agy/default", Payload: payload}
+	return req
+}
+
+func TestPrepareAgyExecutionStagesOnlyWhenConfigured(t *testing.T) {
+	useTempStagingDir(t)
+	setConfig(pluginConfig{BinaryPath: "agy", MaxPromptBytes: 200000})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	// Under the threshold: inline prompt, nothing staged, nothing to clean up.
+	run, err := prepareAgyExecution(stagedRequest(t, 1000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.stagedBytes != 0 || run.cleanup != nil {
+		t.Fatalf("small request was staged: %d", run.stagedBytes)
+	}
+
+	// Over the threshold: staged, handoff prompt names the file, cleanup removes it.
+	run, err = prepareAgyExecution(stagedRequest(t, 220000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.stagedBytes <= 200000 {
+		t.Fatalf("stagedBytes = %d, want the full prompt size", run.stagedBytes)
+	}
+	if len(run.prompt) > 4096 {
+		t.Fatalf("handoff prompt is %d bytes, expected the short wrapper", len(run.prompt))
+	}
+	path := stagedPathFromHandoff(t, run.prompt)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("staged file missing: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("staged file mode = %04o, want 0600", perm)
+	}
+	if run.stagedBytes != int(info.Size()) {
+		t.Fatalf("stagedBytes = %d, file size = %d", run.stagedBytes, info.Size())
+	}
+	run.cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("staged file not removed: %v", err)
+	}
+	if entries, _ := os.ReadDir(promptStagingDir()); len(entries) != 0 {
+		t.Fatalf("staging root not empty after cleanup: %v", entries)
+	}
+}
+
+// useTempStagingDir isolates the shared staging root for a test.
+func useTempStagingDir(t *testing.T) {
+	t.Helper()
+	previous := stagingDirOverride
+	dir := filepath.Join(t.TempDir(), "cliproxy-prompts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stagingDirOverride = dir
+	t.Cleanup(func() { stagingDirOverride = previous })
+}
+
+func stagedPathFromHandoff(t *testing.T, handoff string) string {
+	t.Helper()
+	start := strings.Index(handoff, promptStagingDir())
+	if start < 0 {
+		t.Fatalf("handoff does not reference the staging dir: %s", handoff)
+	}
+	rest := handoff[start:]
+	end := strings.IndexAny(rest, " \n")
+	if end < 0 {
+		end = len(rest)
+	}
+	return rest[:end]
+}
+
+// Staging is off by default: no threshold, no file, whatever the size.
+func TestPrepareAgyExecutionDoesNotStageByDefault(t *testing.T) {
+	setConfig(defaultConfig())
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+	run, err := prepareAgyExecution(stagedRequest(t, 220000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.stagedBytes != 0 || run.cleanup != nil {
+		t.Fatalf("default config staged a request: %+v", run.stagedBytes)
+	}
+}
+
+// The staged copy keeps the tool contract at the top (PR #26 ordering) and the
+// preamble permits reading exactly the one staged file.
+func TestStagedPromptKeepsContractAndReadPolicy(t *testing.T) {
+	payload := []byte(`{"model":"agy/default","messages":[{"role":"user","content":"hi"}],
+      "tools":[{"type":"function","function":{"name":"bash","description":"run"}}]}`)
+	req, err := decodeChatRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := buildChatPromptFor(req, "", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(staged, bridgeReadPolicyStaged) {
+		t.Fatal("staged prompt does not use the staged read policy")
+	}
+	if strings.Contains(staged, bridgeReadPolicy) {
+		t.Fatal("staged prompt still carries the no-read policy")
+	}
+	toolIdx := strings.Index(staged, "[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]")
+	msgIdx := strings.Index(staged, "--- message 1")
+	if toolIdx < 0 || msgIdx < 0 || toolIdx > msgIdx {
+		t.Fatalf("tool contract must lead the staged file (%d vs %d)", toolIdx, msgIdx)
+	}
+	if !strings.Contains(string(mustHandoff(t)), "Do not read any other file") {
+		t.Fatal("handoff does not forbid reading other files")
+	}
+}
+
+func mustHandoff(t *testing.T) string {
+	t.Helper()
+	return fileHandoffPrompt(filepath.Join(promptStagingDir(), "prompt_x.txt"), 1234)
+}
+
+// count_tokens must reflect the conversation, not the short handoff.
+func TestPromptForTokenCountUsesFullPromptWhenStaged(t *testing.T) {
+	setConfig(pluginConfig{BinaryPath: "agy", MaxPromptBytes: 200000})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+	req := stagedRequest(t, 220000)
+	run, err := prepareAgyExecution(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.cleanup != nil {
+		defer run.cleanup()
+	}
+	full := promptForTokenCount(req, run)
+	if len(full) <= len(run.prompt) {
+		t.Fatalf("token count prompt = %d bytes, want the full conversation (%d)", len(full), len(run.prompt))
+	}
+	if estimateTokens(full) <= estimateTokens(run.prompt) {
+		t.Fatal("estimated tokens were computed from the handoff")
+	}
+}
+
+// A staged file must be removed when agy fails as well, not only on success.
+func TestStagedPromptRemovedOnFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a shell script")
+	}
+	useTempStagingDir(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	// Record that it was invoked, then fail: the staged file must still be removed.
+	marker := filepath.Join(dir, "invoked")
+	script := "#!/bin/sh\ncat >/dev/null 2>&1\ntouch " + marker + "\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setConfig(pluginConfig{BinaryPath: bin, MaxPromptBytes: 4096})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	req := stagedRequest(t, 8000)
+	// Prove staging happens for this request before the turn runs.
+	prepared, err := prepareAgyExecution(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.stagedBytes == 0 {
+		t.Fatal("request was not staged, so this test would not exercise cleanup")
+	}
+	prepared.cleanup()
+
+	if _, err := executeNonStream(req); err == nil {
+		t.Fatal("expected the stubbed agy failure to surface")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("stub agy was not invoked: %v", err)
+	}
+	if entries, _ := os.ReadDir(promptStagingDir()); len(entries) != 0 {
+		t.Fatalf("staged file leaked after a failed turn: %v", entries)
+	}
+}
+
+// A staging root another local user could control must be refused.
+func TestEnsurePrivateStagingDirRejectsLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows reports 0777 for every writable directory")
+	}
+	previous := stagingDirOverride
+	base := t.TempDir()
+	dir := filepath.Join(base, "cliproxy-prompts")
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	stagingDirOverride = dir
+	t.Cleanup(func() { stagingDirOverride = previous })
+
+	if _, err := ensurePrivateStagingDir(); err == nil {
+		t.Fatal("expected a 0777 staging directory to be rejected")
+	}
+	if _, err := writePromptFile("payload"); err == nil {
+		t.Fatal("expected staging into a world-writable directory to fail")
+	}
+}
+
+// Each staged prompt lives in its own directory, so its name is not predictable.
+func TestWritePromptFileIsolatesEachTurn(t *testing.T) {
+	useTempStagingDir(t)
+	first, err := writePromptFile("same payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := writePromptFile("same payload")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(first) == filepath.Dir(second) {
+		t.Fatalf("two turns share a staging directory: %s", filepath.Dir(first))
+	}
+	if !strings.HasPrefix(filepath.Base(filepath.Dir(first)), "turn-") {
+		t.Fatalf("staging directory is not per-turn: %s", filepath.Dir(first))
+	}
+	removeStagedPrompt(first)
+	removeStagedPrompt(second)
+	if entries, _ := os.ReadDir(promptStagingDir()); len(entries) != 0 {
+		t.Fatalf("staging root not empty: %v", entries)
+	}
+}
+
+func TestIsPathUnder(t *testing.T) {
+	base := filepath.Join(string(filepath.Separator), "home", "user")
+	cases := map[string]bool{
+		filepath.Join(base, "cliproxy-prompts"): true,
+		base:                                    true,
+		filepath.Join(base, "cliproxy-prompts", "x"):                         true,
+		filepath.Join(string(filepath.Separator), "tmp", "cliproxy-prompts"): false,
+		filepath.Join(string(filepath.Separator), "home", "user2"):           false,
+	}
+	for path, want := range cases {
+		if got := isPathUnder(path, base); got != want {
+			t.Fatalf("isPathUnder(%q, %q) = %v, want %v", path, base, got, want)
+		}
 	}
 }

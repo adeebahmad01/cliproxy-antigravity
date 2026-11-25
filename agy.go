@@ -1127,6 +1127,11 @@ type agyExecution struct {
 	opts    agyOptions
 	prompt  string
 	session conversationRef
+	// stagedBytes is non-zero when the request was staged to a temp file.
+	stagedBytes int
+	// cleanup removes the staged file; it runs after agy exits, on cancel, and on
+	// the process-kill paths.
+	cleanup func()
 }
 
 func prepareAgyExecution(req rpcExecutorRequest) (agyExecution, error) {
@@ -1155,7 +1160,22 @@ func prepareAgyExecution(req rpcExecutorRequest) (agyExecution, error) {
 	if err != nil {
 		return agyExecution{}, err
 	}
-	return agyExecution{cfg: cfg, opts: opts, prompt: prompt, session: session}, nil
+	run := agyExecution{cfg: cfg, opts: opts, prompt: prompt, session: session}
+	// Staging is opt-in: only a configured threshold changes the forwarded payload.
+	if cfg.MaxPromptBytes > 0 && len(prompt) > cfg.MaxPromptBytes {
+		staged, buildErr := buildChatPromptFor(chatReq, nativeID, cfg.Workdir, true)
+		if buildErr != nil {
+			return agyExecution{}, buildErr
+		}
+		path, writeErr := writePromptFile(staged)
+		if writeErr != nil {
+			return agyExecution{}, pError("prompt_staging_failed", "failed to stage the oversized prompt: "+writeErr.Error(), http.StatusInternalServerError)
+		}
+		run.prompt = fileHandoffPrompt(path, len(staged))
+		run.stagedBytes = len(staged)
+		run.cleanup = func() { removeStagedPrompt(path) }
+	}
+	return run, nil
 }
 
 func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
@@ -1165,9 +1185,15 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	}
 	cfg, opts := run.cfg, run.opts
 	if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
+		if run.cleanup != nil {
+			run.cleanup()
+		}
 		return executorResponse{}, err
 	}
 	result, _, err := runAgyJSON(cfg, opts, run.prompt)
+	if run.cleanup != nil {
+		run.cleanup()
+	}
 	if err != nil {
 		return executorResponse{}, err
 	}
@@ -1183,17 +1209,25 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 		headers.Set(conversationHeader, result.ConversationID)
 	}
 	mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
+	metadata := map[string]any{
+		"agy_conversation_id": result.ConversationID,
+		"agy_status":          result.Status,
+	}
+	// Observable, not silent: clients can see that the turn was staged.
+	if run.stagedBytes > 0 {
+		metadata["agy_prompt_staged_bytes"] = run.stagedBytes
+	}
 	return executorResponse{
-		Payload: payload,
-		Headers: headers,
-		Metadata: map[string]any{
-			"agy_conversation_id": result.ConversationID,
-			"agy_status":          result.Status,
-		},
+		Payload:  payload,
+		Headers:  headers,
+		Metadata: metadata,
 	}, nil
 }
 
 func executeStream(req rpcExecutorRequest, run agyExecution) {
+	if run.cleanup != nil {
+		defer run.cleanup()
+	}
 	streamID := req.StreamID
 	cfg, opts := run.cfg, run.opts
 

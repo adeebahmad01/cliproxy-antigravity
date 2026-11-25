@@ -24,6 +24,10 @@ type pluginConfig struct {
 	LimitsRefreshInterval      string
 	EnforceLimits              bool
 	AccountsDir                string
+	// MaxPromptBytes, when > 0, stages requests larger than this to a private
+	// temp file that agy reads in full. Disabled by default: the cap it works
+	// around is agy-version dependent, so no number is assumed.
+	MaxPromptBytes int
 	// AccountHome is the HOME given to agy for the account selected by CLIProxyAPI.
 	// It comes from the "home" field of the agy auth file, never from the plugin YAML.
 	AccountHome string
@@ -343,6 +347,12 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return pluginConfig{}, fmt.Errorf("line %d: enforce_limits must be true or false", lineNo+1)
 			}
 			cfg.EnforceLimits = parsed
+		case "max_prompt_bytes":
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 16*1024 {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid max_prompt_bytes %q: must be an integer >= 16384", lineNo+1, value)
+			}
+			cfg.MaxPromptBytes = parsed
 		case "accounts_dir":
 			cleaned, err := validateWorkdir(value)
 			if err != nil {

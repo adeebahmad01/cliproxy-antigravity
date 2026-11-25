@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `max_prompt_bytes`: opt-in staging for requests larger than the inline prompt that `agy` accepts. `agy` truncates that prompt from the tail, which drops the newest user turn on long conversations; above the threshold the full prompt is written to `os.TempDir()/cliproxy-prompts/<random>` (`0600`, outside `workdir`) and `agy` is asked to read exactly that one file. Disabled by default — the truncation cap is agy-version dependent, so no threshold is assumed (~150000 is a conservative starting point).
+- Staged turns are observable rather than silent: non-streaming responses carry `agy_prompt_staged_bytes` in metadata, streaming responses carry `X-AGY-Prompt-Staged`.
+- The staged copy keeps the client-tools contract at the top, `count_tokens` still estimates the full prompt, and the file is removed after `agy` exits, on error, and on the cancel/kill paths (leftovers swept after an hour).
+- The staging root is validated as user-private: `0700` and owned by the current user on Unix, inside `%LOCALAPPDATA%`/the user profile on Windows (Go cannot inspect Windows ACLs from the stdlib, so a `TEMP`/`TMP` redirected to a shared directory makes staging refuse rather than leak).
+
 ## [0.5.1] - 2026-11-25
 
 ### Fixed
