@@ -40,19 +40,30 @@ func acquireMediaRefLocked(path string) {
 	activeMediaRef[path]++
 }
 
+func releaseOneMediaRefLocked(path string) {
+	if activeMediaRef[path] <= 1 {
+		delete(activeMediaRef, path)
+	} else {
+		activeMediaRef[path]--
+	}
+}
+
 func releaseMediaRefs(paths []string) {
 	if len(paths) == 0 {
 		return
 	}
 	mediaCacheMu.Lock()
 	for _, path := range paths {
-		if activeMediaRef[path] <= 1 {
-			delete(activeMediaRef, path)
-		} else {
-			activeMediaRef[path]--
-		}
+		releaseOneMediaRefLocked(path)
 	}
 	mediaCacheMu.Unlock()
+}
+
+func releaseAndClearAttachments(attachments *[]acpPromptBlock) {
+	if attachments != nil && len(*attachments) > 0 {
+		releaseMediaRefs(mediaPathsFromBlocks(*attachments))
+		*attachments = nil
+	}
 }
 
 func mediaPathsFromBlocks(blocks []acpPromptBlock) []string {
@@ -114,6 +125,9 @@ func acpMediaBlock(block map[string]any, workdir string, requestKeep map[string]
 		ref := nestedString(block, "video_url", "url")
 		if ref == "" {
 			ref, _ = block["url"].(string)
+		}
+		if ref == "" {
+			ref, _ = block["video_url"].(string)
 		}
 		if data, mimeType, err = decodeMediaRef(ref, "video/mp4"); err != nil {
 			return nil, "", err
@@ -181,7 +195,7 @@ func decodeMediaRef(ref, fallbackType string) ([]byte, string, error) {
 	default:
 		data, err := base64.StdEncoding.DecodeString(ref)
 		if err != nil {
-			return nil, "", fmt.Errorf("attachment is not a data URL, an http(s) URL or base64")
+			return nil, "", fmt.Errorf("attachment is not a data URL, an https URL or base64")
 		}
 		return data, sniffMediaType(data, fallbackType), nil
 	}
@@ -298,11 +312,7 @@ func stageMedia(data []byte, mimeType, name, workdir string, requestKeep map[str
 		_ = os.Chtimes(path, now, now)
 		acquireMediaRefLocked(path)
 		if err := evictMediaCacheLocked(dir, path, requestKeep, now); err != nil {
-			if activeMediaRef[path] <= 1 {
-				delete(activeMediaRef, path)
-			} else {
-				activeMediaRef[path]--
-			}
+			releaseOneMediaRefLocked(path)
 			return "", err
 		}
 		return path, nil
@@ -332,10 +342,9 @@ func stageMedia(data []byte, mimeType, name, workdir string, requestKeep map[str
 	}
 	acquireMediaRefLocked(path)
 	if err := evictMediaCacheLocked(dir, path, requestKeep, now); err != nil {
-		if activeMediaRef[path] <= 1 {
-			delete(activeMediaRef, path)
-		} else {
-			activeMediaRef[path]--
+		releaseOneMediaRefLocked(path)
+		if !requestKeep[path] && activeMediaRef[path] == 0 {
+			_ = os.Remove(path)
 		}
 		return "", err
 	}
@@ -346,6 +355,10 @@ type cachedMediaFile struct {
 	path    string
 	size    int64
 	modTime time.Time
+}
+
+func isStagingTempFile(name string) bool {
+	return strings.HasPrefix(name, "media-") && strings.HasSuffix(name, ".tmp")
 }
 
 func evictMediaCacheLocked(dir, keepPath string, requestKeep map[string]bool, now time.Time) error {
@@ -360,6 +373,7 @@ func evictMediaCacheLocked(dir, keepPath string, requestKeep map[string]bool, no
 	var totalBytes int64
 	var protectedBytes int64
 	var totalFiles int
+	var protectedFiles int
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -372,7 +386,7 @@ func evictMediaCacheLocked(dir, keepPath string, requestKeep map[string]bool, no
 		if err != nil {
 			continue
 		}
-		if strings.HasSuffix(entry.Name(), ".tmp") {
+		if isStagingTempFile(entry.Name()) {
 			if now.Sub(info.ModTime()) > acpMediaTempEvictAfter {
 				_ = os.Remove(p)
 			}
@@ -386,6 +400,7 @@ func evictMediaCacheLocked(dir, keepPath string, requestKeep map[string]bool, no
 		totalFiles++
 		if isProtected(p) {
 			protectedBytes += info.Size()
+			protectedFiles++
 			continue
 		}
 		evictable = append(evictable, cachedMediaFile{path: p, size: info.Size(), modTime: info.ModTime()})
@@ -405,8 +420,8 @@ func evictMediaCacheLocked(dir, keepPath string, requestKeep map[string]bool, no
 			}
 		}
 	}
-	if protectedBytes > acpMediaCacheMaxBytes {
-		return pError(errorCodeRequestScoped, fmt.Sprintf("in-flight attachments (%d bytes) exceed the %d-byte media cache limit", protectedBytes, acpMediaCacheMaxBytes), http.StatusRequestEntityTooLarge)
+	if protectedFiles > acpMediaCacheMaxFiles || protectedBytes > acpMediaCacheMaxBytes {
+		return pError(errorCodeRequestScoped, fmt.Sprintf("in-flight attachments (%d files, %d bytes) exceed the media cache limit (%d files, %d bytes)", protectedFiles, protectedBytes, acpMediaCacheMaxFiles, acpMediaCacheMaxBytes), http.StatusRequestEntityTooLarge)
 	}
 	return nil
 }

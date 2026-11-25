@@ -76,6 +76,25 @@ func putConv(key string, c *acpConv) {
 	}
 }
 
+// restoreConv puts an unused conversation back unless a newer entry already replaced key.
+func restoreConv(key string, c *acpConv) {
+	if c == nil || !c.client.alive() {
+		return
+	}
+	closeUnused := false
+	acpConvs.Lock()
+	if existing := acpConvs.m[key]; existing == nil {
+		c.lastUsed = time.Now()
+		acpConvs.m[key] = c
+	} else if existing != c {
+		closeUnused = true
+	}
+	acpConvs.Unlock()
+	if closeUnused {
+		safeGo("closeConv", func() { c.client.closeSession(c.sessionID) })
+	}
+}
+
 func dropAllConvs() {
 	acpConvs.Lock()
 	acpConvs.m = map[string]*acpConv{}
@@ -121,7 +140,7 @@ func (p *acpPlan) releaseMedia() {
 }
 
 func convScope(cfg pluginConfig, opts agyOptions) string {
-	return cfg.AccountHome + "\x00" + opts.NativeModel + "\x00" + opts.ReasoningEffort
+	return cfg.AccountHome + "\x00" + cfg.Workdir + "\x00" + opts.NativeModel + "\x00" + opts.ReasoningEffort
 }
 
 func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPlan, error) {
@@ -159,7 +178,8 @@ func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPla
 			plan.mediaRefs = append(plan.mediaRefs, mediaPathsFromBlocks(attachments)...)
 			return plan, nil
 		}
-		safeGo("closeConv", func() { conv.client.closeSession(conv.sessionID) })
+		restoreConv(key, conv)
+		return nil, err
 	}
 	if _, err := plan.ensureFull(); err != nil {
 		return nil, err

@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -356,7 +358,9 @@ func TestSSRFBlocksLoopbackAndPrivateURLs(t *testing.T) {
 		t.Fatal("expected loopback httptest URL to be blocked by SSRF check")
 	}
 	for _, blocked := range []string{
+		"http://example.com/cleartext.png",
 		"http://169.254.169.254/latest/meta-data/",
+		"https://169.254.169.254/latest/meta-data/",
 		"http://10.0.0.1/internal.png",
 		"http://192.168.1.1/router.png",
 		"http://localhost/local.png",
@@ -372,7 +376,7 @@ func TestSSRFBlocksLoopbackAndPrivateURLs(t *testing.T) {
 		t.Fatal("expected CGNAT IP to be disallowed")
 	}
 
-	// Verify CheckRedirect strips Referer before forwarding to a redirect target.
+	// Verify CheckRedirect strips Referer before forwarding to a redirect target and blocks HTTP downgrade.
 	client := newSSRFSafeHTTPClient()
 	redirectReq, _ := http.NewRequest(http.MethodGet, "https://cdn.example.com/target.png", nil)
 	redirectReq.Header.Set("Referer", "https://signed.example.com/secret?token=abc")
@@ -382,6 +386,10 @@ func TestSSRFBlocksLoopbackAndPrivateURLs(t *testing.T) {
 	}
 	if got := redirectReq.Header.Get("Referer"); got != "" {
 		t.Fatalf("expected Referer to be stripped on redirect, got %q", got)
+	}
+	httpRedirectReq, _ := http.NewRequest(http.MethodGet, "http://cdn.example.com/downgrade.png", nil)
+	if err := client.CheckRedirect(httpRedirectReq, []*http.Request{prevReq}); err == nil {
+		t.Fatal("expected redirect to HTTP URL to be rejected")
 	}
 }
 
@@ -461,14 +469,18 @@ func TestACPMediaCacheEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Expired file (> TTL) and stale .tmp file are evicted when staging a new file.
+	// Expired file (> TTL) and stale staging media-*.tmp file are evicted when staging a new file.
 	expired := filepath.Join(mediaDir, "old.pdf")
-	staleTmp := filepath.Join(mediaDir, "orphan.pdf.tmp")
+	staleTmp := filepath.Join(mediaDir, "media-orphan.tmp")
+	finalTmp := filepath.Join(mediaDir, "payload.tmp")
 	_ = os.WriteFile(expired, []byte("old"), 0o600)
 	_ = os.WriteFile(staleTmp, []byte("tmp"), 0o600)
+	_ = os.WriteFile(finalTmp, []byte("final-tmp"), 0o600)
 	oldTime := time.Now().Add(-acpMediaCacheTTL - time.Hour)
 	_ = os.Chtimes(expired, oldTime, oldTime)
 	_ = os.Chtimes(staleTmp, oldTime, oldTime)
+	recentOld := time.Now().Add(-time.Hour)
+	_ = os.Chtimes(finalTmp, recentOld, recentOld)
 
 	// Create acpMediaCacheMaxFiles extra files so count eviction triggers too.
 	for i := 0; i < acpMediaCacheMaxFiles+2; i++ {
@@ -490,7 +502,10 @@ func TestACPMediaCacheEviction(t *testing.T) {
 		t.Fatal("expired file was not evicted")
 	}
 	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
-		t.Fatal("stale .tmp file was not evicted")
+		t.Fatal("stale media-*.tmp file was not evicted")
+	}
+	if _, err := os.Stat(finalTmp); !os.IsNotExist(err) {
+		t.Fatal("oldest non-staging .tmp file should be counted and evicted cleanly")
 	}
 	entries, _ := os.ReadDir(mediaDir)
 	if len(entries) > acpMediaCacheMaxFiles {
@@ -554,5 +569,181 @@ func TestACPResolveSessionWorkdirAndSetModelErrorClassification(t *testing.T) {
 	}
 	if isACPModelRejection(&acpRPCError{Code: -32603, Message: "rate limit exceeded"}) {
 		t.Fatal("-32603 rate limit must not classify as model_not_found")
+	}
+}
+
+func TestACPFollowUpMediaFailureKeepsRetainedSessionAndWorkdirScope(t *testing.T) {
+	setupFakeACP(t)
+	cfgA := currentConfig()
+	cfgA.Workdir = t.TempDir()
+	cfgB := cfgA
+	cfgB.Workdir = t.TempDir()
+	opts := agyOptions{NativeModel: "gemini-4-hydrogen", ReasoningEffort: "xhigh"}
+
+	if convScope(cfgA, opts) == convScope(cfgB, opts) {
+		t.Fatal("expected convScope to isolate conversations across different workdirs")
+	}
+
+	turn1Payload := []byte(`{"model":"agy/gemini-4-hydrogen:xhigh","messages":[
+		{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://expired.example.com/gone.png"}}]}
+	]}`)
+	chat1, err := decodeChatRequest(turn1Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closeBuf bytes.Buffer
+	fakeClient := &acpClient{dead: make(chan struct{}), in: nopWriteCloserBuf{&closeBuf}}
+	plan1 := &acpPlan{scope: convScope(cfgA, opts), tools: chat1.Tools, messages: chat1.Messages, chatReq: chat1, opts: opts, cfg: cfgA}
+	plan1.retainConv(&acpConv{client: fakeClient, sessionID: "sess-retain"}, "saw it", nil, false)
+	t.Cleanup(dropAllConvs)
+
+	// Under cfgB (different workdir), lookup must miss.
+	turn2DifferentWorkdir := rpcExecutorRequest{
+		Model: "agy/gemini-4-hydrogen:xhigh",
+		Payload: []byte(`{"model":"agy/gemini-4-hydrogen:xhigh","messages":[
+			{"role":"user","content":"look"},
+			{"role":"assistant","content":"saw it"},
+			{"role":"user","content":"follow up"}
+		]}`),
+	}
+	if p, err := planACP(turn2DifferentWorkdir, opts, cfgB); err != nil || p.reuse != nil {
+		t.Fatalf("expected workdir miss without reuse, got p=%+v err=%v", p, err)
+	}
+
+	// Follow-up media fetch fails (503) under cfgA: must NOT close sess-retain or re-fetch expired historical URL.
+	prev := remoteFetchClientOverride
+	allowFollowUp := false
+	remoteFetchClientOverride = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Host, "expired.example.com") {
+				return nil, fmt.Errorf("unexpected historical fetch for %s", r.URL.String())
+			}
+			if !allowFollowUp {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{},
+					Body:       io.NopCloser(strings.NewReader("unavailable")),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"image/png"}},
+				Body:       io.NopCloser(strings.NewReader("ok-img")),
+			}, nil
+		}),
+	}
+	t.Cleanup(func() { remoteFetchClientOverride = prev })
+
+	turn2Req := rpcExecutorRequest{
+		Model: "agy/gemini-4-hydrogen:xhigh",
+		Payload: []byte(`{"model":"agy/gemini-4-hydrogen:xhigh","messages":[
+			{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://expired.example.com/gone.png"}}]},
+			{"role":"assistant","content":"saw it"},
+			{"role":"user","content":[{"type":"text","text":"now this"},{"type":"image_url","image_url":{"url":"https://cdn.example.com/new.png"}}]}
+		]}`),
+	}
+	if _, err := planACP(turn2Req, opts, cfgA); err == nil {
+		t.Fatal("expected follow-up attachment failure")
+	}
+	if closeBuf.Len() != 0 {
+		t.Fatalf("retained session must stay open on follow-up failure, got close write: %q", closeBuf.String())
+	}
+
+	// Subsequent retry when attachment becomes available must still reuse sess-retain.
+	allowFollowUp = true
+	plan2, err := planACP(turn2Req, opts, cfgA)
+	if err != nil {
+		t.Fatalf("expected retry to succeed: %v", err)
+	}
+	if plan2.reuse == nil || plan2.reuse.sessionID != "sess-retain" {
+		t.Fatalf("expected retained session sess-retain on retry, got %+v", plan2.reuse)
+	}
+}
+
+func TestACPMessageContentReleasesEarlierMediaOnInvalidBlockTypeAndVideoStringURL(t *testing.T) {
+	workdir := t.TempDir()
+	keep := map[string]bool{}
+	videoBlock, label, err := acpMediaBlock(map[string]any{
+		"type":      "input_video",
+		"video_url": "data:video/mp4;base64," + base64.StdEncoding.EncodeToString([]byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 'm', 'p', '4', '2'}),
+	}, workdir, keep)
+	if err != nil || label != "video" || videoBlock["type"] != "resource_link" {
+		t.Fatalf("expected string video_url to stage as resource_link, got block=%+v label=%q err=%v", videoBlock, label, err)
+	}
+	releaseMediaRefs(mediaPathsFromBlocks([]acpPromptBlock{videoBlock}))
+
+	// Invalid content in message 2 must release media staged in message 1.
+	msgs := []chatMessage{
+		{Role: "user", Content: json.RawMessage(fmt.Sprintf(`[{"type":"input_audio","input_audio":{"data":%q,"format":"wav"}}]`, base64.StdEncoding.EncodeToString([]byte("RIFF\x00\x00\x00\x00WAVEfmt "))))},
+		{Role: "user", Content: json.RawMessage(`{"unexpected":"object"}`)},
+	}
+	var attachments []acpPromptBlock
+	_, err = buildFollowUpPrompt(msgs, false, workdir, &attachments)
+	if err == nil {
+		t.Fatal("expected error for object content")
+	}
+	mediaCacheMu.Lock()
+	refs := len(activeMediaRef)
+	mediaCacheMu.Unlock()
+	if refs != 0 {
+		t.Fatalf("expected all active media refs released on error, got %d remaining", refs)
+	}
+}
+
+func TestACPProtectedMediaCountLimitAndWriteCancellationAndTempShutdown(t *testing.T) {
+	dir := t.TempDir()
+	requestKeep := map[string]bool{}
+	t.Cleanup(func() {
+		var paths []string
+		for p := range requestKeep {
+			paths = append(paths, p)
+		}
+		releaseMediaRefs(paths)
+	})
+	for i := 0; i < acpMediaCacheMaxFiles; i++ {
+		p, err := stageMedia([]byte(fmt.Sprintf("file-%d", i)), "text/plain", fmt.Sprintf("f-%d.txt", i), dir, requestKeep)
+		if err != nil {
+			t.Fatalf("unexpected error staging file %d: %v", i, err)
+		}
+		requestKeep[p] = true
+	}
+	_, err := stageMedia([]byte("overflow-file"), "text/plain", "overflow.txt", dir, requestKeep)
+	var pe *pluginError
+	if !errors.As(err, &pe) || pe.HTTPStatus != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 RequestEntityTooLarge for >acpMediaCacheMaxFiles protected files, got %v", err)
+	}
+
+	// Pre-enqueue ctx cancellation must NOT shut down the resident client.
+	client := &acpClient{
+		writeCh:  make(chan acpWriteReq),
+		pending:  map[int64]chan acpReply{},
+		sessions: map[string]*acpSink{},
+		dead:     make(chan struct{}),
+		in:       nopWriteCloser{},
+		cmd:      &exec.Cmd{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.call(ctx, "session/prompt", map[string]any{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if !client.alive() {
+		t.Fatal("client must stay alive when ctx expires before enqueue")
+	}
+
+	// Temporary discovery clients tracked in acpPool.temps must be closed by retireAllACP.
+	resetACPQuiesceForTest()
+	t.Cleanup(resetACPQuiesceForTest)
+	temp := &acpClient{
+		dead: make(chan struct{}),
+		in:   nopWriteCloser{},
+		cmd:  &exec.Cmd{},
+	}
+	acpPool.Lock()
+	acpPool.temps[temp] = struct{}{}
+	acpPool.Unlock()
+	retireAllACP()
+	if temp.alive() {
+		t.Fatal("expected retireAllACP to shut down tracked temporary discovery client")
 	}
 }

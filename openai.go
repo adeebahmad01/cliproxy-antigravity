@@ -376,6 +376,7 @@ func messageContent(raw json.RawMessage, workdir string, attachments *[]acpPromp
 
 	var blocks []map[string]any
 	if err := json.Unmarshal(raw, &blocks); err != nil {
+		releaseAndClearAttachments(attachments)
 		return "", fmt.Errorf("content must be a string or an array of content blocks")
 	}
 
@@ -407,7 +408,7 @@ func messageContent(raw json.RawMessage, workdir string, attachments *[]acpPromp
 				if attachments != nil {
 					imgBlock, err := acpImageBlock(imgURL)
 					if err != nil {
-						releaseMediaRefs(mediaPathsFromBlocks(*attachments))
+						releaseAndClearAttachments(attachments)
 						return "", err
 					}
 					*attachments = append(*attachments, imgBlock)
@@ -430,7 +431,7 @@ func messageContent(raw json.RawMessage, workdir string, attachments *[]acpPromp
 			}
 			link, label, err := acpMediaBlock(block, workdir, requestKeep)
 			if err != nil {
-				releaseMediaRefs(mediaPathsFromBlocks(*attachments))
+				releaseAndClearAttachments(attachments)
 				return "", err
 			}
 			*attachments = append(*attachments, link)

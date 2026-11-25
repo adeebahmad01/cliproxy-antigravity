@@ -173,7 +173,17 @@ var acpPool = struct {
 	retired    bool
 	clients    map[string]*acpClient
 	starting   map[string]*acpStart
-}{clients: map[string]*acpClient{}, starting: map[string]*acpStart{}}
+	temps      map[*acpClient]struct{}
+}{clients: map[string]*acpClient{}, starting: map[string]*acpStart{}, temps: map[*acpClient]struct{}{}}
+
+func untrackTempACP(c *acpClient) {
+	if c == nil {
+		return
+	}
+	acpPool.Lock()
+	delete(acpPool.temps, c)
+	acpPool.Unlock()
+}
 
 var acpQuiesceState = struct {
 	sync.Mutex
@@ -206,6 +216,7 @@ func resetACPQuiesceForTest() {
 	acpQuiesceState.Unlock()
 	acpPool.Lock()
 	acpPool.retired = false
+	acpPool.temps = map[*acpClient]struct{}{}
 	acpPool.Unlock()
 }
 
@@ -263,9 +274,10 @@ func acquireACP(cfg pluginConfig) (*acpClient, error) {
 	acpPool.starting[key] = pending
 	acpPool.Unlock()
 
-	client, err := startACP(cfg, key)
+	client, err := startACP(cfg, key, false)
 
 	acpPool.Lock()
+	delete(acpPool.temps, client)
 	stillValid := !acpPool.retired && acpPool.generation == gen && acpPool.starting[key] == pending
 	if acpPool.starting[key] == pending {
 		delete(acpPool.starting, key)
@@ -362,16 +374,21 @@ func retireAllACP() {
 	acpPool.retired = true
 	acpPool.generation++
 	clients := acpPool.clients
+	temps := acpPool.temps
 	acpPool.clients = map[string]*acpClient{}
 	acpPool.starting = map[string]*acpStart{}
+	acpPool.temps = map[*acpClient]struct{}{}
 	acpPool.Unlock()
 	dropAllConvs()
 	for _, c := range clients {
 		c.shutdown(errors.New("agy acp pool retired"))
 	}
+	for c := range temps {
+		c.shutdown(errors.New("agy acp pool retired"))
+	}
 }
 
-func startACP(cfg pluginConfig, key string) (*acpClient, error) {
+func startACP(cfg pluginConfig, key string, temporary bool) (*acpClient, error) {
 	if err := validateBinaryPath(cfg.BinaryPath); err != nil {
 		return nil, pError("invalid_binary", err.Error(), http.StatusBadRequest)
 	}
@@ -413,6 +430,17 @@ func startACP(cfg pluginConfig, key string) (*acpClient, error) {
 	go c.writeLoop()
 	go c.readLoop(out)
 
+	acpPool.Lock()
+	if acpPool.retired {
+		acpPool.Unlock()
+		err := pRetryableError("plugin_quiescing", "cliproxy-antigravity plugin is shutting down", http.StatusServiceUnavailable)
+		c.shutdown(err)
+		return nil, err
+	}
+	// Track both temporary discovery processes and in-flight pool startups so shutdown stops them immediately.
+	acpPool.temps[c] = struct{}{}
+	acpPool.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), acpInitTimeout)
 	defer cancel()
 	_, err = c.call(ctx, "initialize", map[string]any{
@@ -421,9 +449,11 @@ func startACP(cfg pluginConfig, key string) (*acpClient, error) {
 		"clientInfo":         map[string]any{"name": pluginID, "version": pluginVersion},
 	})
 	if err != nil {
+		untrackTempACP(c)
 		c.shutdown(err)
 		return nil, c.wrapErr(err)
 	}
+	_ = temporary
 	return c, nil
 }
 
@@ -603,8 +633,11 @@ func (c *acpClient) writeWithTimeout(ctx context.Context, v any, timeout time.Du
 	raw = append(raw, '\n')
 	if c.writeCh == nil {
 		// Direct writer fallback for unit tests constructing lightweight acpClient stubs.
-		_, err = c.in.Write(raw)
-		return err
+		if _, err = c.in.Write(raw); err != nil {
+			c.shutdown(fmt.Errorf("writing to agy acp: %w", err))
+			return err
+		}
+		return nil
 	}
 	req := acpWriteReq{data: raw, done: make(chan error, 1)}
 	timer := time.NewTimer(timeout)
@@ -615,6 +648,7 @@ func (c *acpClient) writeWithTimeout(ctx context.Context, v any, timeout time.Du
 	case <-c.dead:
 		return c.deadErr
 	case <-ctx.Done():
+		// Not queued yet, so the resident connection framing is still intact.
 		return ctx.Err()
 	case <-timer.C:
 		err := errors.New("writing to agy acp timed out")
@@ -624,6 +658,9 @@ func (c *acpClient) writeWithTimeout(ctx context.Context, v any, timeout time.Du
 
 	select {
 	case err := <-req.done:
+		if err != nil {
+			c.shutdown(fmt.Errorf("writing to agy acp: %w", err))
+		}
 		return err
 	case <-c.dead:
 		return c.deadErr
@@ -654,7 +691,6 @@ func (c *acpClient) call(ctx context.Context, method string, params any) (json.R
 	c.mu.Unlock()
 	if err := c.writeWithTimeout(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}, acpWriteTimeout); err != nil {
 		c.forget(id)
-		c.shutdown(fmt.Errorf("writing to agy acp: %w", err))
 		return nil, err
 	}
 	select {
@@ -940,15 +976,11 @@ func runACPOnce(ctx context.Context, cfg pluginConfig, opts agyOptions, blocks [
 		sessionID = info.SessionID
 		if model := acpModelChoice(opts, info.modelSet()); model != "" {
 			if _, err := c.call(ctx, "session/set_model", map[string]any{"sessionId": sessionID, "modelId": model}); err != nil {
-				var rpcErr *acpRPCError
-				if errors.As(err, &rpcErr) {
-					if isACPModelRejection(rpcErr) {
-						c.closeSession(sessionID)
-						return agyResult{}, nil, pError(errorCodeModelNotFound, "Antigravity model not available: "+model+" ("+rpcErr.Message+")", http.StatusNotFound), false
-					}
-					return agyResult{}, nil, c.wrapErr(err), !c.alive()
-				}
 				c.closeSession(sessionID)
+				var rpcErr *acpRPCError
+				if errors.As(err, &rpcErr) && isACPModelRejection(rpcErr) {
+					return agyResult{}, nil, pError(errorCodeModelNotFound, "Antigravity model not available: "+model+" ("+rpcErr.Message+")", http.StatusNotFound), false
+				}
 				return agyResult{}, nil, c.wrapErr(err), !c.alive()
 			}
 		}

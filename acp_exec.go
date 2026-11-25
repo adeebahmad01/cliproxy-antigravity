@@ -56,7 +56,7 @@ func validateRemoteURL(rawURL string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid attachment URL: %w", err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	if u.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported attachment URL scheme %q", u.Scheme)
 	}
 	if u.User != nil {
@@ -181,7 +181,7 @@ func acpImageBlock(ref string) (acpPromptBlock, error) {
 		}
 		return acpPromptBlock{"type": "image", "mimeType": mime, "data": base64.StdEncoding.EncodeToString(raw)}, nil
 	default:
-		return nil, fmt.Errorf("only data: and http(s) image URLs are accepted in acp mode")
+		return nil, fmt.Errorf("only data: and https image URLs are accepted in acp mode")
 	}
 }
 
@@ -322,11 +322,14 @@ func discoverModelsACP(cfg pluginConfig) ([]modelInfo, map[string]string, error)
 			return nil, nil, err
 		}
 	default:
-		temp, err := startACP(cfg, "discovery")
+		temp, err := startACP(cfg, "discovery", true)
 		if err != nil {
 			return nil, nil, err
 		}
-		defer temp.shutdown(errors.New("discovery finished"))
+		defer func() {
+			untrackTempACP(temp)
+			temp.shutdown(errors.New("discovery finished"))
+		}()
 		c = temp
 	}
 	c.busy.Add(1)
