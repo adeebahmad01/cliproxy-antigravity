@@ -134,6 +134,43 @@ func TestEnsureAuthFileSyncsAccountsDir(t *testing.T) {
 	if got := len(readAgyAuthFiles(t, authDir)); got != 2 {
 		t.Fatalf("resync created duplicates: %d files", got)
 	}
+
+	// Deleting a synced auth file must not recreate it on the next sync while its home stays marked.
+	if err := os.Remove(filepath.Join(authDir, "antigravity-work@example.com.json")); err != nil {
+		t.Fatal(err)
+	}
+	ensureAuthFile(configYAML, cfg)
+	files = readAgyAuthFiles(t, authDir)
+	if len(files) != 1 || files["antigravity-work@example.com.json"] != nil {
+		t.Fatalf("deleted auth file was recreated: %v", files)
+	}
+	if !authFileIssued(filepath.Join(accountsDir, "work")) {
+		t.Fatal("expected issued marker to remain in account home")
+	}
+}
+
+func TestSyncAccountAuthFilesSkipsWhenMarkerCannotBeWritten(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permissions")
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	authDir := t.TempDir()
+	accountsDir := t.TempDir()
+	roHome := filepath.Join(accountsDir, "readonly")
+	signInAccount(t, roHome, "ro@example.com")
+	if err := os.Chmod(roHome, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roHome, 0o755) })
+
+	cfg := defaultConfig()
+	cfg.AccountsDir = accountsDir
+	ensureAuthFile([]byte("auth-dir: "+authDir+"\n"), cfg)
+
+	if files := readAgyAuthFiles(t, authDir); len(files) != 0 {
+		t.Fatalf("expected no auth file issued when marker cannot be written, got %v", files)
+	}
 }
 
 func TestEnsureAuthFileAccountsDirKeepsSignedInDefault(t *testing.T) {

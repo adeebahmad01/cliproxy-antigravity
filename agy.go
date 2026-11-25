@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,15 +102,29 @@ func (r *processRegistry) killAll() {
 	}
 }
 
-type catalogState struct {
-	sync.Mutex
+const catalogTTL = time.Minute
+
+var catalogRetryAfter = 10 * time.Second
+
+type catalogEntry struct {
+	home       string
 	fetchedAt  time.Time
-	binaryPath string
+	failedAt   time.Time
 	models     []modelInfo
 	nativeByID map[string]string
+	loading    chan struct{}
 }
 
-var modelCatalog = catalogState{}
+type catalogState struct {
+	sync.Mutex
+	entries map[string]*catalogEntry
+}
+
+var modelCatalog = catalogState{entries: map[string]*catalogEntry{}}
+
+func catalogKey(cfg pluginConfig) string {
+	return strings.Join([]string{cfg.BinaryPath, cfg.AccountHome}, "\x00")
+}
 
 // modelCatalogDiskCache is the last discovery that succeeded. `agy models` fails
 // while an account is rate limited, when the CLI times out, or on a transient
@@ -116,9 +132,10 @@ var modelCatalog = catalogState{}
 // every agy/* request fail with an unknown model, so a failed refresh falls back
 // to the previous catalog and to this cache.
 type modelCatalogDiskCache struct {
-	BinaryPath string            `json:"binary_path"`
-	Models     []modelInfo       `json:"models"`
-	NativeByID map[string]string `json:"native_by_id"`
+	BinaryPath  string            `json:"binary_path"`
+	AccountHome string            `json:"account_home,omitempty"`
+	Models      []modelInfo       `json:"models"`
+	NativeByID  map[string]string `json:"native_by_id"`
 }
 
 // modelCacheDirOverride lets tests point the cache at a temporary directory; the
@@ -141,14 +158,31 @@ func modelCatalogCachePath() (string, bool) {
 	return filepath.Join(dir, pluginID, "models.json"), true
 }
 
+func modelCatalogCachePathFor(cfg pluginConfig) (string, bool) {
+	base, ok := modelCatalogCachePath()
+	if !ok {
+		return "", false
+	}
+	if cfg.AccountHome == "" {
+		return base, true
+	}
+	sum := sha256.Sum256([]byte(cfg.AccountHome))
+	return filepath.Join(filepath.Dir(base), "accounts", hex.EncodeToString(sum[:6])+".json"), true
+}
+
 // writeModelCatalogCache persists a discovery. Only call it after `agy models`
 // exited successfully; a partial catalog would otherwise outlive the failure.
 func writeModelCatalogCache(cfg pluginConfig, models []modelInfo, nativeByID map[string]string) {
-	path, ok := modelCatalogCachePath()
+	path, ok := modelCatalogCachePathFor(cfg)
 	if !ok {
 		return
 	}
-	payload, err := json.Marshal(modelCatalogDiskCache{BinaryPath: cfg.BinaryPath, Models: models, NativeByID: nativeByID})
+	payload, err := json.Marshal(modelCatalogDiskCache{
+		BinaryPath:  cfg.BinaryPath,
+		AccountHome: cfg.AccountHome,
+		Models:      models,
+		NativeByID:  nativeByID,
+	})
 	if err != nil {
 		return
 	}
@@ -182,7 +216,7 @@ func writeModelCatalogCache(cfg pluginConfig, models []modelInfo, nativeByID map
 }
 
 func readModelCatalogCache(cfg pluginConfig) ([]modelInfo, map[string]string) {
-	path, ok := modelCatalogCachePath()
+	path, ok := modelCatalogCachePathFor(cfg)
 	if !ok {
 		return nil, nil
 	}
@@ -194,7 +228,7 @@ func readModelCatalogCache(cfg pluginConfig) ([]modelInfo, map[string]string) {
 	if err := json.Unmarshal(payload, &cached); err != nil {
 		return nil, nil
 	}
-	if cached.BinaryPath != cfg.BinaryPath || len(cached.Models) == 0 {
+	if cached.BinaryPath != cfg.BinaryPath || cached.AccountHome != cfg.AccountHome || len(cached.Models) == 0 {
 		return nil, nil
 	}
 	return cached.Models, cached.NativeByID
@@ -230,10 +264,64 @@ func mergeCatalogMapping(primary, extra map[string]string) map[string]string {
 
 func invalidateModels() {
 	modelCatalog.Lock()
-	modelCatalog.fetchedAt = time.Time{}
-	modelCatalog.binaryPath = ""
-	modelCatalog.models = nil
-	modelCatalog.nativeByID = nil
+	modelCatalog.entries = map[string]*catalogEntry{}
+	modelCatalog.Unlock()
+}
+
+func catalogConfigs(cfg pluginConfig) []pluginConfig {
+	if cfg.AccountHome != "" {
+		return []pluginConfig{cfg}
+	}
+	homes, _ := enabledAgyHomes(currentAuthDir())
+	if len(homes) == 0 {
+		return []pluginConfig{cfg}
+	}
+	configs := make([]pluginConfig, 0, len(homes))
+	for _, home := range homes {
+		accountCfg := cfg
+		accountCfg.AccountHome = home
+		configs = append(configs, accountCfg)
+	}
+	return configs
+}
+
+func cachedEnabledModels(cfg pluginConfig) []modelInfo {
+	configs := catalogConfigs(cfg)
+	var merged []modelInfo
+	seen := map[string]bool{}
+	modelCatalog.Lock()
+	for _, accountCfg := range configs {
+		if entry := modelCatalog.entries[catalogKey(accountCfg)]; entry != nil {
+			for _, m := range entry.models {
+				if !seen[m.ID] {
+					seen[m.ID] = true
+					merged = append(merged, m)
+				}
+			}
+		}
+	}
+	modelCatalog.Unlock()
+	if len(merged) == 0 {
+		merged, _ = builtinCatalog()
+	}
+	return cloneModels(merged)
+}
+
+func reconcileAccounts() {
+	homes, ok := enabledAgyHomes(currentAuthDir())
+	if !ok {
+		return
+	}
+	enabled := make(map[string]bool, len(homes))
+	for _, home := range homes {
+		enabled[home] = true
+	}
+	modelCatalog.Lock()
+	for key, entry := range modelCatalog.entries {
+		if !enabled[entry.home] {
+			delete(modelCatalog.entries, key)
+		}
+	}
 	modelCatalog.Unlock()
 }
 
@@ -244,7 +332,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Antigravity CLI (default model)",
-			Name:                       "Antigravity CLI (default model)",
+			Name:                       "agy/default",
 			Description:                "Uses the default model selected by the installed official agy CLI.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -254,7 +342,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash",
-			Name:                       "Gemini 3.8 Flash",
+			Name:                       "gemini-3.8-flash",
 			Description:                "Standard Gemini 3.8 Flash model with configurable reasoning effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -264,7 +352,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash (High)",
-			Name:                       "Gemini 3.8 Flash (High)",
+			Name:                       "gemini-3.8-flash-high",
 			Description:                "Standard Gemini 3.8 Flash model with high thinking effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -274,7 +362,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash (Medium)",
-			Name:                       "Gemini 3.8 Flash (Medium)",
+			Name:                       "gemini-3.8-flash-medium",
 			Description:                "Standard Gemini 3.8 Flash model with medium thinking effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -284,7 +372,7 @@ func standardBuiltinModels() []modelInfo {
 			Object:                     "model",
 			OwnedBy:                    "google-antigravity-cli",
 			DisplayName:                "Gemini 3.8 Flash (Low)",
-			Name:                       "Gemini 3.8 Flash (Low)",
+			Name:                       "gemini-3.8-flash-low",
 			Description:                "Standard Gemini 3.8 Flash model with low thinking effort.",
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
@@ -293,21 +381,12 @@ func standardBuiltinModels() []modelInfo {
 }
 
 func discoverModels(cfg pluginConfig) []modelInfo {
-	modelCatalog.Lock()
-	defer modelCatalog.Unlock()
+	models, _, _ := loadCatalog(cfg)
+	return cloneModels(models)
+}
 
-	if modelCatalog.binaryPath == cfg.BinaryPath && time.Since(modelCatalog.fetchedAt) < time.Minute && len(modelCatalog.models) > 0 {
-		return cloneModels(modelCatalog.models)
-	}
-
-	// Keep the previous successful catalog in case this refresh fails.
-	previousModels := cloneModels(modelCatalog.models)
-	previousMapping := modelCatalog.nativeByID
-	previousCompatible := modelCatalog.binaryPath == cfg.BinaryPath
-
-	discoveryComplete := false
-	builtin := standardBuiltinModels()
-	models := append([]modelInfo(nil), builtin...)
+func builtinCatalog() ([]modelInfo, map[string]string) {
+	models := standardBuiltinModels()
 	nativeByID := map[string]string{
 		"agy/default":                     "",
 		"antigravity/default":             "",
@@ -322,6 +401,79 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		"gemini-3.8-flash-low":            "gemini-3.8-flash-low",
 		"Gemini 3.8 Flash (Low)":          "gemini-3.8-flash-low",
 	}
+	return models, nativeByID
+}
+
+// loadCatalog returns the catalog of cfg's account home; ok is false when discovery failed and the
+// builtin list stands in. Concurrent first loads of one home wait for a single discovery.
+func loadCatalog(cfg pluginConfig) (models []modelInfo, nativeByID map[string]string, ok bool) {
+	key := catalogKey(cfg)
+	for {
+		modelCatalog.Lock()
+		entry := modelCatalog.entries[key]
+		if entry == nil {
+			entry = &catalogEntry{home: cfg.AccountHome}
+			modelCatalog.entries[key] = entry
+		}
+		cached := len(entry.models) > 0
+		switch {
+		case cached && (time.Since(entry.fetchedAt) < catalogTTL || entry.loading != nil || time.Since(entry.failedAt) < catalogRetryAfter):
+			models, nativeByID = entry.models, entry.nativeByID
+			modelCatalog.Unlock()
+			return models, nativeByID, true
+		case entry.loading != nil:
+			wait := entry.loading
+			modelCatalog.Unlock()
+			<-wait
+			continue
+		case time.Since(entry.failedAt) < catalogRetryAfter:
+			if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
+				cachedModels = normalizeCachedModelNames(cachedModels)
+				if modelCatalog.entries[key] == entry {
+					entry.models, entry.nativeByID = cachedModels, cachedMapping
+				}
+				modelCatalog.Unlock()
+				return cachedModels, cachedMapping, true
+			}
+			modelCatalog.Unlock()
+			models, nativeByID = builtinCatalog()
+			return models, nativeByID, false
+		}
+		loading := make(chan struct{})
+		entry.loading = loading
+		modelCatalog.Unlock()
+
+		models, nativeByID, ok = discoverCatalog(cfg)
+
+		modelCatalog.Lock()
+		entry.loading = nil
+		if ok {
+			if modelCatalog.entries[key] == entry {
+				entry.fetchedAt, entry.failedAt = time.Now(), time.Time{}
+				entry.models, entry.nativeByID = models, nativeByID
+			}
+		} else {
+			entry.failedAt = time.Now()
+			if cached {
+				models, nativeByID, ok = entry.models, entry.nativeByID, true
+			} else if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
+				models = mergeCatalogModels(models, normalizeCachedModelNames(cachedModels))
+				nativeByID = mergeCatalogMapping(nativeByID, cachedMapping)
+				if modelCatalog.entries[key] == entry {
+					entry.models, entry.nativeByID = models, nativeByID
+				}
+				ok = true
+			}
+		}
+		modelCatalog.Unlock()
+		close(loading)
+		return models, nativeByID, ok
+	}
+}
+
+func discoverCatalog(cfg pluginConfig) ([]modelInfo, map[string]string, bool) {
+	models, nativeByID := builtinCatalog()
+	discoveryComplete := false
 
 	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -329,6 +481,7 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		binPath := resolveBinaryPath(cfg.BinaryPath)
 		cmd := exec.CommandContext(ctx, binPath, "models")
 		configureSysProcAttr(cmd)
+		applyAccountEnv(cmd, cfg)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -343,70 +496,25 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 			discovered, mapping := parseAgyModelLines(stdout.String())
 			// Only a clean exit means the listing is complete.
 			if waitErr == nil && len(discovered) > 0 {
-				for _, m := range discovered {
-					models = append(models, m)
-				}
+				models = append(models, discovered...)
 				mergeDiscoveredNativeMap(nativeByID, mapping)
 				discoveryComplete = true
 			}
 		}
 	}
 
-	switch {
-	case discoveryComplete:
+	// CLIProxyAPI lists Gemini-format models as models/<Name>; keep the routable ID there and
+	// the label in DisplayName, so clients that fetch the Gemini list get usable model IDs.
+	for i := range models {
+		models[i].Name = models[i].ID
+	}
+	if discoveryComplete {
 		writeModelCatalogCache(cfg, models, nativeByID)
-	default:
-		if previousCompatible && len(previousModels) > 0 {
-			models = mergeCatalogModels(models, previousModels)
-			nativeByID = mergeCatalogMapping(nativeByID, previousMapping)
-		}
-		if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
-			models = mergeCatalogModels(models, cachedModels)
-			nativeByID = mergeCatalogMapping(nativeByID, cachedMapping)
-		}
 	}
-
-	modelCatalog.fetchedAt = time.Now()
-	modelCatalog.binaryPath = cfg.BinaryPath
-	modelCatalog.models = models
-	modelCatalog.nativeByID = nativeByID
-	return cloneModels(models)
+	return models, nativeByID, discoveryComplete
 }
 
-// routeModel lets the host pick an account when agy credentials exist, or
-// uses the local agy login otherwise.
-func routeModel(req modelRouteRequest) modelRouteResponse {
-	hasAgy := containsFold(req.AvailableProviders, providerID)
-	id := requestConversationID(readConversationFields(req.Body), req.Headers, req.Metadata)
-	if strings.HasPrefix(id, conversationPrefix) {
-		// A native session must not silently route to a different provider.
-		// The executor rejects managed IDs if only the direct route is available.
-		if hasAgy {
-			return modelRouteResponse{Handled: true, TargetKind: "provider", Target: providerID}
-		}
-		return modelRouteResponse{Handled: true, TargetKind: "self"}
-	}
-	if hasAgy {
-		return modelRouteResponse{}
-	}
-	model := strings.TrimSpace(req.RequestedModel)
-	if open := strings.LastIndex(model, "("); open > 0 && strings.HasSuffix(model, ")") {
-		model = strings.TrimSpace(model[:open])
-	}
-	model, _ = splitColonEffortSuffix(model)
-	lower := strings.ToLower(model)
-	baseModel := stripEffortSuffix(model)
-	// antigravity/ is only claimed when the built-in Antigravity provider is not configured.
-	owned := strings.HasPrefix(lower, "agy/") ||
-		strings.HasPrefix(lower, "antigravity/") && !containsFold(req.AvailableProviders, "antigravity") ||
-		catalogHasModel(model) ||
-		(baseModel != model && catalogHasModel(baseModel))
-	if !owned {
-		return modelRouteResponse{}
-	}
-	return modelRouteResponse{Handled: true, TargetKind: "self", Reason: "agy model served by the local Antigravity CLI"}
-}
-
+// mergeDiscoveredNativeMap records direct and base-slug mappings deterministically.
 func mergeDiscoveredNativeMap(nativeByID, mapping map[string]string) {
 	// Pass 1: record direct mappings. Pass 2: normalize derived base slugs so
 	// map iteration order never lets a display label overwrite a clean base slug.
@@ -427,22 +535,6 @@ func mergeDiscoveredNativeMap(nativeByID, mapping map[string]string) {
 	}
 }
 
-// catalogHasModel checks the last published catalog without running agy, since routing is on the request path.
-func catalogHasModel(model string) bool {
-	modelCatalog.Lock()
-	models := modelCatalog.models
-	modelCatalog.Unlock()
-	if len(models) == 0 {
-		models = standardBuiltinModels()
-	}
-	for _, m := range models {
-		if strings.EqualFold(m.ID, model) {
-			return true
-		}
-	}
-	return false
-}
-
 func containsFold(values []string, target string) bool {
 	for _, v := range values {
 		if strings.EqualFold(strings.TrimSpace(v), target) {
@@ -450,6 +542,16 @@ func containsFold(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeCachedModelNames(models []modelInfo) []modelInfo {
+	out := cloneModels(models)
+	for i := range out {
+		if out[i].ID != "" {
+			out[i].Name = out[i].ID
+		}
+	}
+	return out
 }
 
 func cloneModels(in []modelInfo) []modelInfo {
@@ -511,7 +613,7 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 				Object:                     "model",
 				OwnedBy:                    "google-antigravity-cli",
 				DisplayName:                name,
-				Name:                       name,
+				Name:                       id,
 				Description:                "Discovered from the installed official agy CLI.",
 				SupportedGenerationMethods: []string{"chat"},
 				UserDefined:                true,
@@ -533,7 +635,7 @@ func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
 					Object:                     "model",
 					OwnedBy:                    "google-antigravity-cli",
 					DisplayName:                baseName,
-					Name:                       baseName,
+					Name:                       baseID,
 					Description:                "Discovered from the installed official agy CLI with configurable reasoning effort.",
 					SupportedGenerationMethods: []string{"chat"},
 					UserDefined:                true,
@@ -586,6 +688,10 @@ func slugifyModelLabel(label string) string {
 }
 
 func resolveNativeModel(model string, cfg pluginConfig) string {
+	return resolveNativeModelWithDiscovery(model, cfg, true)
+}
+
+func resolveNativeModelWithDiscovery(model string, cfg pluginConfig, discover bool) string {
 	cleanModel := strings.TrimSpace(model)
 	cleanModel = strings.TrimPrefix(cleanModel, "antigravity/")
 	cleanModel = strings.TrimPrefix(cleanModel, "agy/")
@@ -594,17 +700,39 @@ func resolveNativeModel(model string, cfg pluginConfig) string {
 		return ""
 	}
 
-	_ = discoverModels(cfg)
-	modelCatalog.Lock()
-	defer modelCatalog.Unlock()
+	var nativeByID map[string]string
+	if discover {
+		_, nativeByID, _ = loadCatalog(cfg)
+	} else {
+		nativeByID = cachedNativeMapping(cfg)
+	}
 
-	if native, ok := modelCatalog.nativeByID[cleanModel]; ok && native != "" {
+	if native, ok := nativeByID[cleanModel]; ok && native != "" {
 		return native
 	}
-	if native, ok := modelCatalog.nativeByID["agy/"+cleanModel]; ok && native != "" {
+	if native, ok := nativeByID["agy/"+cleanModel]; ok && native != "" {
 		return native
 	}
 	return cleanModel
+}
+
+func cachedNativeMapping(cfg pluginConfig) map[string]string {
+	key := catalogKey(cfg)
+	modelCatalog.Lock()
+	entry := modelCatalog.entries[key]
+	var mapping map[string]string
+	if entry != nil && len(entry.nativeByID) > 0 {
+		mapping = entry.nativeByID
+	}
+	modelCatalog.Unlock()
+	if len(mapping) > 0 {
+		return mapping
+	}
+	if _, diskMapping := readModelCatalogCache(cfg); len(diskMapping) > 0 {
+		return diskMapping
+	}
+	_, builtinMapping := builtinCatalog()
+	return builtinMapping
 }
 
 type effortSuffixSpec struct {
@@ -788,6 +916,10 @@ func defaultEffortForModel(model string) string {
 }
 
 func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOptions {
+	return resolveExecutionOptionsWithDiscovery(req, cfg, true)
+}
+
+func resolveExecutionOptionsWithDiscovery(req rpcExecutorRequest, cfg pluginConfig, discover bool) agyOptions {
 	var chatReq chatCompletionRequest
 	_ = json.Unmarshal(req.Payload, &chatReq)
 
@@ -860,7 +992,7 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 		effort = ""
 	}
 
-	nativeModel := resolveNativeModel(requestedModel, cfg)
+	nativeModel := resolveNativeModelWithDiscovery(requestedModel, cfg, discover)
 
 	return agyOptions{
 		NativeModel:     nativeModel,
@@ -1135,11 +1267,15 @@ type agyExecution struct {
 }
 
 func prepareAgyExecution(req rpcExecutorRequest) (agyExecution, error) {
+	return prepareAgyExecutionWithDiscovery(req, true)
+}
+
+func prepareAgyExecutionWithDiscovery(req rpcExecutorRequest, discover bool) (agyExecution, error) {
 	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
 	if err != nil {
 		return agyExecution{}, err
 	}
-	opts := resolveExecutionOptions(req, cfg)
+	opts := resolveExecutionOptionsWithDiscovery(req, cfg, discover)
 	session := conversationRef{Home: sessionHome(cfg.AccountHome), Managed: req.AuthID != ""}
 	nativeID, handoff, err := resolveConversation(opts.ConversationID, req.Headers, session)
 	if err != nil {
@@ -1423,7 +1559,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 			closePluginStream(streamID, err)
 			return
 		}
-		if requestWantsUsage(req.Payload) {
+		if streamWantsUsage(req) {
 			if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
 				closePluginStream(streamID, err)
 				return
@@ -1451,7 +1587,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		closePluginStream(streamID, err)
 		return
 	}
-	if requestWantsUsage(req.Payload) {
+	if streamWantsUsage(req) {
 		if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
 			closePluginStream(streamID, err)
 			return

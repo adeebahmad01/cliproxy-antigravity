@@ -38,18 +38,21 @@ gemini-4-hydrogen-xhigh	Gemini 4 Hydrogen (XHigh)
 	byID := map[string]modelInfo{}
 	for _, m := range models {
 		byID[m.ID] = m
+		if m.Name != m.ID {
+			t.Fatalf("model %q has Name=%q, want %q", m.ID, m.Name, m.ID)
+		}
 	}
-	if byID["agy/gemini-3.6-flash-high"].Name != "Gemini 3.6 Flash (High)" {
-		t.Fatalf("unexpected Name for gemini-3.6-flash-high: %q", byID["agy/gemini-3.6-flash-high"].Name)
+	if byID["agy/gemini-3.6-flash-high"].DisplayName != "Gemini 3.6 Flash (High)" {
+		t.Fatalf("unexpected DisplayName for gemini-3.6-flash-high: %q", byID["agy/gemini-3.6-flash-high"].DisplayName)
 	}
-	if byID["agy/gemini-3.6-flash"].Name != "Gemini 3.6 Flash" {
-		t.Fatalf("unexpected Name for base gemini-3.6-flash: %q", byID["agy/gemini-3.6-flash"].Name)
+	if byID["agy/gemini-3.6-flash"].DisplayName != "Gemini 3.6 Flash" {
+		t.Fatalf("unexpected DisplayName for base gemini-3.6-flash: %q", byID["agy/gemini-3.6-flash"].DisplayName)
 	}
-	if byID["agy/gemini-4-hydrogen-xhigh"].Name != "Gemini 4 Hydrogen (XHigh)" {
-		t.Fatalf("unexpected Name for gemini-4-hydrogen-xhigh: %q", byID["agy/gemini-4-hydrogen-xhigh"].Name)
+	if byID["agy/gemini-4-hydrogen-xhigh"].DisplayName != "Gemini 4 Hydrogen (XHigh)" {
+		t.Fatalf("unexpected DisplayName for gemini-4-hydrogen-xhigh: %q", byID["agy/gemini-4-hydrogen-xhigh"].DisplayName)
 	}
-	if byID["agy/gemini-4-hydrogen"].Name != "Gemini 4 Hydrogen" {
-		t.Fatalf("unexpected Name for base gemini-4-hydrogen: %q", byID["agy/gemini-4-hydrogen"].Name)
+	if byID["agy/gemini-4-hydrogen"].DisplayName != "Gemini 4 Hydrogen" {
+		t.Fatalf("unexpected DisplayName for base gemini-4-hydrogen: %q", byID["agy/gemini-4-hydrogen"].DisplayName)
 	}
 
 	rawModels, _ := parseAgyModelLines(`
@@ -62,17 +65,17 @@ claude-sonnet-4-6
 	for _, m := range rawModels {
 		rawByID[m.ID] = m
 	}
-	if rawByID["agy/gemini-3.8-flash"].Name != "Gemini 3.8 Flash" {
-		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gemini-3.8-flash"].Name)
+	if rawByID["agy/gemini-3.8-flash"].DisplayName != "Gemini 3.8 Flash" {
+		t.Fatalf("unexpected humanized DisplayName for raw base slug: %q", rawByID["agy/gemini-3.8-flash"].DisplayName)
 	}
-	if rawByID["agy/gemini-4-hydrogen"].Name != "Gemini 4 Hydrogen" || rawByID["agy/gemini-4-hydrogen-max"].Name != "Gemini 4 Hydrogen (Max)" {
-		t.Fatalf("unexpected humanized Name for raw max slug: %#v", rawByID)
+	if rawByID["agy/gemini-4-hydrogen"].DisplayName != "Gemini 4 Hydrogen" || rawByID["agy/gemini-4-hydrogen-max"].DisplayName != "Gemini 4 Hydrogen (Max)" {
+		t.Fatalf("unexpected humanized DisplayName for raw max slug: %#v", rawByID)
 	}
-	if rawByID["agy/gpt-oss-120b"].Name != "GPT-OSS 120B" {
-		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gpt-oss-120b"].Name)
+	if rawByID["agy/gpt-oss-120b"].DisplayName != "GPT-OSS 120B" {
+		t.Fatalf("unexpected humanized DisplayName for raw base slug: %q", rawByID["agy/gpt-oss-120b"].DisplayName)
 	}
-	if rawByID["agy/claude-sonnet-4-6"].Name != "Claude Sonnet 4.6" {
-		t.Fatalf("unexpected humanized Name for raw claude slug: %q", rawByID["agy/claude-sonnet-4-6"].Name)
+	if rawByID["agy/claude-sonnet-4-6"].DisplayName != "Claude Sonnet 4.6" {
+		t.Fatalf("unexpected humanized DisplayName for raw claude slug: %q", rawByID["agy/claude-sonnet-4-6"].DisplayName)
 	}
 
 	// Label-only output must keep clean baseSlug in nativeByID regardless of line or map order.
@@ -122,8 +125,11 @@ func TestHumanizeModelName(t *testing.T) {
 
 func TestStandardBuiltinModelsHaveCleanNames(t *testing.T) {
 	for _, m := range standardBuiltinModels() {
-		if m.Name == "" || looksLikeModelSlug(m.Name) {
-			t.Fatalf("builtin model %s has ugly slug name %q", m.ID, m.Name)
+		if m.DisplayName == "" || looksLikeModelSlug(m.DisplayName) {
+			t.Fatalf("builtin model %s has ugly slug DisplayName %q", m.ID, m.DisplayName)
+		}
+		if m.Name != m.ID {
+			t.Fatalf("builtin model %s has Name %q, want %q", m.ID, m.Name, m.ID)
 		}
 	}
 }
@@ -551,40 +557,6 @@ func TestParseAgyJSONOutputUsesTerminalLine(t *testing.T) {
 	}
 }
 
-func TestRouteModel(t *testing.T) {
-	invalidateModels()
-	cases := []struct {
-		model     string
-		providers []string
-		want      bool
-	}{
-		{"agy/gemini-3.8-flash", nil, true},
-		{"agy/gemini-3.8-flash(high)", nil, true},
-		{"agy/gemini-4-hydrogen(xhigh)", nil, true},
-		{"agy/default:high", nil, true},
-		{"agy/default:xhigh", nil, true},
-		{"agy/default:max", nil, true},
-		{"gemini-3.8-flash-high", nil, true},
-		{"gemini-3.8-flash-xhigh", nil, true},
-		{"gemini-3.8-flash-max", nil, true},
-		{"gemini-3.8-flash-extra-high", nil, true},
-		{"gemini-3.8-flash:xhigh", nil, true},
-		{"gemini-3.8-flash:max", nil, true},
-		{"antigravity/gemini-3.8-flash", nil, true},
-		{"antigravity/gemini-3.8-flash", []string{"antigravity"}, false},
-		{"gpt-5.5", nil, false},
-		{"gpt-5.5-xhigh", nil, false},
-		{"gpt-5.5-max", nil, false},
-		{"agy/gemini-3.8-flash", []string{"agy"}, false},
-	}
-	for _, tc := range cases {
-		resp := routeModel(modelRouteRequest{RequestedModel: tc.model, AvailableProviders: tc.providers})
-		if resp.Handled != tc.want || (tc.want && resp.TargetKind != "self") {
-			t.Errorf("routeModel(%q, %v) = %+v, want handled=%v", tc.model, tc.providers, resp, tc.want)
-		}
-	}
-}
-
 func TestFinishPluginStreamPropagatesDoneEmitError(t *testing.T) {
 	wantErr := errors.New("broken pipe")
 	var gotCloseErr error
@@ -683,6 +655,9 @@ func TestDiscoverModelsFallsBackToCachedCatalog(t *testing.T) {
 	models := discoverModels(cfg)
 	for _, model := range models {
 		if model.ID == "agy/gemini-4-neon" {
+			if model.Name != "agy/gemini-4-neon" {
+				t.Fatalf("legacy cached model Name = %q, want agy/gemini-4-neon", model.Name)
+			}
 			return
 		}
 	}

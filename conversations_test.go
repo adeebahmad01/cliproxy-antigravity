@@ -127,18 +127,3 @@ func TestInvalidConversationIDFailsClosed(t *testing.T) {
 		t.Fatalf("modified ID must fail closed: %v", err)
 	}
 }
-
-func TestNativeConversationRoutesOnlyToAntigravity(t *testing.T) {
-	req := modelRouteRequest{
-		RequestedModel:     "shared-model",
-		AvailableProviders: []string{"openai", "agy"},
-		Body:               []byte(`{"conversation_id":"agy.v1.proxy-id"}`),
-	}
-	if route := routeModel(req); !route.Handled || route.TargetKind != "provider" || route.Target != providerID {
-		t.Fatalf("shared model should route to the agy scheduler: %+v", route)
-	}
-	req.AvailableProviders = []string{"openai"}
-	if route := routeModel(req); !route.Handled || route.TargetKind != "self" {
-		t.Fatalf("missing agy accounts must not send native requests to another provider: %+v", route)
-	}
-}

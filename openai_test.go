@@ -306,6 +306,47 @@ func TestNormalizeArgumentsKeepsPlainObject(t *testing.T) {
 	}
 }
 
+func TestNormalizeArgumentsCompactsPrettyJSON(t *testing.T) {
+	pretty := json.RawMessage("{\n  \"command\": \"ls -la\",\n  \"nested\": {\n    \"ok\": true\n  }\n}")
+	got := normalizeArguments(pretty)
+	if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("expected single-line JSON, got %q", got)
+	}
+	if got != `{"command":"ls -la","nested":{"ok":true}}` {
+		t.Fatalf("unexpected compacted JSON: %q", got)
+	}
+
+	doublePretty := json.RawMessage(`"{\n  \"expr\": \"2+2\"\n}"`)
+	if got := normalizeArguments(doublePretty); got != `{"expr":"2+2"}` {
+		t.Fatalf("unexpected compacted double-encoded JSON: %q", got)
+	}
+}
+
+func TestStreamWantsUsage(t *testing.T) {
+	noInclude := []byte(`{"model":"agy/default","messages":[{"role":"user","content":"hi"}]}`)
+	withInclude := []byte(`{"model":"agy/default","stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)
+
+	cases := []struct {
+		name string
+		req  rpcExecutorRequest
+		want bool
+	}{
+		{"openai path without include_usage", rpcExecutorRequest{Payload: noInclude, Metadata: map[string]any{"request_path": "/v1/chat/completions"}}, false},
+		{"openai path with include_usage", rpcExecutorRequest{Payload: withInclude, Metadata: map[string]any{"request_path": "/v1/chat/completions"}}, true},
+		{"completions path without include_usage", rpcExecutorRequest{Payload: noInclude, Metadata: map[string]any{"request_path": "/v1/completions"}}, false},
+		{"gemini path even with SourceFormat openai", rpcExecutorRequest{Payload: noInclude, SourceFormat: "openai", Metadata: map[string]any{"request_path": "/v1beta/models/agy/default:streamGenerateContent"}}, true},
+		{"claude path without include_usage", rpcExecutorRequest{Payload: noInclude, SourceFormat: "openai", Metadata: map[string]any{"request_path": "/v1/messages"}}, true},
+		{"responses path without include_usage", rpcExecutorRequest{Payload: noInclude, SourceFormat: "openai", Metadata: map[string]any{"request_path": "/v1/responses"}}, true},
+		{"non-openai source format without path", rpcExecutorRequest{Payload: noInclude, SourceFormat: "gemini"}, true},
+		{"empty path and openai format", rpcExecutorRequest{Payload: noInclude, SourceFormat: "openai"}, false},
+	}
+	for _, tc := range cases {
+		if got := streamWantsUsage(tc.req); got != tc.want {
+			t.Errorf("%s: streamWantsUsage = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestDeclaredToolNames(t *testing.T) {
 	payload := []byte(`{"tools":[{"type":"function","function":{"name":"bash"}},{"type":"function","function":{"name":"subagent"}}]}`)
 	got := declaredToolNames(payload)
