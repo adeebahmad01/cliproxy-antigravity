@@ -125,34 +125,34 @@ def main() -> int:
         if rc != 0 or not registration.get("ok"):
             raise RuntimeError(f"registration failed: {registration}")
         result = registration["result"]
-        assert result["capabilities"]["executor_model_scope"] == "static"
+        assert result["capabilities"]["executor_model_scope"] == "oauth"
         fields = {f["Name"]: f for f in result["metadata"]["ConfigFields"]}
         if fields["reasoning_effort"]["Type"] != "enum" or fields["reasoning_effort"]["EnumValues"] != ["low", "medium", "high", "xhigh", "max"] or fields["binary_path"]["Default"] != "agy":
             raise RuntimeError(f"unexpected config field metadata: {fields}")
 
-        if not result["capabilities"].get("model_router"):
-            raise RuntimeError("expected model_router capability")
+        if result["capabilities"].get("model_router"):
+            raise RuntimeError("model_router must stay off: models are registered per agy auth")
 
         rc, model_response = call("model.register", {})
         if rc != 0 or not model_response.get("ok"):
             raise RuntimeError(f"model registration failed: {model_response}")
         model_ids = [m["ID"] for m in model_response["result"]["Models"]]
-        if "agy/default" not in model_ids or "agy/mock-model-high" not in model_ids or "agy/mock-model-xhigh" not in model_ids or "agy/mock-model" not in model_ids:
-            raise RuntimeError(f"expected default + discovered models: {model_ids}")
+        if "agy/default" not in model_ids:
+            raise RuntimeError(f"expected default model: {model_ids}")
 
-        # agy has no CLIProxyAPI auth record, so its models are routed straight to this executor.
+        rc, auth_models = call("model.for_auth", {"Metadata": {"home": tmp}})
+        if rc != 0 or not auth_models.get("ok"):
+            raise RuntimeError(f"model.for_auth failed: {auth_models}")
+        auth_model_by_id = {m["ID"]: m for m in auth_models["result"]["Models"]}
+        if "agy/mock-model-high" not in auth_model_by_id or "agy/mock-model-xhigh" not in auth_model_by_id or "agy/mock-model" not in auth_model_by_id:
+            raise RuntimeError(f"expected discovered models: {list(auth_model_by_id)}")
+        if auth_model_by_id["agy/mock-model-high"]["Name"] != "agy/mock-model-high" or auth_model_by_id["agy/mock-model-high"]["DisplayName"] != "Mock Model (High)":
+            raise RuntimeError(f"unexpected Name/DisplayName: {auth_model_by_id['agy/mock-model-high']}")
+        model_ids = list(auth_model_by_id)
+
         rc, route = call("model.route", {"RequestedModel": "agy/mock-model(high)"})
-        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
-            raise RuntimeError(f"expected self route for agy model: {route}")
-        rc, route = call("model.route", {"RequestedModel": "agy/mock-model:xhigh"})
-        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
-            raise RuntimeError(f"expected self route for :xhigh agy model: {route}")
-        rc, route = call("model.route", {"RequestedModel": "gemini-3.8-flash:max"})
-        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
-            raise RuntimeError(f"expected self route for :max built-in model: {route}")
-        rc, route = call("model.route", {"RequestedModel": "gpt-5.5"})
         if rc != 0 or route["result"]["Handled"]:
-            raise RuntimeError(f"foreign model must not be routed: {route}")
+            raise RuntimeError(f"model.route must not handle under oauth scope: {route}")
 
         chat_request = {
             "model": "agy/mock-model-high",

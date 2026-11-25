@@ -134,6 +134,19 @@ func TestEnsureAuthFileSyncsAccountsDir(t *testing.T) {
 	if got := len(readAgyAuthFiles(t, authDir)); got != 2 {
 		t.Fatalf("resync created duplicates: %d files", got)
 	}
+
+	// Deleting a synced auth file must not recreate it on the next sync while its home stays marked.
+	if err := os.Remove(filepath.Join(authDir, "antigravity-work@example.com.json")); err != nil {
+		t.Fatal(err)
+	}
+	ensureAuthFile(configYAML, cfg)
+	files = readAgyAuthFiles(t, authDir)
+	if len(files) != 1 || files["antigravity-work@example.com.json"] != nil {
+		t.Fatalf("deleted auth file was recreated: %v", files)
+	}
+	if !authFileIssued(filepath.Join(accountsDir, "work")) {
+		t.Fatal("expected issued marker to remain in account home")
+	}
 }
 
 func TestEnsureAuthFileAccountsDirKeepsSignedInDefault(t *testing.T) {

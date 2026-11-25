@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -532,9 +533,19 @@ func fencedToolCallPayloads(text string) []string {
 	return out
 }
 
-// normalizeArguments renders tool arguments as the JSON text clients expect. Some
-// models double-encode them as a JSON string ({"command":"ls"} quoted), which
-// makes clients parse a string instead of an object and fail the call.
+// compactJSON removes insignificant whitespace from valid JSON so multi-line
+// tool arguments cannot split single-line SSE frames on translated routes.
+func compactJSON(s string) string {
+	var out bytes.Buffer
+	if json.Compact(&out, []byte(s)) == nil && out.Len() > 0 {
+		return out.String()
+	}
+	return s
+}
+
+// normalizeArguments renders tool arguments as the single-line JSON text clients expect. Some
+// models double-encode them as a JSON string ({"command":"ls"} quoted) or pretty-print newlines,
+// which breaks translated SSE frames when embedded raw.
 func normalizeArguments(raw json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
@@ -548,9 +559,12 @@ func normalizeArguments(raw json.RawMessage) string {
 				return "{}"
 			}
 			if json.Valid([]byte(unquoted)) {
-				return unquoted
+				return compactJSON(unquoted)
 			}
 		}
+	}
+	if json.Valid([]byte(trimmed)) {
+		return compactJSON(trimmed)
 	}
 	return trimmed
 }
@@ -725,6 +739,26 @@ func newCallID() string {
 		return hex.EncodeToString(buf)
 	}
 	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// streamWantsUsage reports whether a stream should end with a usage chunk.
+// Direct OpenAI routes honor stream_options.include_usage; translated routes
+// (Gemini, Claude, Responses) always need the usage chunk so CLIProxyAPI can
+// populate usageMetadata and cached-token counts even when SourceFormat is "openai".
+func streamWantsUsage(req rpcExecutorRequest) bool {
+	path, _ := req.Metadata["request_path"].(string)
+	if path == "/v1/chat/completions" || path == "/v1/completions" {
+		return requestWantsUsage(req.Payload)
+	}
+	if path != "" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(req.SourceFormat)) {
+	case "", "openai", "chat-completions", "openai-chat":
+		return requestWantsUsage(req.Payload)
+	default:
+		return true
+	}
 }
 
 func requestWantsUsage(raw []byte) bool {

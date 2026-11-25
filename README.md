@@ -47,11 +47,11 @@ Google Antigravity
 - Antigravity token usage mapped to OpenAI-compatible usage fields
 - No Antigravity OAuth/token extraction
 - No direct calls to private Antigravity services
-- No fake CLIProxyAPI Antigravity credential: the plugin's `model_router` capability sends its models straight to its own executor, so no auth file is needed
+- Per-account model discovery (`model.for_auth`, `oauth` scope): each enabled `agy` auth file registers the models its own `HOME` reports
 
 The plugin registers under the provider key **`agy`**, and supports requests addressed to `agy/*`, `antigravity/*`, or unprefixed models.
 
-Because `agy` manages its own login, CLIProxyAPI has no auth record to schedule for these models. The plugin therefore routes `agy/*` models, its published unprefixed models, and `antigravity/*` models (only while CLIProxyAPI's built-in Antigravity provider has no credentials) to itself. If you do add an auth record with provider `agy`, routing is left to CLIProxyAPI's normal credential path. Requests can arrive through any CLIProxyAPI entry protocol (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`); the host translates them to Chat Completions for the plugin.
+Requests are served through an enabled `agy` auth file in CLIProxyAPI's `auth-dir` (`type: agy`, `disabled` absent or false, `home` pointing at a signed-in account home, or omitting `home` to use the process `HOME`). Without an enabled `agy` auth file, no `agy` models are registered. Models are discovered per account home via `model.for_auth`, so enabling or disabling accounts in the panel updates the available models. Requests can arrive through any CLIProxyAPI entry protocol (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`); the host translates them to Chat Completions for the plugin.
 
 ## Requirements & Platform Support
 
@@ -385,9 +385,9 @@ For requests without a native conversation ID, CLIProxyAPI chooses an eligible a
 Things to know:
 
 - New chats follow your routing strategy. [Native resumes](#conversation-resumption) stay with the original account unless your client explicitly replays the chat on another account.
-- **Disable** keeps an auth record out of rotation without removing its sign-in. With no enabled agy auth records, the plugin can still use the sign-in in the CLIProxyAPI process's HOME. Disable the plugin to stop serving agy requests entirely.
-- **Remove** deletes the auth file but keeps the signed-in agy home. If `accounts_dir` scans that home, a later plugin reconfiguration can import it again.
-- Model discovery (`agy models`) and `GET /v0/management/agy/limits` use the CLIProxyAPI process's HOME.
+- **Disable** keeps an auth record out of rotation without removing its sign-in, and retires its account-specific model registration. With no enabled `agy` auth records, no `agy` models are registered. Disable the plugin to stop serving `agy` requests entirely.
+- **Remove** deletes the auth file but keeps the signed-in agy home. The plugin writes a `.cpa-auth-file-issued` marker inside each issued account home so `accounts_dir` will not recreate a panel-deleted auth file on restart or reload (remove the marker file if you want `accounts_dir` to re-import it).
+- Model discovery (`agy models`) runs per enabled account home (`HOME`), outside the catalog lock.
 - Each home has its own agy settings, MCP servers and plugins. The `workdir` is shared.
 
 ### Permission safety

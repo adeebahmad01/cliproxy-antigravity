@@ -4,6 +4,18 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Model discovery now uses `oauth` executor scope (`model.for_auth`) per enabled `agy` auth file rather than `static` scope with a `model_router` self-route (adapted from `@seiry`, #23). Each enabled auth registers models discovered under its own `HOME`, requiring at least one enabled `agy` auth file to serve `agy` models.
+
+### Fixed
+
+- Gemini-format model lists now publish the routable model ID as `Name` and keep the human-readable label in `DisplayName` (adapted from `@seiry`, #23).
+- Tool-call arguments are compacted to single-line JSON (`json.Compact`) so pretty-printed multi-line arguments no longer split translated Gemini SSE frames (adapted from `@seiry`, #23).
+- Auth files deleted in the panel are no longer recreated on restart/reload while their home stays signed in, tracked via `.cpa-auth-file-issued` in each issued account home (adapted from `@seiry`, #23).
+- Model catalog refreshes now run outside the catalog lock with per-home caching, singleflight deduplication, short failure backoff, retirement of disabled/removed accounts (including the last account), and zero discovery calls during `model.register`, `model.static`, and `executor.count_tokens` (adapted from `@seiry`, #23).
+- Translated streaming routes (Gemini, Claude, Responses) always emit the final usage chunk for `usageMetadata` and cached-token reporting while direct OpenAI routes continue honoring `stream_options.include_usage` (adapted from `@seiry`, #23).
+
 ### Added
 
 - `max_prompt_bytes`: opt-in staging for requests larger than the inline prompt that `agy` accepts. `agy` truncates that prompt from the tail, which drops the newest user turn on long conversations; above the threshold the full prompt is written to `os.TempDir()/cliproxy-prompts/<random>` (`0600`, outside `workdir`) and `agy` is asked to read exactly that one file. Disabled by default — the truncation cap is agy-version dependent, so no threshold is assumed (~150000 is a conservative starting point).

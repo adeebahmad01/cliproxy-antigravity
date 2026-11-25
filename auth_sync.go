@@ -53,6 +53,7 @@ func ensureAuthFile(configYAML []byte, cfg pluginConfig) {
 			hasAgyAuth = true
 			if home, errHome := validateWorkdir(meta.Home); errHome == nil && home != "" {
 				knownHomes[home] = true
+				markAuthFileIssued(home)
 			}
 		}
 	}
@@ -99,7 +100,7 @@ func syncAccountAuthFiles(authDir, accountsDir string, knownHomes map[string]boo
 			continue
 		}
 		home := filepath.Join(accountsDir, entry.Name())
-		if knownHomes[home] || !accountSignedIn(home) {
+		if knownHomes[home] || authFileIssued(home) || !accountSignedIn(home) {
 			continue
 		}
 		email := emailFromHome(home)
@@ -132,7 +133,76 @@ func writeAgyAuthFile(path, email, home string) {
 	if errMarshal != nil {
 		return
 	}
-	_ = os.WriteFile(path, encoded, 0o600)
+	if os.WriteFile(path, encoded, 0o600) == nil && home != "" {
+		markAuthFileIssued(home)
+	}
+}
+
+// authFileIssuedMarker sits in an account home once an auth file was created for it, so an auth
+// file deleted in the panel stays deleted instead of being recreated from the signed-in home.
+const authFileIssuedMarker = ".cpa-auth-file-issued"
+
+func markAuthFileIssued(home string) {
+	marker := filepath.Join(home, authFileIssuedMarker)
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	_ = os.WriteFile(marker, nil, 0o600)
+}
+
+func authFileIssued(home string) bool {
+	_, err := os.Stat(filepath.Join(home, authFileIssuedMarker))
+	return err == nil
+}
+
+// enabledAgyHomes lists the homes of enabled, signed-in agy auth files, deduped. An empty entry is
+// the process HOME, which an auth file without a home runs against. The boolean reports whether
+// authDir could be read, so callers can distinguish zero enabled accounts from an unconfigured dir.
+func enabledAgyHomes(authDir string) ([]string, bool) {
+	if authDir == "" {
+		return nil, false
+	}
+	entries, err := os.ReadDir(authDir)
+	if err != nil {
+		return nil, false
+	}
+	var homes []string
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(authDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			Type     string `json:"type"`
+			Disabled bool   `json:"disabled"`
+			Home     string `json:"home"`
+		}
+		if json.Unmarshal(data, &meta) != nil || !strings.EqualFold(meta.Type, providerID) || meta.Disabled {
+			continue
+		}
+		home := ""
+		if strings.TrimSpace(meta.Home) != "" {
+			validated, err := validateWorkdir(meta.Home)
+			if err != nil || !accountSignedIn(validated) {
+				continue
+			}
+			home = validated
+		} else {
+			processHome, err := os.UserHomeDir()
+			if err != nil || !accountSignedIn(processHome) {
+				continue
+			}
+		}
+		if !seen[home] {
+			seen[home] = true
+			homes = append(homes, home)
+		}
+	}
+	return homes, true
 }
 
 func agyStateDir(home string) string {
