@@ -230,6 +230,31 @@ func TestAgyArgsClaudeOmitsEffort(t *testing.T) {
 	}
 }
 
+func TestAgyArgsOrchestratorOmitsEffort(t *testing.T) {
+	cfg := defaultConfig()
+	for _, model := range []string{"gemini-pro-orchestrator", "gemini-pro-orchestrator-argon", "gemini-pro-orchestrator-neon"} {
+		got := agyArgs(cfg, agyOptions{NativeModel: model, ReasoningEffort: "high"})
+		want := []string{
+			"--output-format", "json",
+			"--print-timeout", "30m",
+			"--disable-slash-commands",
+			"--model", model,
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("agyArgs(%q) = %#v, want %#v", model, got, want)
+		}
+	}
+}
+
+func TestDefaultEffortSkipsOrchestrator(t *testing.T) {
+	if supportsEffort("agy/gemini-pro-orchestrator") {
+		t.Fatal("supportsEffort(agy/gemini-pro-orchestrator) = true, want false")
+	}
+	if !supportsEffort("agy/gemini-4-neon") {
+		t.Fatal("supportsEffort(agy/gemini-4-neon) = false, want true")
+	}
+}
+
 func TestResolveExecutionOptions(t *testing.T) {
 	useTempModelCache(t)
 	invalidateModels()

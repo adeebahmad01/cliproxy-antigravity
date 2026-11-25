@@ -909,6 +909,10 @@ func supportsEffort(model string) bool {
 	if strings.HasPrefix(lower, "claude-") {
 		return false
 	}
+	// agy rejects --effort for the orchestrator models ("--effort is not supported").
+	if strings.HasPrefix(lower, "gemini-pro-orchestrator") {
+		return false
+	}
 	return true
 }
 
