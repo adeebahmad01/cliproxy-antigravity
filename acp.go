@@ -910,7 +910,7 @@ func drainACP(limit time.Duration) {
 
 // runACP executes one prompt on the resident agy for cfg's account. onDelta, when set, receives
 // assistant text as it streams; returning an error from it cancels the ACP turn.
-func runACP(cfg pluginConfig, opts agyOptions, plan *acpPlan, onDelta func(string) error) (agyResult, *acpConv, error) {
+func runACP(cfg pluginConfig, opts agyOptions, plan *acpPlan, onDelta func(string) error, onPromptStart func(), canRetry func() bool) (agyResult, *acpConv, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(cfg))
 	defer cancel()
 
@@ -932,15 +932,15 @@ func runACP(cfg pluginConfig, opts agyOptions, plan *acpPlan, onDelta func(strin
 			return agyResult{}, nil, err
 		}
 	}
-	result, conv, err, retryable := runACPOnce(ctx, cfg, opts, blocks, wrapped, reuse)
+	result, conv, err, retryable := runACPOnce(ctx, cfg, opts, blocks, wrapped, onPromptStart, reuse)
 	// A reused session that is gone (agy restarted, session evicted) is replayed in full, as is a
-	// fresh session whose resident died; both only before any text reached the client.
-	if err != nil && !emitted && ctx.Err() == nil && (retryable || (reuse != nil && sessionGone(err))) {
+	// fresh session whose resident died; both only before any chunk reached the client.
+	if err != nil && !emitted && (canRetry == nil || canRetry()) && ctx.Err() == nil && (retryable || (reuse != nil && sessionGone(err))) {
 		full, fullErr := plan.ensureFull()
 		if fullErr != nil {
 			return agyResult{}, nil, fullErr
 		}
-		result, conv, err, _ = runACPOnce(ctx, cfg, opts, full, wrapped, nil)
+		result, conv, err, _ = runACPOnce(ctx, cfg, opts, full, wrapped, onPromptStart, nil)
 	}
 	return result, conv, err
 }
@@ -952,7 +952,7 @@ func sessionGone(err error) bool {
 
 // runACPOnce runs one turn on reuse's session, or a fresh one. A successful turn leaves the session
 // open for the caller to retain; retryable=true only when the resident died under the request.
-func runACPOnce(ctx context.Context, cfg pluginConfig, opts agyOptions, blocks []acpPromptBlock, onDelta func(string) error, reuse *acpConv) (agyResult, *acpConv, error, bool) {
+func runACPOnce(ctx context.Context, cfg pluginConfig, opts agyOptions, blocks []acpPromptBlock, onDelta func(string) error, onPromptStart func(), reuse *acpConv) (agyResult, *acpConv, error, bool) {
 	var c *acpClient
 	var sessionID string
 	if reuse != nil {
@@ -987,6 +987,9 @@ func runACPOnce(ctx context.Context, cfg pluginConfig, opts agyOptions, blocks [
 	}
 
 	sink := c.register(sessionID)
+	if onPromptStart != nil {
+		onPromptStart()
+	}
 	result, err, retryable := runACPTurn(ctx, c, sessionID, sink, blocks, onDelta)
 	if err != nil {
 		c.closeSession(sessionID)

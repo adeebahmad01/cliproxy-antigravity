@@ -4,6 +4,15 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `max_prompt_action`: optional `error` mode for `max_prompt_bytes` (keeping `stage` as the default) that rejects oversized prompts with non-retryable HTTP `413` (`request_scoped`) in both `print` and `acp` modes so clients know to compact before retrying (#32).
+- `stream_keepalive_interval`: opt-in streaming keepalive (minimum `15s`, disabled by default) that emits no-op content deltas after `agy` initializes a turn, keeping reverse proxies from dropping silent staged turns without touching `finish_reason` or `[DONE]` framing (#32).
+
+### Fixed
+
+- `executor.count_tokens` now measures the built conversation directly without staging temp files to disk or failing under `max_prompt_action: error`, and `promptForTokenCount` preserves the full prompt on staged managed-session resumes and explicit cross-account handoffs.
+
 ## [0.6.0] - 2026-11-25
 
 ### Changed

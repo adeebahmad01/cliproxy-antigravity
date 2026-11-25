@@ -172,6 +172,10 @@ func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPla
 	if conv != nil {
 		var attachments []acpPromptBlock
 		text, err := buildFollowUpPrompt(chatReq.Messages[last+1:], len(chatReq.Tools) > 0, cfg.Workdir, &attachments)
+		if err == nil && cfg.MaxPromptBytes > 0 && cfg.MaxPromptAction == promptActionError && len(text) > cfg.MaxPromptBytes {
+			releaseMediaRefs(mediaPathsFromBlocks(attachments))
+			err = promptTooLargeError(len(text), cfg.MaxPromptBytes)
+		}
 		if err == nil {
 			plan.reuse = conv
 			plan.follow = append([]acpPromptBlock{{"type": "text", "text": text}}, attachments...)

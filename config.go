@@ -24,12 +24,14 @@ type pluginConfig struct {
 	LimitsRefreshInterval      string
 	EnforceLimits              bool
 	AccountsDir                string
-	// MaxPromptBytes, when > 0, stages requests larger than this to a private
-	// temp file that agy reads in full. Disabled by default: the cap it works
+	// MaxPromptBytes, when > 0, applies MaxPromptAction ("stage" or "error") to
+	// requests larger than this many bytes. Disabled by default: the cap it works
 	// around is agy-version dependent, so no number is assumed.
-	MaxPromptBytes int
-	Mode           string
-	ConvDebugFile  string
+	MaxPromptBytes          int
+	MaxPromptAction         string
+	StreamKeepaliveInterval string
+	Mode                    string
+	ConvDebugFile           string
 	// AccountHome is the HOME given to agy for the account selected by CLIProxyAPI.
 	// It comes from the "home" field of the agy auth file, never from the plugin YAML.
 	AccountHome string
@@ -41,13 +43,17 @@ func defaultConfig() pluginConfig {
 		PrintTimeout:          "30m",
 		LimitsTracking:        true,
 		LimitsRefreshInterval: "1m",
+		MaxPromptAction:       promptActionStage,
 		Mode:                  modePrint,
 	}
 }
 
 const (
-	modeACP   = "acp"
-	modePrint = "print"
+	modeACP            = "acp"
+	modePrint          = "print"
+	promptActionStage  = "stage"
+	promptActionError  = "error"
+	minStreamKeepalive = 15 * time.Second
 )
 
 // acpSettingsChanged reports a change that running resident agy processes cannot pick up.
@@ -378,6 +384,24 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return pluginConfig{}, fmt.Errorf("line %d: invalid max_prompt_bytes %q: must be an integer >= 16384", lineNo+1, value)
 			}
 			cfg.MaxPromptBytes = parsed
+		case "max_prompt_action":
+			action := strings.ToLower(value)
+			if action != promptActionStage && action != promptActionError {
+				return pluginConfig{}, fmt.Errorf("line %d: max_prompt_action must be stage or error", lineNo+1)
+			}
+			cfg.MaxPromptAction = action
+		case "stream_keepalive_interval":
+			d, err := time.ParseDuration(value)
+			if err != nil {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid stream_keepalive_interval %q: %w", lineNo+1, value, err)
+			}
+			if d == 0 {
+				cfg.StreamKeepaliveInterval = ""
+			} else if d < minStreamKeepalive {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid stream_keepalive_interval %q: must be at least 15s (or 0s to disable)", lineNo+1, value)
+			} else {
+				cfg.StreamKeepaliveInterval = value
+			}
 		case "mode":
 			mode := strings.ToLower(value)
 			if mode != modeACP && mode != modePrint {
@@ -399,6 +423,17 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 		return pluginConfig{}, err
 	}
 	return cfg, nil
+}
+
+func streamKeepaliveInterval(cfg pluginConfig) time.Duration {
+	if strings.TrimSpace(cfg.StreamKeepaliveInterval) == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(cfg.StreamKeepaliveInterval)
+	if err != nil || d < minStreamKeepalive {
+		return 0
+	}
+	return d
 }
 
 func normalizeConfigKey(s string) string {

@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -769,6 +771,17 @@ func emptyResponseError() error {
 	)
 }
 
+// promptTooLargeError marks a request that exceeded max_prompt_bytes when
+// max_prompt_action is set to error. Non-retryable at the same payload so
+// clients know to compact before retrying.
+func promptTooLargeError(promptBytes, limit int) error {
+	return pError(
+		errorCodeRequestScoped,
+		fmt.Sprintf("built prompt is %d bytes, exceeding max_prompt_bytes (%d); compact the conversation or raise max_prompt_bytes", promptBytes, limit),
+		http.StatusRequestEntityTooLarge,
+	)
+}
+
 func newCallID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err == nil {
@@ -916,8 +929,10 @@ func makeChatChunk(id string, created int64, model string, delta map[string]any,
 }
 
 // chatStream writes Chat Completions chunks to a plugin stream. The role chunk waits
-// for the first real output so startup errors can still reach the host's retry path.
+// for the first real output (or keepalive tick after startup) so startup errors can
+// still reach the host's retry path.
 type chatStream struct {
+	mu             sync.Mutex
 	streamID       string
 	completionID   string
 	created        int64
@@ -925,6 +940,12 @@ type chatStream struct {
 	conversationID string
 	rawChunks      bool
 	sentRole       bool
+	closed         bool
+	emitChunk      func(string, []byte) error
+	closeStream    func(string, error)
+	keepaliveStop  chan struct{}
+	keepaliveOnce  sync.Once
+	keepaliveWG    sync.WaitGroup
 }
 
 func newChatStream(req rpcExecutorRequest, conversationID string) *chatStream {
@@ -937,30 +958,135 @@ func newChatStream(req rpcExecutorRequest, conversationID string) *chatStream {
 		conversationID: conversationID,
 		// The OpenAI HTTP handlers frame plain JSON chunks and send [DONE].
 		// Other entrypoints may translate these chunks as SSE, so keep that framing.
-		rawChunks: path == "/v1/chat/completions" || path == "/v1/completions",
+		rawChunks:   path == "/v1/chat/completions" || path == "/v1/completions",
+		emitChunk:   emitPluginStreamChunk,
+		closeStream: closePluginStream,
 	}
 }
 
-func (s *chatStream) send(delta map[string]any, finishReason *string, usage map[string]any) error {
+func (s *chatStream) setConversationID(conversationID string) {
+	s.mu.Lock()
+	s.conversationID = conversationID
+	s.mu.Unlock()
+}
+
+func (s *chatStream) hasSent() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sentRole
+}
+
+func (s *chatStream) sendLocked(delta map[string]any, finishReason *string, usage map[string]any) error {
 	chunk := makeChatChunk(s.completionID, s.created, s.model, delta, finishReason, usage, s.conversationID)
 	if !s.rawChunks {
 		chunk = append(append([]byte("data: "), chunk...), '\n', '\n')
 	}
-	return emitPluginStreamChunk(s.streamID, chunk)
+	return s.emitChunk(s.streamID, chunk)
 }
 
-func (s *chatStream) emit(delta map[string]any, finishReason *string, usage map[string]any) error {
+func (s *chatStream) emitLocked(delta map[string]any, finishReason *string, usage map[string]any) error {
+	if s.closed {
+		return errors.New("stream already closed")
+	}
 	if !s.sentRole {
-		if err := s.send(map[string]any{"role": "assistant"}, nil, nil); err != nil {
+		if err := s.sendLocked(map[string]any{"role": "assistant"}, nil, nil); err != nil {
 			return err
 		}
 		s.sentRole = true
 	}
-	return s.send(delta, finishReason, usage)
+	return s.sendLocked(delta, finishReason, usage)
+}
+
+func (s *chatStream) emit(delta map[string]any, finishReason *string, usage map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.emitLocked(delta, finishReason, usage)
+}
+
+func (s *chatStream) emitKeepalive(stop <-chan struct{}) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-stop:
+		return false
+	default:
+	}
+	if s.closed {
+		return false
+	}
+	return s.emitLocked(map[string]any{"content": ""}, nil, nil) == nil
+}
+
+// startKeepalive emits no-op content deltas on interval until stopKeepalive or
+// terminal closure. Tests can pass any positive duration; config enforces >= 15s.
+func (s *chatStream) startKeepalive(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.closed || s.keepaliveStop != nil {
+		s.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	s.keepaliveStop = stop
+	s.keepaliveWG.Add(1)
+	s.mu.Unlock()
+
+	safeGo("streamKeepalive", func() {
+		defer s.keepaliveWG.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if !s.emitKeepalive(stop) {
+					return
+				}
+			}
+		}
+	})
+}
+
+// stopKeepalive stops the keepalive ticker and waits for any in-flight tick
+// emission to finish before terminal chunks or [DONE] are written.
+func (s *chatStream) stopKeepalive() {
+	s.mu.Lock()
+	stop := s.keepaliveStop
+	s.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	s.keepaliveOnce.Do(func() { close(stop) })
+	s.keepaliveWG.Wait()
 }
 
 func (s *chatStream) finish() {
-	finishPluginStream(s.streamID, s.rawChunks, emitPluginStreamChunk, closePluginStream)
+	s.stopKeepalive()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	streamID, rawChunks, emitChunk, closeStream := s.streamID, s.rawChunks, s.emitChunk, s.closeStream
+	s.mu.Unlock()
+	finishPluginStream(streamID, rawChunks, emitChunk, closeStream)
+}
+
+func (s *chatStream) closeError(err error) {
+	s.stopKeepalive()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	streamID, closeStream := s.streamID, s.closeStream
+	s.mu.Unlock()
+	closeStream(streamID, err)
 }
 
 // isPathUnder reports whether path is base or below it, comparing cleaned paths.

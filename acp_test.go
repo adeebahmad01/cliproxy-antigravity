@@ -747,3 +747,50 @@ func TestACPProtectedMediaCountLimitAndWriteCancellationAndTempShutdown(t *testi
 		t.Fatal("expected retireAllACP to shut down tracked temporary discovery client")
 	}
 }
+
+func TestACPMaxPromptActionErrorReturns413AndRestoresSession(t *testing.T) {
+	setConfig(pluginConfig{BinaryPath: "agy", Mode: modeACP, MaxPromptBytes: 20000, MaxPromptAction: promptActionError})
+	t.Cleanup(func() {
+		dropAllConvs()
+		setConfig(defaultConfig())
+	})
+	cfg := currentConfig()
+	opts := agyOptions{NativeModel: "gemini-4-hydrogen"}
+
+	// 1. Fresh request exceeding MaxPromptBytes rejects with 413 request_scoped.
+	blob := strings.Repeat("x", 30000)
+	fullReq := rpcExecutorRequest{
+		Model:   "agy/gemini-4-hydrogen",
+		Payload: []byte(`{"model":"agy/gemini-4-hydrogen","messages":[{"role":"user","content":"` + blob + `"}]}`),
+	}
+	_, err := planACP(fullReq, opts, cfg)
+	var pe *pluginError
+	if !errors.As(err, &pe) || pe.HTTPStatus != http.StatusRequestEntityTooLarge || pe.Code != errorCodeRequestScoped {
+		t.Fatalf("expected 413 %s for oversized ACP full prompt, got %v", errorCodeRequestScoped, err)
+	}
+
+	// 2. Reused session with oversized follow-up restores the session and rejects with 413.
+	priorMsgs := []chatMessage{
+		{Role: "user", Content: json.RawMessage(`"hi"`)},
+		{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+	}
+	client := &acpClient{
+		dead: make(chan struct{}),
+		in:   nopWriteCloser{},
+		cmd:  &exec.Cmd{},
+	}
+	key := convKey(convScope(cfg, opts), nil, priorMsgs)
+	putConv(key, &acpConv{client: client, sessionID: "sess-1"})
+
+	followReq := rpcExecutorRequest{
+		Model:   "agy/gemini-4-hydrogen",
+		Payload: []byte(`{"model":"agy/gemini-4-hydrogen","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"` + blob + `"}]}`),
+	}
+	_, err = planACP(followReq, opts, cfg)
+	if !errors.As(err, &pe) || pe.HTTPStatus != http.StatusRequestEntityTooLarge || pe.Code != errorCodeRequestScoped {
+		t.Fatalf("expected 413 %s for oversized ACP follow-up, got %v", errorCodeRequestScoped, err)
+	}
+	if restored := takeConv(key); restored == nil || restored.sessionID != "sess-1" {
+		t.Fatalf("expected cached ACP session to be restored after 413 error, got %+v", restored)
+	}
+}
