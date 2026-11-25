@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -176,7 +178,7 @@ func buildChatPromptWithAttachments(req chatCompletionRequest, convID, workdir s
 		}
 		if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" && string(msg.ToolCalls) != "[]" {
 			b.WriteString("Prior assistant tool calls:\n")
-			b.Write(msg.ToolCalls)
+			b.WriteString(compactJSON(string(msg.ToolCalls)))
 			b.WriteByte('\n')
 		}
 	}
@@ -189,7 +191,7 @@ func writeToolInstruction(b *strings.Builder, tools []json.RawMessage) {
 	b.WriteString("[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]\n")
 	b.WriteString("The client application has provided the following tools:\n")
 	for _, tool := range tools {
-		b.Write(tool)
+		b.WriteString(compactJSON(string(tool)))
 		b.WriteByte('\n')
 	}
 	if names := toolNamesFromSpecs(tools); len(names) > 0 {
@@ -293,11 +295,22 @@ func removeStagedPrompt(path string) {
 
 // fileHandoffPrompt is the short inline prompt sent when the request is staged.
 func fileHandoffPrompt(path string, promptBytes int) string {
-	return fmt.Sprintf("READ THIS FIRST: this turn's complete client request (%d bytes) is stored in the file %s .\n"+
-		"Read exactly that one file in full before answering: use your file-reading tool with offset/limit and keep reading until you have consumed every line. Do not read any other file.\n"+
-		"The file begins with a [SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING] block that defines the client's tools, followed by the conversation transcript and the latest user request.\n"+
-		"Follow those instructions exactly: answer the latest user request, and when a client tool call is required reply ONLY with the fenced tool_calls JSON block described there.\n"+
-		"Do not modify files, run local commands, or inspect the machine beyond reading that file.\n", promptBytes, path)
+	return fileHandoffPromptFor(path, promptBytes, true)
+}
+
+func fileHandoffPromptFor(path string, promptBytes int, hasTools bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "READ THIS FIRST: this turn's complete client request (%d bytes) is stored in the file %s .\n", promptBytes, path)
+	b.WriteString("Read exactly that one file in full before answering: use your file-reading tool with offset/limit and keep reading until you have consumed every line. Do not read any other file.\n")
+	if hasTools {
+		b.WriteString("The file begins with a [SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING] block that defines the client's tools, followed by the conversation transcript and the latest user request.\n")
+		b.WriteString("Follow those instructions exactly: answer the latest user request, and when a client tool call is required reply ONLY with the fenced tool_calls JSON block described there.\n")
+	} else {
+		b.WriteString("The file contains the system/developer instructions, the conversation transcript, and the latest user request.\n")
+		b.WriteString("Follow those instructions and answer the latest user request directly without leaving the reply empty.\n")
+	}
+	b.WriteString("Do not modify files, run local commands, or inspect the machine beyond reading that file.\n")
+	return b.String()
 }
 
 func stageImage(dataURLOrPath string, workdir string) (string, error) {
@@ -769,6 +782,36 @@ func emptyResponseError() error {
 	)
 }
 
+func emptyResponseErrorForStaged(stagedBytes int) error {
+	return pRetryableError(
+		"empty_assistant_response",
+		fmt.Sprintf("agy returned no assistant text after staging a %d-byte prompt: agy may have blocked reading the staged temp file (requires agy >= 1.5.14 auto mode or dangerously_skip_permissions: true without sandbox blocking temp reads); you can also set max_prompt_action: error or max_prompt_bytes: 0", stagedBytes),
+		http.StatusBadGateway,
+	)
+}
+
+// promptTooLargeError marks a request that exceeded max_prompt_bytes when
+// max_prompt_action is set to error. Non-retryable at the same payload so
+// clients know to compact before retrying.
+func promptTooLargeError(promptBytes, limit int) error {
+	return promptTooLargeErrorWithContext(promptBytes, limit, 0, 0)
+}
+
+func promptTooLargeErrorWithContext(promptBytes, limit, msgCount, toolCount int) error {
+	if msgCount > 0 || toolCount > 0 {
+		return pError(
+			errorCodeRequestScoped,
+			fmt.Sprintf("built prompt is %d bytes (%d messages, %d tools), exceeding max_prompt_bytes (%d); compact the conversation or raise max_prompt_bytes", promptBytes, msgCount, toolCount, limit),
+			http.StatusRequestEntityTooLarge,
+		)
+	}
+	return pError(
+		errorCodeRequestScoped,
+		fmt.Sprintf("built prompt is %d bytes, exceeding max_prompt_bytes (%d); compact the conversation or raise max_prompt_bytes", promptBytes, limit),
+		http.StatusRequestEntityTooLarge,
+	)
+}
+
 func newCallID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err == nil {
@@ -915,9 +958,16 @@ func makeChatChunk(id string, created int64, model string, delta map[string]any,
 	return raw
 }
 
+var (
+	chatStreamEmitChunk = emitPluginStreamChunk
+	chatStreamClose     = closePluginStream
+)
+
 // chatStream writes Chat Completions chunks to a plugin stream. The role chunk waits
-// for the first real output so startup errors can still reach the host's retry path.
+// for the first real output (or keepalive tick after startup) so startup errors can
+// still reach the host's retry path.
 type chatStream struct {
+	mu             sync.Mutex
 	streamID       string
 	completionID   string
 	created        int64
@@ -925,6 +975,13 @@ type chatStream struct {
 	conversationID string
 	rawChunks      bool
 	sentRole       bool
+	closed         bool
+	emitChunk      func(string, []byte) error
+	closeStream    func(string, error)
+	keepaliveStop  chan struct{}
+	keepaliveErr   error
+	keepaliveOnce  sync.Once
+	keepaliveWG    sync.WaitGroup
 }
 
 func newChatStream(req rpcExecutorRequest, conversationID string) *chatStream {
@@ -937,30 +994,149 @@ func newChatStream(req rpcExecutorRequest, conversationID string) *chatStream {
 		conversationID: conversationID,
 		// The OpenAI HTTP handlers frame plain JSON chunks and send [DONE].
 		// Other entrypoints may translate these chunks as SSE, so keep that framing.
-		rawChunks: path == "/v1/chat/completions" || path == "/v1/completions",
+		rawChunks:   path == "/v1/chat/completions" || path == "/v1/completions",
+		emitChunk:   chatStreamEmitChunk,
+		closeStream: chatStreamClose,
 	}
 }
 
-func (s *chatStream) send(delta map[string]any, finishReason *string, usage map[string]any) error {
+func (s *chatStream) setConversationID(conversationID string) {
+	s.mu.Lock()
+	s.conversationID = conversationID
+	s.mu.Unlock()
+}
+
+func (s *chatStream) hasSent() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sentRole
+}
+
+func (s *chatStream) sendLocked(delta map[string]any, finishReason *string, usage map[string]any) error {
 	chunk := makeChatChunk(s.completionID, s.created, s.model, delta, finishReason, usage, s.conversationID)
 	if !s.rawChunks {
 		chunk = append(append([]byte("data: "), chunk...), '\n', '\n')
 	}
-	return emitPluginStreamChunk(s.streamID, chunk)
+	return s.emitChunk(s.streamID, chunk)
 }
 
-func (s *chatStream) emit(delta map[string]any, finishReason *string, usage map[string]any) error {
+func (s *chatStream) emitLocked(delta map[string]any, finishReason *string, usage map[string]any) error {
+	if s.closed {
+		return errors.New("stream already closed")
+	}
 	if !s.sentRole {
-		if err := s.send(map[string]any{"role": "assistant"}, nil, nil); err != nil {
+		if err := s.sendLocked(map[string]any{"role": "assistant"}, nil, nil); err != nil {
 			return err
 		}
 		s.sentRole = true
 	}
-	return s.send(delta, finishReason, usage)
+	return s.sendLocked(delta, finishReason, usage)
+}
+
+func (s *chatStream) emit(delta map[string]any, finishReason *string, usage map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.emitLocked(delta, finishReason, usage)
+}
+
+func (s *chatStream) keepaliveFailure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepaliveErr
+}
+
+func (s *chatStream) emitKeepalive(stop <-chan struct{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-stop:
+		return nil
+	default:
+	}
+	if s.closed {
+		return nil
+	}
+	if err := s.emitLocked(map[string]any{"content": ""}, nil, nil); err != nil {
+		s.keepaliveErr = err
+		return err
+	}
+	return nil
+}
+
+// startKeepalive emits no-op content deltas on interval until stopKeepalive or
+// terminal closure. If an emission fails, onErr runs so the caller can abort the
+// upstream execution immediately. Tests can pass any positive duration; config enforces >= 15s.
+func (s *chatStream) startKeepalive(interval time.Duration, onErr func(error)) {
+	if interval <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.closed || s.keepaliveStop != nil {
+		s.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	s.keepaliveStop = stop
+	s.keepaliveWG.Add(1)
+	s.mu.Unlock()
+
+	safeGo("streamKeepalive", func() {
+		defer s.keepaliveWG.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if err := s.emitKeepalive(stop); err != nil {
+					if onErr != nil {
+						onErr(err)
+					}
+					return
+				}
+			}
+		}
+	})
+}
+
+// stopKeepalive stops the keepalive ticker and waits for any in-flight tick
+// emission to finish before terminal chunks or [DONE] are written.
+func (s *chatStream) stopKeepalive() {
+	s.mu.Lock()
+	stop := s.keepaliveStop
+	s.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	s.keepaliveOnce.Do(func() { close(stop) })
+	s.keepaliveWG.Wait()
 }
 
 func (s *chatStream) finish() {
-	finishPluginStream(s.streamID, s.rawChunks, emitPluginStreamChunk, closePluginStream)
+	s.stopKeepalive()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	streamID, rawChunks, emitChunk, closeStream := s.streamID, s.rawChunks, s.emitChunk, s.closeStream
+	s.mu.Unlock()
+	finishPluginStream(streamID, rawChunks, emitChunk, closeStream)
+}
+
+func (s *chatStream) closeError(err error) {
+	s.stopKeepalive()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	streamID, closeStream := s.streamID, s.closeStream
+	s.mu.Unlock()
+	closeStream(streamID, err)
 }
 
 // isPathUnder reports whether path is base or below it, comparing cleaned paths.

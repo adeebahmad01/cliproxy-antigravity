@@ -191,6 +191,11 @@ func buildACPBlocks(chatReq chatCompletionRequest, opts agyOptions, cfg pluginCo
 	if err != nil {
 		return nil, nil, err
 	}
+	if cfg.MaxPromptBytes > 0 && cfg.MaxPromptAction == promptActionError && len(prompt) > cfg.MaxPromptBytes {
+		releaseMediaRefs(mediaPathsFromBlocks(attachments))
+		log.Printf("cliproxy-antigravity: rejecting oversized acp prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+		return nil, nil, promptTooLargeErrorWithContext(len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools))
+	}
 	blocks := []acpPromptBlock{{"type": "text", "text": prompt}}
 	return append(blocks, attachments...), mediaPathsFromBlocks(attachments), nil
 }
@@ -202,7 +207,7 @@ func executeNonStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptio
 	}
 	defer plan.releaseMedia()
 
-	result, conv, err := runACP(cfg, opts, plan, nil)
+	result, conv, err := runACP(context.Background(), cfg, opts, plan, nil, nil, nil)
 	if err != nil {
 		return agyResult{}, err
 	}
@@ -224,6 +229,8 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 	defer plan.releaseMedia()
 
 	out := newChatStream(req, "")
+	defer out.stopKeepalive()
+	keepaliveInterval := streamKeepaliveInterval(cfg)
 	var streamed strings.Builder
 	emittedLen := 0
 	isToolCallStream := false
@@ -247,12 +254,30 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 		return out.emit(map[string]any{"content": pending}, nil, nil)
 	}
 
-	result, conv, err := runACP(cfg, opts, plan, onDelta)
+	acpCtx, acpCancel := context.WithCancel(context.Background())
+	defer acpCancel()
+	result, conv, err := runACP(
+		acpCtx,
+		cfg,
+		opts,
+		plan,
+		onDelta,
+		func() { out.startKeepalive(keepaliveInterval, func(error) { acpCancel() }) },
+		func() bool { return !out.hasSent() },
+	)
+	out.stopKeepalive()
+	if kErr := out.keepaliveFailure(); kErr != nil {
+		if conv != nil {
+			safeGo("closeConv", func() { conv.client.closeSession(conv.sessionID) })
+		}
+		out.closeError(kErr)
+		return
+	}
 	if err == errACPClientGone {
 		return
 	}
 	if err != nil {
-		closePluginStream(streamID, err)
+		out.closeError(err)
 		return
 	}
 
@@ -263,22 +288,22 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 	isToolCall = isToolCall && opts.HasTools
 	plan.retainConv(conv, fullResponse, toolCalls, isToolCall)
 	if !isToolCall && strings.TrimSpace(fullResponse) == "" {
-		closePluginStream(streamID, emptyResponseError())
+		out.closeError(emptyResponseError())
 		return
 	}
 	if isToolCall {
 		if err := out.emit(map[string]any{"tool_calls": toolCalls}, nil, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 		finish := "tool_calls"
 		if err := out.emit(map[string]any{}, &finish, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 		if streamWantsUsage(req) {
 			if err := out.emit(map[string]any{}, nil, openAIUsage(result.Usage)); err != nil {
-				closePluginStream(streamID, err)
+				out.closeError(err)
 				return
 			}
 		}
@@ -288,18 +313,18 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 
 	if streamed.Len() > emittedLen {
 		if err := out.emit(map[string]any{"content": streamed.String()[emittedLen:]}, nil, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 	}
 	finish := "stop"
 	if err := out.emit(map[string]any{}, &finish, nil); err != nil {
-		closePluginStream(streamID, err)
+		out.closeError(err)
 		return
 	}
 	if streamWantsUsage(req) {
 		if err := out.emit(map[string]any{}, nil, openAIUsage(result.Usage)); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 	}

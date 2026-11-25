@@ -387,6 +387,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			}
 		}
 		mergeHeaders(headers, limitHeaders(run.cfg, run.opts.NativeModel))
+		if run.promptBytes > 0 {
+			headers.Set(promptBytesHeader, fmt.Sprintf("%d", run.promptBytes))
+		}
 		// Observable, not silent: the turn was staged to a file agy reads in full.
 		if run.stagedBytes > 0 {
 			headers.Set(promptStagedHeader, fmt.Sprintf("%d", run.stagedBytes))
@@ -398,11 +401,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, pError("invalid_request", "could not decode count-tokens request: "+err.Error(), 400)
 		}
-		run, err := prepareAgyExecutionWithDiscovery(req, false)
+		// Never stage, reject on max_prompt_bytes, or discover models for count_tokens:
+		// clients call this specifically to measure oversized conversations before compacting.
+		run, err := prepareAgyExecutionWithOptions(req, false, false)
 		if err != nil {
 			return nil, err
 		}
-		// The staged file holds the full conversation; this path never runs agy.
 		if run.cleanup != nil {
 			defer run.cleanup()
 		}
@@ -560,7 +564,9 @@ func pluginRegistration() registration {
 				{Name: "limits_tracking", Type: "boolean", Default: defaults.LimitsTracking, Description: "Track Antigravity usage limits via agy /usage (default: true)."},
 				{Name: "limits_refresh_interval", Type: "string", Default: defaults.LimitsRefreshInterval, Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
 				{Name: "enforce_limits", Type: "boolean", Default: defaults.EnforceLimits, Description: "Reject requests with HTTP 429 when the quota group of the model is exhausted, without launching agy (default: false)."},
-				{Name: "max_prompt_bytes", Type: "integer", Default: defaults.MaxPromptBytes, Description: "Stage requests larger than this many bytes to a private temp file that agy reads in full (mode: print), instead of letting agy truncate the prompt tail. Disabled by default; ~150000 is a conservative starting point."},
+				{Name: "max_prompt_bytes", Type: "integer", Default: defaults.MaxPromptBytes, Description: "Apply max_prompt_action to requests larger than this many bytes, instead of letting agy truncate the prompt tail (default: 150000; 0 disables)."},
+				{Name: "max_prompt_action", Type: "enum", Default: defaults.MaxPromptAction, EnumValues: []string{promptActionStage, promptActionError}, Description: "Action when a built prompt exceeds max_prompt_bytes: stage (default, write to a private temp file that agy reads in full in mode: print) or error (reject with HTTP 413 request_scoped so the client can compact). Ignored when max_prompt_bytes is 0."},
+				{Name: "stream_keepalive_interval", Type: "string", Default: defaults.StreamKeepaliveInterval, Description: "Emit no-op streaming keepalive deltas at this interval (default: 15s, minimum 15s, 0s disables) after agy initializes a turn, keeping proxies from dropping silent staged turns."},
 				{Name: "mode", Type: "enum", Default: defaults.Mode, EnumValues: []string{modePrint, modeACP}, Description: "Execution mode: print (default, runs agy -p per request) or acp (keeps a resident agy acp server per account home with session reuse; conversation_id requests stay on print)."},
 				{Name: "conv_debug_file", Type: "string", Default: defaults.ConvDebugFile, Description: "Optional JSONL log path for ACP session reuse lookup/store troubleshooting (contains message excerpts)."},
 				{Name: "accounts_dir", Type: "string", Default: defaults.AccountsDir, Description: "Directory with one agy home per account. Accounts added from the panel are created here (default ~/.agy-accounts), and every signed-in home in it gets its own CLIProxyAPI auth file. CLIProxyAPI rotates between the accounts."},
@@ -597,21 +603,27 @@ func mustErrorEnvelope(pe *pluginError) []byte {
 	return raw
 }
 
-// promptForTokenCount returns the prompt a staged turn actually represents: the
-// full conversation, not the short handoff that replaced it.
+// promptForTokenCount returns the full conversation prompt a request represents,
+// without staged handoff wrapping or native-resume history trimming.
 func promptForTokenCount(req rpcExecutorRequest, run agyExecution) string {
+	if run.opts.ConversationID != "" {
+		if chatReq, err := decodeChatRequest(req.Payload); err == nil {
+			if full, err := buildChatPrompt(chatReq, "", run.cfg.Workdir); err == nil {
+				return full
+			}
+		}
+	}
+	if run.fullPrompt != "" {
+		return run.fullPrompt
+	}
 	if run.stagedBytes == 0 {
 		return run.prompt
 	}
-	var chatReq chatCompletionRequest
-	if err := json.Unmarshal(req.Payload, &chatReq); err != nil {
-		return run.prompt
-	}
-	nativeID, _, err := resolveConversation(run.opts.ConversationID, req.Headers, run.session)
+	chatReq, err := decodeChatRequest(req.Payload)
 	if err != nil {
 		return run.prompt
 	}
-	full, err := buildChatPrompt(chatReq, nativeID, run.cfg.Workdir)
+	full, err := buildChatPrompt(chatReq, "", run.cfg.Workdir)
 	if err != nil {
 		return run.prompt
 	}

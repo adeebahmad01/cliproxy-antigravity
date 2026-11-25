@@ -210,3 +210,43 @@ func TestResolveBinaryPathCandidateSearch(t *testing.T) {
 		t.Errorf("expected /usr/local/bin in search directories")
 	}
 }
+
+func TestParsePluginConfigPromptOverflowAndKeepalive(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte(`
+max_prompt_bytes: 150000
+max_prompt_action: error
+stream_keepalive_interval: 15s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxPromptBytes != 150000 || cfg.MaxPromptAction != promptActionError || cfg.StreamKeepaliveInterval != "15s" {
+		t.Fatalf("unexpected config: %+v", cfg)
+	}
+
+	disabled, err := parsePluginConfig([]byte("max_prompt_bytes: 0\nstream_keepalive_interval: 0s\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.MaxPromptBytes != 0 || disabled.StreamKeepaliveInterval != "" {
+		t.Fatalf("expected 0 max_prompt_bytes and 0s keepalive to disable, got %+v", disabled)
+	}
+
+	def := defaultConfig()
+	if def.MaxPromptBytes != defaultMaxPromptBytes || def.StreamKeepaliveInterval != defaultStreamKeepalive {
+		t.Fatalf("unexpected prompt/keepalive defaults: %+v", def)
+	}
+
+	for _, bad := range []string{
+		"max_prompt_bytes: -1\n",
+		"max_prompt_bytes: 1024\n",
+		"max_prompt_action: drop\n",
+		"stream_keepalive_interval: 10s\n",
+		"stream_keepalive_interval: -5s\n",
+		"stream_keepalive_interval: nope\n",
+	} {
+		if _, err := parsePluginConfig([]byte(bad)); err == nil {
+			t.Fatalf("expected error for config %q", bad)
+		}
+	}
+}

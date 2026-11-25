@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1280,10 +1281,15 @@ func nonEmpty(value, fallback string) string {
 }
 
 type agyExecution struct {
-	cfg     pluginConfig
-	opts    agyOptions
-	prompt  string
-	session conversationRef
+	cfg    pluginConfig
+	opts   agyOptions
+	prompt string
+	// fullPrompt retains the un-staged prompt when prompt was replaced by
+	// fileHandoffPrompt, so count_tokens measures the real conversation even on
+	// resumes and explicit handoffs.
+	fullPrompt  string
+	promptBytes int
+	session     conversationRef
 	// stagedBytes is non-zero when the request was staged to a temp file.
 	stagedBytes int
 	// cleanup removes the staged file; it runs after agy exits, on cancel, and on
@@ -1292,10 +1298,14 @@ type agyExecution struct {
 }
 
 func prepareAgyExecution(req rpcExecutorRequest) (agyExecution, error) {
-	return prepareAgyExecutionWithDiscovery(req, true)
+	return prepareAgyExecutionWithOptions(req, true, true)
 }
 
 func prepareAgyExecutionWithDiscovery(req rpcExecutorRequest, discover bool) (agyExecution, error) {
+	return prepareAgyExecutionWithOptions(req, discover, true)
+}
+
+func prepareAgyExecutionWithOptions(req rpcExecutorRequest, discover, applyPromptLimit bool) (agyExecution, error) {
 	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
 	if err != nil {
 		return agyExecution{}, err
@@ -1323,9 +1333,12 @@ func prepareAgyExecutionWithDiscovery(req rpcExecutorRequest, discover bool) (ag
 	if err != nil {
 		return agyExecution{}, err
 	}
-	run := agyExecution{cfg: cfg, opts: opts, prompt: prompt, session: session}
-	// Staging is opt-in: only a configured threshold changes the forwarded payload.
-	if cfg.MaxPromptBytes > 0 && len(prompt) > cfg.MaxPromptBytes {
+	run := agyExecution{cfg: cfg, opts: opts, prompt: prompt, fullPrompt: prompt, promptBytes: len(prompt), session: session}
+	if applyPromptLimit && cfg.MaxPromptBytes > 0 && len(prompt) > cfg.MaxPromptBytes {
+		if cfg.MaxPromptAction == promptActionError {
+			log.Printf("cliproxy-antigravity: rejecting oversized prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+			return agyExecution{}, promptTooLargeErrorWithContext(len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools))
+		}
 		staged, buildErr := buildChatPromptFor(chatReq, nativeID, cfg.Workdir, true)
 		if buildErr != nil {
 			return agyExecution{}, buildErr
@@ -1334,9 +1347,12 @@ func prepareAgyExecutionWithDiscovery(req rpcExecutorRequest, discover bool) (ag
 		if writeErr != nil {
 			return agyExecution{}, pError("prompt_staging_failed", "failed to stage the oversized prompt: "+writeErr.Error(), http.StatusInternalServerError)
 		}
-		run.prompt = fileHandoffPrompt(path, len(staged))
+		log.Printf("cliproxy-antigravity: staged oversized prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(staged), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+		run.prompt = fileHandoffPromptFor(path, len(staged), len(chatReq.Tools) > 0)
 		run.stagedBytes = len(staged)
 		run.cleanup = func() { removeStagedPrompt(path) }
+	} else if applyPromptLimit && cfg.MaxPromptBytes == 0 && len(prompt) >= defaultMaxPromptBytes {
+		log.Printf("cliproxy-antigravity: warning: inline prompt is %d bytes (messages=%d, tools=%d, model=%s) with max_prompt_bytes=0; agy may truncate the tail", len(prompt), len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
 	}
 	return run, nil
 }
@@ -1400,6 +1416,10 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 
 	payload, err := makeChatCompletion(req.Model, declaredToolNames(req.Payload), result)
 	if err != nil {
+		var pe *pluginError
+		if run.stagedBytes > 0 && errors.As(err, &pe) && pe.Code == "empty_assistant_response" {
+			return executorResponse{}, emptyResponseErrorForStaged(run.stagedBytes)
+		}
 		return executorResponse{}, err
 	}
 	headers := http.Header{"Content-Type": []string{"application/json"}}
@@ -1407,12 +1427,19 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 		headers.Set(conversationHeader, result.ConversationID)
 	}
 	mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
+	if run.promptBytes > 0 {
+		headers.Set(promptBytesHeader, fmt.Sprintf("%d", run.promptBytes))
+	}
 	metadata := map[string]any{
 		"agy_conversation_id": result.ConversationID,
 		"agy_status":          result.Status,
 	}
+	if run.promptBytes > 0 {
+		metadata["agy_prompt_bytes"] = run.promptBytes
+	}
 	// Observable, not silent: clients can see that the turn was staged.
 	if run.stagedBytes > 0 {
+		headers.Set(promptStagedHeader, fmt.Sprintf("%d", run.stagedBytes))
 		metadata["agy_prompt_staged_bytes"] = run.stagedBytes
 	}
 	return executorResponse{
@@ -1454,15 +1481,17 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	_ = model
 	session := run.session
 	out := newChatStream(req, session.clientID())
+	defer out.stopKeepalive()
 	updateConversationID := func(nativeID string) {
 		if nativeID = strings.TrimSpace(nativeID); nativeID != "" && nativeID != session.NativeID {
 			session.NativeID = nativeID
-			out.conversationID = session.clientID()
+			out.setConversationID(session.clientID())
 		}
 	}
 
 	emit := out.emit
 	finishStream := out.finish
+	keepaliveInterval := streamKeepaliveInterval(cfg)
 
 	scanner := bufio.NewScanner(stdout)
 	// One NDJSON event carries a whole assistant turn, and a turn holding several
@@ -1490,6 +1519,10 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		switch event.Event {
 		case "init":
 			updateConversationID(event.ConversationID)
+			out.startKeepalive(keepaliveInterval, func(error) {
+				killProcessTree(cmd)
+				cancel()
+			})
 		case "step_update":
 			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 				streamedText.WriteString(event.StepUpdate.TextDelta)
@@ -1510,7 +1543,7 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 				pending := streamedText.String()[emittedLen:]
 				emittedLen = streamedText.Len()
 				if err := emit(map[string]any{"content": pending}, nil, nil); err != nil {
-					closePluginStream(streamID, err)
+					out.closeError(err)
 					killProcessTree(cmd)
 					_ = cmd.Wait()
 					return
@@ -1535,35 +1568,40 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		}
 	}
 
+	out.stopKeepalive()
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
+	if kErr := out.keepaliveFailure(); kErr != nil {
+		out.closeError(kErr)
+		return
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		closePluginStream(streamID, classifyAgyError(ctx.Err(), stderr.String()))
+		out.closeError(classifyAgyError(ctx.Err(), stderr.String()))
 		return
 	}
 	if scanErr != nil {
-		closePluginStream(streamID, pRetryableError("agy_stream_error", "reading agy stream: "+scanErr.Error(), http.StatusBadGateway))
+		out.closeError(pRetryableError("agy_stream_error", "reading agy stream: "+scanErr.Error(), http.StatusBadGateway))
 		return
 	}
 	if streamError != "" {
-		closePluginStream(streamID, classifyAgyError(errors.New(streamError), stderr.String()))
+		out.closeError(classifyAgyError(errors.New(streamError), stderr.String()))
 		return
 	}
 	if terminal == nil {
 		if waitErr != nil {
-			closePluginStream(streamID, classifyAgyError(waitErr, stderr.String()))
+			out.closeError(classifyAgyError(waitErr, stderr.String()))
 		} else {
-			closePluginStream(streamID, pError("invalid_upstream_response", "agy stream ended without a result event", http.StatusBadGateway))
+			out.closeError(pError("invalid_upstream_response", "agy stream ended without a result event", http.StatusBadGateway))
 		}
 		return
 	}
 	if !strings.EqualFold(terminal.Status, "SUCCESS") {
 		msg := nonEmpty(terminal.Error, "Antigravity CLI ended with status "+terminal.Status)
-		closePluginStream(streamID, classifyAgyError(errors.New(msg), stderr.String()))
+		out.closeError(classifyAgyError(errors.New(msg), stderr.String()))
 		return
 	}
 	if waitErr != nil {
-		closePluginStream(streamID, classifyAgyError(waitErr, stderr.String()))
+		out.closeError(classifyAgyError(waitErr, stderr.String()))
 		return
 	}
 
@@ -1578,7 +1616,11 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		// agy finished without text: it burned the turn on its own built-in tools.
 		// Failing here lets the client walk its fallback chain instead of retrying
 		// an identical empty completion.
-		closePluginStream(streamID, emptyResponseError())
+		if run.stagedBytes > 0 {
+			out.closeError(emptyResponseErrorForStaged(run.stagedBytes))
+		} else {
+			out.closeError(emptyResponseError())
+		}
 		return
 	}
 	if opts.HasTools && isToolCall {
@@ -1586,19 +1628,19 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		if err := emit(map[string]any{
 			"tool_calls": toolCalls,
 		}, nil, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 
 		// The finish chunk and the usage chunk must stay separate: a usage chunk has empty choices.
 		finishReason := "tool_calls"
 		if err := emit(map[string]any{}, &finishReason, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 		if streamWantsUsage(req) {
 			if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
-				closePluginStream(streamID, err)
+				out.closeError(err)
 				return
 			}
 		}
@@ -1609,24 +1651,24 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	// If it was buffered thinking it was a tool call but turned out not to be
 	if streamedText.Len() > emittedLen {
 		if err := emit(map[string]any{"content": streamedText.String()[emittedLen:]}, nil, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 	} else if streamedText.Len() == 0 && terminal.Response != "" {
 		if err := emit(map[string]any{"content": terminal.Response}, nil, nil); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 	}
 
 	finish := "stop"
 	if err := emit(map[string]any{}, &finish, nil); err != nil {
-		closePluginStream(streamID, err)
+		out.closeError(err)
 		return
 	}
 	if streamWantsUsage(req) {
 		if err := emit(map[string]any{}, nil, openAIUsage(terminal.Usage)); err != nil {
-			closePluginStream(streamID, err)
+			out.closeError(err)
 			return
 		}
 	}

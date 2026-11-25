@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func testChatPrompt(t *testing.T, payload []byte, nativeID, workdir string) (string, error) {
@@ -603,16 +605,115 @@ func stagedPathFromHandoff(t *testing.T, handoff string) string {
 	return rest[:end]
 }
 
-// Staging is off by default: no threshold, no file, whatever the size.
-func TestPrepareAgyExecutionDoesNotStageByDefault(t *testing.T) {
+// Staging is enabled by default at 150000 bytes, and max_prompt_bytes: 0 disables it.
+func TestPrepareAgyExecutionStagesByDefaultAndRespectsZeroDisable(t *testing.T) {
+	useTempStagingDir(t)
 	setConfig(defaultConfig())
 	t.Cleanup(func() { setConfig(defaultConfig()) })
+
 	run, err := prepareAgyExecution(stagedRequest(t, 220000))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.stagedBytes != 0 || run.cleanup != nil {
-		t.Fatalf("default config staged a request: %+v", run.stagedBytes)
+	if run.cleanup != nil {
+		defer run.cleanup()
+	}
+	if run.stagedBytes <= 200000 || run.promptBytes <= 200000 {
+		t.Fatalf("expected default config to stage oversized prompt, got staged=%d prompt=%d", run.stagedBytes, run.promptBytes)
+	}
+
+	disabled := defaultConfig()
+	disabled.MaxPromptBytes = 0
+	setConfig(disabled)
+	runDisabled, err := prepareAgyExecution(stagedRequest(t, 220000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runDisabled.stagedBytes != 0 || runDisabled.cleanup != nil {
+		t.Fatalf("max_prompt_bytes=0 still staged a request: %d", runDisabled.stagedBytes)
+	}
+}
+
+func TestBuildChatPromptCompactsToolsAndToolCalls(t *testing.T) {
+	payload := []byte(`{
+		"model": "agy/default",
+		"messages": [
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{
+					"id": "call_1",
+					"type": "function",
+					"function": {
+						"name": "bash",
+						"arguments": "{\"cmd\":\"ls\"}"
+					}
+				}
+			]}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "bash",
+					"description": "run command",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"cmd": {"type": "string"}
+						}
+					}
+				}
+			}
+		]
+	}`)
+	req, err := decodeChatRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := buildChatPrompt(req, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(prompt, "\n\t") || strings.Contains(prompt, "\n\t\t") {
+		t.Fatalf("expected tools/tool_calls JSON to be compacted, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, `"name":"bash"`) || !strings.Contains(prompt, `"id":"call_1"`) {
+		t.Fatalf("expected compacted tool schema and tool call in prompt:\n%s", prompt)
+	}
+}
+
+func TestFileHandoffPromptOmitsToolFenceWhenNoTools(t *testing.T) {
+	withoutTools := fileHandoffPromptFor("/tmp/cliproxy-prompts/turn-1/prompt.txt", 1234, false)
+	if strings.Contains(withoutTools, "tool_calls") {
+		t.Fatalf("did not expect tool_calls instructions when hasTools=false: %s", withoutTools)
+	}
+	withTools := fileHandoffPromptFor("/tmp/cliproxy-prompts/turn-1/prompt.txt", 1234, true)
+	if !strings.Contains(withTools, "tool_calls") {
+		t.Fatalf("expected tool_calls instructions when hasTools=true: %s", withTools)
+	}
+}
+
+func TestStagedEmptyResponseIncludesRemediationAndPromptHeaders(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a shell script")
+	}
+	useTempStagingDir(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	script := "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '{\"status\":\"SUCCESS\",\"response\":\"\"}\\n'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setConfig(pluginConfig{BinaryPath: bin, MaxPromptBytes: 4096, MaxPromptAction: promptActionStage})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	_, err := executeNonStream(stagedRequest(t, 8000))
+	var pe *pluginError
+	if !errors.As(err, &pe) || pe.Code != "empty_assistant_response" {
+		t.Fatalf("expected empty_assistant_response, got %#v", err)
+	}
+	if !strings.Contains(pe.Message, "staging") || !strings.Contains(pe.Message, "max_prompt_bytes: 0") {
+		t.Fatalf("expected staged remediation in error message, got %q", pe.Message)
 	}
 }
 
@@ -772,5 +873,281 @@ func TestIsPathUnder(t *testing.T) {
 		if got := isPathUnder(path, base); got != want {
 			t.Fatalf("isPathUnder(%q, %q) = %v, want %v", path, base, got, want)
 		}
+	}
+}
+
+func TestMaxPromptActionErrorReturns413WithoutStaging(t *testing.T) {
+	useTempStagingDir(t)
+	setConfig(pluginConfig{BinaryPath: "agy", MaxPromptBytes: 20000, MaxPromptAction: promptActionError})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	req := stagedRequest(t, 40000)
+	_, err := prepareAgyExecution(req)
+	var pe *pluginError
+	if !errors.As(err, &pe) || pe.HTTPStatus != http.StatusRequestEntityTooLarge || pe.Code != errorCodeRequestScoped || pe.Retryable {
+		t.Fatalf("expected non-retryable 413 %s, got %#v", errorCodeRequestScoped, err)
+	}
+	if entries, _ := os.ReadDir(promptStagingDir()); len(entries) != 0 {
+		t.Fatalf("error action wrote a staging file: %v", entries)
+	}
+
+	// count_tokens still estimates the full prompt rather than failing with 413.
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleMethod(methodExecutorCountTokens, body)
+	if err != nil {
+		t.Fatalf("count_tokens failed under max_prompt_action=error: %v", err)
+	}
+	var env struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Payload []byte `json:"Payload"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("unexpected count_tokens envelope: %s (%v)", raw, err)
+	}
+	var tok struct {
+		TotalTokens int `json:"total_tokens"`
+	}
+	if err := json.Unmarshal(env.Result.Payload, &tok); err != nil {
+		t.Fatal(err)
+	}
+	if tok.TotalTokens < 5000 {
+		t.Fatalf("expected full-prompt token count >= 5000, got %d", tok.TotalTokens)
+	}
+}
+
+func TestPromptForTokenCountUsesFullPromptOnManagedResumeAndHandoff(t *testing.T) {
+	useTempStagingDir(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	setConfig(pluginConfig{BinaryPath: "agy", MaxPromptBytes: 20000})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	origDir := t.TempDir()
+	handoffHome := t.TempDir()
+	convID := conversationRef{NativeID: "native-123", Home: sessionHome(origDir), Managed: true}.clientID()
+	if convID == "" {
+		t.Fatal("failed to mint conversation ID")
+	}
+
+	blob := strings.Repeat("b", 30000)
+	payload := []byte(`{"model":"agy/default","conversation_id":"` + convID + `","messages":[{"role":"user","content":"earlier"},{"role":"assistant","content":"ok"},{"role":"user","content":"` + blob + `"}]}`)
+
+	// 1. Managed resume on the owning account.
+	resumeReq := rpcExecutorRequest{
+		Model:        "agy/default",
+		AuthID:       "auth-1",
+		AuthMetadata: map[string]any{"home": origDir},
+		Payload:      payload,
+	}
+
+	run, err := prepareAgyExecution(resumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.cleanup != nil {
+		defer run.cleanup()
+	}
+	if run.stagedBytes == 0 {
+		t.Fatal("expected resume request to be staged")
+	}
+	full := promptForTokenCount(resumeReq, run)
+	if len(full) <= len(run.prompt) || !strings.Contains(full, blob) {
+		t.Fatalf("resume promptForTokenCount returned %d bytes instead of full prompt", len(full))
+	}
+
+	// 1b. Managed resume where the large message precedes the last assistant reply and
+	// the new follow-up is short: count_tokens must still reflect the full history.
+	earlyPayload := []byte(`{"model":"agy/default","conversation_id":"` + convID + `","messages":[{"role":"user","content":"` + blob + `"},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}`)
+	earlyResumeReq := rpcExecutorRequest{
+		Model:        "agy/default",
+		AuthID:       "auth-1",
+		AuthMetadata: map[string]any{"home": origDir},
+		Payload:      earlyPayload,
+	}
+	earlyRun, err := prepareAgyExecution(earlyResumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if earlyRun.stagedBytes != 0 {
+		t.Fatalf("short follow-up on native resume should not stage, got %d", earlyRun.stagedBytes)
+	}
+	earlyCountPrompt := promptForTokenCount(earlyResumeReq, earlyRun)
+	if !strings.Contains(earlyCountPrompt, blob) {
+		t.Fatalf("expected native-resume count_tokens prompt to include earlier history, got %d bytes", len(earlyCountPrompt))
+	}
+	earlyBody, err := json.Marshal(earlyResumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlyRaw, err := handleMethod(methodExecutorCountTokens, earlyBody)
+	if err != nil {
+		t.Fatalf("count_tokens failed on native resume: %v", err)
+	}
+	var earlyEnv struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Payload []byte `json:"Payload"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(earlyRaw, &earlyEnv); err != nil || !earlyEnv.OK {
+		t.Fatalf("unexpected count_tokens envelope: %s (%v)", earlyRaw, err)
+	}
+	var earlyTok struct {
+		TotalTokens int `json:"total_tokens"`
+	}
+	if err := json.Unmarshal(earlyEnv.Result.Payload, &earlyTok); err != nil {
+		t.Fatal(err)
+	}
+	if earlyTok.TotalTokens < 7000 {
+		t.Fatalf("expected count_tokens on native resume with 30KB earlier history >= 7000, got %d", earlyTok.TotalTokens)
+	}
+
+	// 2. Explicit cross-account handoff with a large history.
+	headers := http.Header{}
+	headers.Set(handoffHeader, "true")
+	handoffReq := rpcExecutorRequest{
+		Model:        "agy/default",
+		AuthID:       "auth-2",
+		AuthMetadata: map[string]any{"home": handoffHome},
+		Headers:      headers,
+		Payload:      payload,
+	}
+	handoffRun, err := prepareAgyExecution(handoffReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handoffRun.cleanup != nil {
+		defer handoffRun.cleanup()
+	}
+	if handoffRun.stagedBytes == 0 {
+		t.Fatal("expected handoff request to be staged")
+	}
+	fullHandoff := promptForTokenCount(handoffReq, handoffRun)
+	if len(fullHandoff) <= len(handoffRun.prompt) || !strings.Contains(fullHandoff, blob) {
+		t.Fatalf("handoff promptForTokenCount returned %d bytes instead of full prompt", len(fullHandoff))
+	}
+}
+
+func TestChatStreamKeepaliveAndStopOrdering(t *testing.T) {
+	req := rpcExecutorRequest{
+		StreamID: "stream-keepalive",
+		Model:    "agy/default",
+	}
+	out := newChatStream(req, "")
+
+	var mu sync.Mutex
+	var events []string
+	var sawKeepalive = make(chan struct{})
+	var closeOnce sync.Once
+	out.emitChunk = func(_ string, payload []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		text := string(payload)
+		events = append(events, text)
+		if strings.Contains(text, `"content":""`) {
+			closeOnce.Do(func() { close(sawKeepalive) })
+		}
+		return nil
+	}
+	out.closeStream = func(_ string, _ error) {
+		mu.Lock()
+		events = append(events, "CLOSE")
+		mu.Unlock()
+	}
+
+	out.startKeepalive(5*time.Millisecond, nil)
+	select {
+	case <-sawKeepalive:
+	case <-time.After(time.Second):
+		out.stopKeepalive()
+		t.Fatal("timed out waiting for keepalive chunk")
+	}
+	out.setConversationID("agy.v1.updated")
+	out.stopKeepalive()
+
+	finish := "stop"
+	if err := out.emit(map[string]any{}, &finish, nil); err != nil {
+		t.Fatal(err)
+	}
+	out.finish()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) < 5 {
+		t.Fatalf("expected role, keepalive, finish, [DONE], CLOSE; got %d events: %v", len(events), events)
+	}
+	if !strings.Contains(events[0], `"role":"assistant"`) {
+		t.Fatalf("first event should be role delta, got %s", events[0])
+	}
+	if !strings.Contains(events[len(events)-3], `"finish_reason":"stop"`) {
+		t.Fatalf("expected finish_reason=stop before [DONE], got %s", events[len(events)-3])
+	}
+	if events[len(events)-2] != "data: [DONE]\n\n" || events[len(events)-1] != "CLOSE" {
+		t.Fatalf("expected [DONE] then CLOSE at end, got %v", events[len(events)-2:])
+	}
+}
+
+func TestExecuteStreamKillsSilentAgyOnKeepaliveError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a shell script")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	// Emit init so keepalive starts, then stay silent well past the test deadline.
+	script := "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '{\"event\":\"init\",\"conversation_id\":\"c1\"}\\n'\nsleep 30\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	prevInterval := streamKeepaliveOverride
+	prevEmit := chatStreamEmitChunk
+	prevClose := chatStreamClose
+	streamKeepaliveOverride = 10 * time.Millisecond
+	t.Cleanup(func() {
+		streamKeepaliveOverride = prevInterval
+		chatStreamEmitChunk = prevEmit
+		chatStreamClose = prevClose
+	})
+
+	emitErr := errors.New("client disconnected")
+	var closedErr error
+	var mu sync.Mutex
+	chatStreamEmitChunk = func(_ string, _ []byte) error {
+		return emitErr
+	}
+	chatStreamClose = func(_ string, err error) {
+		mu.Lock()
+		closedErr = err
+		mu.Unlock()
+	}
+
+	run := agyExecution{
+		cfg:    pluginConfig{BinaryPath: bin, PrintTimeout: "30s"},
+		opts:   agyOptions{OutputFormat: "stream-json"},
+		prompt: "hi",
+	}
+	req := rpcExecutorRequest{StreamID: "s-keepalive-err", Model: "agy/default"}
+
+	done := make(chan struct{})
+	go func() {
+		executeStream(req, run)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("executeStream hung after keepalive emission failed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !errors.Is(closedErr, emitErr) {
+		t.Fatalf("expected stream to close with %v, got %v", emitErr, closedErr)
 	}
 }

@@ -4,6 +4,21 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Enabled `max_prompt_bytes` (`150000` bytes, `max_prompt_action: stage`; set `max_prompt_bytes: 0` to disable) and `stream_keepalive_interval` (`15s`; set `0s` to disable) by default so large tool-heavy clients like Claude CLI do not hit silent `agy` inline prompt tail truncation out of the box.
+- Compacted JSON in `writeToolInstruction` (`tools[]`) and prior `tool_calls` blocks to eliminate whitespace bloat in flattened prompts, and omitted tool-calling instructions from staged handoff prompts when no `tools[]` are declared.
+
+### Added
+
+- `max_prompt_action`: optional `error` mode for `max_prompt_bytes` (keeping `stage` as the default) that rejects oversized prompts with non-retryable HTTP `413` (`request_scoped`) in both `print` and `acp` modes so clients know to compact before retrying (#32).
+- `stream_keepalive_interval`: streaming keepalive (`15s` default, minimum `15s`, `0s` disables) that emits no-op content deltas after `agy` initializes a turn, keeping reverse proxies from dropping silent staged turns without touching `finish_reason` or `[DONE]` framing (#32).
+- Prompt-size diagnostics: `X-AGY-Prompt-Bytes` header (and `agy_prompt_bytes` metadata) on `mode: print` runs, structured server logs when staging, rejecting (`413` with message/tool counts), or exceeding 150 KB with `max_prompt_bytes: 0`, and staged-specific remediation on `empty_assistant_response` when `agy` blocks reading the staged temp file.
+
+### Fixed
+
+- `executor.count_tokens` now measures the built conversation directly without staging temp files to disk or failing under `max_prompt_action: error`, and `promptForTokenCount` preserves the full prompt on staged managed-session resumes and explicit cross-account handoffs.
+
 ## [0.6.0] - 2026-11-25
 
 ### Changed
