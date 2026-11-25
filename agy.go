@@ -428,7 +428,10 @@ func loadCatalog(cfg pluginConfig) (models []modelInfo, nativeByID map[string]st
 			continue
 		case time.Since(entry.failedAt) < catalogRetryAfter:
 			if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
-				entry.models, entry.nativeByID = cachedModels, cachedMapping
+				cachedModels = normalizeCachedModelNames(cachedModels)
+				if modelCatalog.entries[key] == entry {
+					entry.models, entry.nativeByID = cachedModels, cachedMapping
+				}
 				modelCatalog.Unlock()
 				return cachedModels, cachedMapping, true
 			}
@@ -454,7 +457,7 @@ func loadCatalog(cfg pluginConfig) (models []modelInfo, nativeByID map[string]st
 			if cached {
 				models, nativeByID, ok = entry.models, entry.nativeByID, true
 			} else if cachedModels, cachedMapping := readModelCatalogCache(cfg); len(cachedModels) > 0 {
-				models = mergeCatalogModels(models, cachedModels)
+				models = mergeCatalogModels(models, normalizeCachedModelNames(cachedModels))
 				nativeByID = mergeCatalogMapping(nativeByID, cachedMapping)
 				if modelCatalog.entries[key] == entry {
 					entry.models, entry.nativeByID = models, nativeByID
@@ -539,6 +542,16 @@ func containsFold(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeCachedModelNames(models []modelInfo) []modelInfo {
+	out := cloneModels(models)
+	for i := range out {
+		if out[i].ID != "" {
+			out[i].Name = out[i].ID
+		}
+	}
+	return out
 }
 
 func cloneModels(in []modelInfo) []modelInfo {

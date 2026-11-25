@@ -458,7 +458,7 @@ func newAccountAuth(s *loginSession, authDir string) authData {
 		}
 	}
 	meta := map[string]any{"type": providerID, "email": email, "label": email, "home": s.home, "disabled": false}
-	markAuthFileIssued(s.home)
+	_ = markAuthFileIssued(s.home)
 	auth := agyAuthData(fileName, meta)
 	auth.ID = fileName
 	return auth

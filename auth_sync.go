@@ -53,7 +53,7 @@ func ensureAuthFile(configYAML []byte, cfg pluginConfig) {
 			hasAgyAuth = true
 			if home, errHome := validateWorkdir(meta.Home); errHome == nil && home != "" {
 				knownHomes[home] = true
-				markAuthFileIssued(home)
+				_ = markAuthFileIssued(home)
 			}
 		}
 	}
@@ -114,12 +114,13 @@ func syncAccountAuthFiles(authDir, accountsDir string, knownHomes map[string]boo
 				continue
 			}
 		}
-		writeAgyAuthFile(targetPath, email, home)
-		knownHomes[home] = true
+		if writeAgyAuthFile(targetPath, email, home) {
+			knownHomes[home] = true
+		}
 	}
 }
 
-func writeAgyAuthFile(path, email, home string) {
+func writeAgyAuthFile(path, email, home string) bool {
 	content := map[string]any{
 		"type":     "agy",
 		"email":    email,
@@ -131,23 +132,39 @@ func writeAgyAuthFile(path, email, home string) {
 	}
 	encoded, errMarshal := json.MarshalIndent(content, "", "  ")
 	if errMarshal != nil {
-		return
+		return false
 	}
-	if os.WriteFile(path, encoded, 0o600) == nil && home != "" {
-		markAuthFileIssued(home)
+	marker := ""
+	hadMarker := false
+	if home != "" {
+		marker = filepath.Join(home, authFileIssuedMarker)
+		_, errStat := os.Stat(marker)
+		hadMarker = errStat == nil
+		if !hadMarker {
+			if err := os.WriteFile(marker, nil, 0o600); err != nil {
+				return false
+			}
+		}
 	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		if marker != "" && !hadMarker {
+			_ = os.Remove(marker)
+		}
+		return false
+	}
+	return true
 }
 
 // authFileIssuedMarker sits in an account home once an auth file was created for it, so an auth
 // file deleted in the panel stays deleted instead of being recreated from the signed-in home.
 const authFileIssuedMarker = ".cpa-auth-file-issued"
 
-func markAuthFileIssued(home string) {
+func markAuthFileIssued(home string) error {
 	marker := filepath.Join(home, authFileIssuedMarker)
 	if _, err := os.Stat(marker); err == nil {
-		return
+		return nil
 	}
-	_ = os.WriteFile(marker, nil, 0o600)
+	return os.WriteFile(marker, nil, 0o600)
 }
 
 func authFileIssued(home string) bool {

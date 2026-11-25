@@ -655,6 +655,9 @@ func TestDiscoverModelsFallsBackToCachedCatalog(t *testing.T) {
 	models := discoverModels(cfg)
 	for _, model := range models {
 		if model.ID == "agy/gemini-4-neon" {
+			if model.Name != "agy/gemini-4-neon" {
+				t.Fatalf("legacy cached model Name = %q, want agy/gemini-4-neon", model.Name)
+			}
 			return
 		}
 	}

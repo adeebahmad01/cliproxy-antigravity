@@ -149,6 +149,30 @@ func TestEnsureAuthFileSyncsAccountsDir(t *testing.T) {
 	}
 }
 
+func TestSyncAccountAuthFilesSkipsWhenMarkerCannotBeWritten(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permissions")
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	authDir := t.TempDir()
+	accountsDir := t.TempDir()
+	roHome := filepath.Join(accountsDir, "readonly")
+	signInAccount(t, roHome, "ro@example.com")
+	if err := os.Chmod(roHome, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roHome, 0o755) })
+
+	cfg := defaultConfig()
+	cfg.AccountsDir = accountsDir
+	ensureAuthFile([]byte("auth-dir: "+authDir+"\n"), cfg)
+
+	if files := readAgyAuthFiles(t, authDir); len(files) != 0 {
+		t.Fatalf("expected no auth file issued when marker cannot be written, got %v", files)
+	}
+}
+
 func TestEnsureAuthFileAccountsDirKeepsSignedInDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
