@@ -4,7 +4,7 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
-## [0.7.0] - 2026-11-25
+## [0.7.0] - 2026-11-26
 
 ### Changed
 
@@ -16,10 +16,12 @@ All notable changes to this project will be documented here.
 - `max_prompt_action`: optional `error` mode for `max_prompt_bytes` (keeping `stage` as the default) that rejects oversized prompts with non-retryable HTTP `413` (`request_scoped`) in both `print` and `acp` modes so clients know to compact before retrying (#32).
 - `stream_keepalive_interval`: streaming keepalive (`15s` default, minimum `15s`, `0s` disables) that emits no-op content deltas after `agy` initializes a turn, keeping reverse proxies from dropping silent staged turns without touching `finish_reason` or `[DONE]` framing (#32).
 - Prompt-size diagnostics: `X-AGY-Prompt-Bytes` header (and `agy_prompt_bytes` metadata) on `mode: print` runs, structured server logs when staging, rejecting (`413` with message/tool counts), or exceeding 150 KB with `max_prompt_bytes: 0`, and staged-specific remediation on `empty_assistant_response` when `agy` blocks reading the staged temp file.
+- Copyable Google sign-in URL field and **Copy URL** button in `accounts_page.html` alongside **Open Google sign-in** for cross-profile OAuth login (#42).
 
 ### Fixed
 
 - `executor.count_tokens` now measures the built conversation directly without staging temp files to disk or failing under `max_prompt_action: error`, and `promptForTokenCount` preserves the full prompt on staged managed-session resumes and explicit cross-account handoffs.
+- Isolated per-account `agy` homes from the Linux desktop D-Bus/Secret Service keyring (`DBUS_SESSION_BUS_ADDRESS=/dev/null`, `SSH_CONNECTION=127.0.0.1 1 127.0.0.1 22`) in `applyAccountEnv` and `startAgyLogin` so each account stores and reads tokens from its own `HOME` (#43).
 
 ## [0.6.0] - 2026-11-25
 
