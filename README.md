@@ -33,9 +33,11 @@ Google Antigravity
 
 **v0.1** features:
 
-- OpenAI Chat Completions-compatible text & vision requests
-- Non-streaming responses through `agy --output-format json`
-- Streaming responses through `agy --output-format stream-json`
+- `mode: print` (default): one-shot `agy -p` execution with signed account-bound conversation resumption (`agy.v1.*`), cross-account replay/handoff, and `max_prompt_bytes` oversized prompt staging
+- `mode: acp` (opt-in): resident `agy acp` stdio server per account home with transcript-fingerprinted session reuse for prompt cache hits, plus audio/video/file attachment support (`input_audio`, `video_url`, `file`)
+- OpenAI Chat Completions-compatible text, vision, and multimodal requests
+- Non-streaming responses through `agy --output-format json` or `agy acp`
+- Streaming responses through `agy --output-format stream-json` or `agy acp` (`agent_message_chunk`)
 - Prompt streaming via stdin (avoiding OS `ARG_MAX` and command-line length limits)
 - Multi-turn conversation resumption through `agy --conversation <id>`
 - Reasoning effort control via `agy --effort` (`low`, `medium`, `high`, `xhigh`, `max`)
@@ -294,7 +296,9 @@ The prompt is piped directly to `agy`'s standard input rather than passed as a c
 | `limits_tracking` | `true` | Track Antigravity usage limits by running `agy /usage` (no tokens consumed). |
 | `limits_refresh_interval` | `1m` | How long cached limits stay fresh (minimum `10s`). Limits are also refreshed after any quota error. |
 | `enforce_limits` | `false` | Reject requests with HTTP 429 (`agy_quota_exhausted`, retryable) when the model's quota group is known to be exhausted, without starting `agy`. Off by default because paid plans may continue on AI credits after a limit is reached. |
-| `max_prompt_bytes` | disabled | Stage requests larger than this many bytes to a private temp file that `agy` reads in full, instead of letting `agy` truncate the prompt tail. `agy` accepts roughly 190–198 KB of inline prompt on the tested version and drops the tail beyond it, which loses the newest user turn. Off by default because the cap is version dependent; ~`150000` is a conservative starting point. Requires the active agy permission mode to allow reading the staged path (auto mode does since 1.5.14; `ask` rules or older CLIs may block it). Staged turns report `agy_prompt_staged_bytes` (metadata) or `X-AGY-Prompt-Staged` (streaming). The staging root must be private to the current user: on Unix it is created `0700` and rejected if another user owns it, and on Windows it must resolve inside `%LOCALAPPDATA%` or the user profile — if `TEMP`/`TMP` points at a shared directory, staging refuses to run. |
+| `max_prompt_bytes` | disabled | Stage requests larger than this many bytes to a private temp file that `agy` reads in full (`mode: print` and `conversation_id` turns), instead of letting `agy` truncate the prompt tail. `agy` accepts roughly 190–198 KB of inline prompt on the tested version and drops the tail beyond it, which loses the newest user turn. Off by default because the cap is version dependent; ~`150000` is a conservative starting point. Requires the active agy permission mode to allow reading the staged path (auto mode does since 1.5.14; `ask` rules or older CLIs may block it). Staged turns report `agy_prompt_staged_bytes` (metadata) or `X-AGY-Prompt-Staged` (streaming). The staging root must be private to the current user: on Unix it is created `0700` and rejected if another user owns it, and on Windows it must resolve inside `%LOCALAPPDATA%` or the user profile — if `TEMP`/`TMP` points at a shared directory, staging refuses to run. |
+| `mode` | `print` | Execution mode: `print` (default, spawns `agy -p` per request) or `acp` (keeps a resident `agy acp` process per enabled account home, reuses matching sessions by transcript fingerprint to hit Antigravity's prompt cache, and supports `input_audio`, `video_url`, and `file` attachments). Requests carrying a `conversation_id` stay on `print` mode. |
+| `conv_debug_file` | empty | Optional JSONL log file path for troubleshooting ACP session lookup/store fingerprints (contains message excerpts; enable only during short debugging sessions). |
 | `accounts_dir` | empty | Directory holding one agy home per account. Accounts added from the panel go here (`~/.agy-accounts` when empty). See [Multiple accounts](#multiple-accounts). |
 
 ### Usage limits

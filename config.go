@@ -28,6 +28,8 @@ type pluginConfig struct {
 	// temp file that agy reads in full. Disabled by default: the cap it works
 	// around is agy-version dependent, so no number is assumed.
 	MaxPromptBytes int
+	Mode           string
+	ConvDebugFile  string
 	// AccountHome is the HOME given to agy for the account selected by CLIProxyAPI.
 	// It comes from the "home" field of the agy auth file, never from the plugin YAML.
 	AccountHome string
@@ -39,7 +41,19 @@ func defaultConfig() pluginConfig {
 		PrintTimeout:          "30m",
 		LimitsTracking:        true,
 		LimitsRefreshInterval: "1m",
+		Mode:                  modePrint,
 	}
+}
+
+const (
+	modeACP   = "acp"
+	modePrint = "print"
+)
+
+// acpSettingsChanged reports a change that running resident agy processes cannot pick up.
+func acpSettingsChanged(a, b pluginConfig) bool {
+	return a.Mode != b.Mode || a.BinaryPath != b.BinaryPath || a.Workdir != b.Workdir ||
+		a.Sandbox != b.Sandbox || a.DangerouslySkipPermissions != b.DangerouslySkipPermissions
 }
 
 var configState = struct {
@@ -49,8 +63,12 @@ var configState = struct {
 
 func setConfig(cfg pluginConfig) {
 	configState.Lock()
+	old := configState.value
 	configState.value = cfg
 	configState.Unlock()
+	if acpSettingsChanged(old, cfg) {
+		closeAllACP()
+	}
 	invalidateModels()
 	invalidateLimits()
 }
@@ -356,6 +374,14 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 				return pluginConfig{}, fmt.Errorf("line %d: invalid max_prompt_bytes %q: must be an integer >= 16384", lineNo+1, value)
 			}
 			cfg.MaxPromptBytes = parsed
+		case "mode":
+			mode := strings.ToLower(value)
+			if mode != modeACP && mode != modePrint {
+				return pluginConfig{}, fmt.Errorf("line %d: mode must be acp or print", lineNo+1)
+			}
+			cfg.Mode = mode
+		case "conv_debug_file":
+			cfg.ConvDebugFile = expandHome(value)
 		case "accounts_dir":
 			cleaned, err := validateWorkdir(value)
 			if err != nil {

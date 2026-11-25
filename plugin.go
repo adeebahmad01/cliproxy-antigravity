@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -43,6 +44,8 @@ const (
 	methodAuthRefresh           = "auth.refresh"
 	methodHostStreamEmit        = "host.stream.emit"
 	methodHostStreamClose       = "host.stream.close"
+	methodPluginQuiesce         = "plugin.quiesce"
+	methodPluginShutdown        = "plugin.shutdown"
 )
 
 type envelope struct {
@@ -345,6 +348,20 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if strings.TrimSpace(req.StreamID) == "" {
 			return nil, pError("stream_unavailable", "CLIProxyAPI did not provide a plugin stream ID", 500)
 		}
+		cfg, err := withAccount(currentConfig(), req.AuthMetadata)
+		if err != nil {
+			return nil, err
+		}
+		opts := resolveExecutionOptions(req, cfg)
+		if useACP(cfg, opts) {
+			if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
+				return nil, err
+			}
+			safeGo("executeStreamACP", func() { executeStreamACP(req, cfg, opts) })
+			headers := http.Header{"Content-Type": []string{"text/event-stream"}}
+			mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
+			return okEnvelope(executorStreamResponse{Headers: headers})
+		}
 		run, err := prepareAgyExecution(req)
 		if err != nil {
 			return nil, err
@@ -356,7 +373,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		run.opts.OutputFormat = "stream-json"
-		go executeStream(req, run)
+		safeGo("executeStream", func() { executeStream(req, run) })
 		headers := http.Header{"Content-Type": []string{"text/event-stream"}}
 		if run.session.NativeID != "" {
 			if id := run.session.clientID(); id != "" {
@@ -502,6 +519,17 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case methodQuotaReset:
 		return okEnvelope(quotaResetResponse{Success: false, Message: "Antigravity quota cannot be reset by the plugin; it refreshes on the schedule reported by agy"})
 
+	case methodPluginQuiesce:
+		// CLIProxyAPI is replacing this instance (hot reload): release the resident agy processes
+		// once in-flight turns finish, or they outlive the retired library.
+		drainACP(10 * time.Minute)
+		return okEnvelope(struct{}{})
+
+	case methodPluginShutdown:
+		activeProcesses.killAll()
+		closeAllACP()
+		return okEnvelope(struct{}{})
+
 	default:
 		return nil, pError("unknown_method", fmt.Sprintf("unknown plugin method %q", method), 404)
 	}
@@ -526,7 +554,9 @@ func pluginRegistration() registration {
 				{Name: "limits_tracking", Type: "boolean", Default: defaults.LimitsTracking, Description: "Track Antigravity usage limits via agy /usage (default: true)."},
 				{Name: "limits_refresh_interval", Type: "string", Default: defaults.LimitsRefreshInterval, Description: "How long cached usage limits stay fresh, as a duration (default: 1m, minimum 10s)."},
 				{Name: "enforce_limits", Type: "boolean", Default: defaults.EnforceLimits, Description: "Reject requests with HTTP 429 when the quota group of the model is exhausted, without launching agy (default: false)."},
-				{Name: "max_prompt_bytes", Type: "integer", Default: defaults.MaxPromptBytes, Description: "Stage requests larger than this many bytes to a private temp file that agy reads in full, instead of letting agy truncate the prompt tail. Disabled by default; the truncation cap is agy-version dependent, so ~150000 is a conservative starting point."},
+				{Name: "max_prompt_bytes", Type: "integer", Default: defaults.MaxPromptBytes, Description: "Stage requests larger than this many bytes to a private temp file that agy reads in full (mode: print), instead of letting agy truncate the prompt tail. Disabled by default; ~150000 is a conservative starting point."},
+				{Name: "mode", Type: "enum", Default: defaults.Mode, EnumValues: []string{modePrint, modeACP}, Description: "Execution mode: print (default, runs agy -p per request) or acp (keeps a resident agy acp server per account home with session reuse; conversation_id requests stay on print)."},
+				{Name: "conv_debug_file", Type: "string", Default: defaults.ConvDebugFile, Description: "Optional JSONL log path for ACP session reuse lookup/store troubleshooting (contains message excerpts)."},
 				{Name: "accounts_dir", Type: "string", Default: defaults.AccountsDir, Description: "Directory with one agy home per account. Accounts added from the panel are created here (default ~/.agy-accounts), and every signed-in home in it gets its own CLIProxyAPI auth file. CLIProxyAPI rotates between the accounts."},
 			},
 		},

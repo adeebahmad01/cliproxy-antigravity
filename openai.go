@@ -91,12 +91,18 @@ const (
 )
 
 func buildChatPrompt(req chatCompletionRequest, convID, workdir string) (string, error) {
-	return buildChatPromptFor(req, convID, workdir, false)
+	return buildChatPromptWithAttachments(req, convID, workdir, false, nil)
 }
 
 // buildChatPromptFor renders the forwarded prompt. When staged is true the
 // preamble permits reading the single request file that the handoff names.
 func buildChatPromptFor(req chatCompletionRequest, convID, workdir string, staged bool) (string, error) {
+	return buildChatPromptWithAttachments(req, convID, workdir, staged, nil)
+}
+
+// buildChatPromptWithAttachments renders the forwarded prompt and, when attachments
+// is non-nil (ACP mode), encodes image/audio/video/file blocks into *attachments.
+func buildChatPromptWithAttachments(req chatCompletionRequest, convID, workdir string, staged bool, attachments *[]acpPromptBlock) (string, error) {
 	messages := req.Messages
 	if convID != "" {
 		// When resuming an existing conversation, only include messages after the last
@@ -115,7 +121,7 @@ func buildChatPromptFor(req chatCompletionRequest, convID, workdir string, stage
 
 	// For a single user message in a resumed conversation without tools, pass the content directly.
 	if convID != "" && len(messages) == 1 && (strings.TrimSpace(messages[0].Role) == "" || strings.EqualFold(strings.TrimSpace(messages[0].Role), "user")) && len(req.Tools) == 0 && messages[0].ToolCallID == "" && len(messages[0].ToolCalls) == 0 {
-		content, err := messageContentText(messages[0].Content, workdir)
+		content, err := messageContent(messages[0].Content, workdir, attachments)
 		if err != nil {
 			return "", pError(errorCodeRequestScoped, fmt.Sprintf("message: %v", err), http.StatusBadRequest)
 		}
@@ -144,7 +150,7 @@ func buildChatPromptFor(req chatCompletionRequest, convID, workdir string, stage
 		if role == "" {
 			role = "user"
 		}
-		content, err := messageContentText(msg.Content, workdir)
+		content, err := messageContent(msg.Content, workdir, attachments)
 		if err != nil {
 			return "", pError(errorCodeRequestScoped, fmt.Sprintf("message %d: %v", i+1, err), http.StatusBadRequest)
 		}
@@ -355,6 +361,10 @@ func stageImage(dataURLOrPath string, workdir string) (string, error) {
 }
 
 func messageContentText(raw json.RawMessage, workdir string) (string, error) {
+	return messageContent(raw, workdir, nil)
+}
+
+func messageContent(raw json.RawMessage, workdir string, attachments *[]acpPromptBlock) (string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return "", nil
 	}
@@ -394,12 +404,31 @@ func messageContentText(raw json.RawMessage, workdir string) (string, error) {
 			}
 
 			if imgURL != "" {
+				if attachments != nil {
+					imgBlock, err := acpImageBlock(imgURL)
+					if err != nil {
+						return "", err
+					}
+					*attachments = append(*attachments, imgBlock)
+					parts = append(parts, "[Attached image]")
+					continue
+				}
 				stagedPath, err := stageImage(imgURL, workdir)
 				if err != nil {
 					return "", fmt.Errorf("staging image: %w", err)
 				}
 				parts = append(parts, fmt.Sprintf("[Attached image: %s (inspect this image file to answer the request)]", stagedPath))
 			}
+		case "input_audio", "video_url", "input_video", "file", "input_file":
+			if attachments == nil {
+				continue
+			}
+			link, label, err := acpMediaBlock(block, workdir)
+			if err != nil {
+				return "", err
+			}
+			*attachments = append(*attachments, link)
+			parts = append(parts, fmt.Sprintf("[Attached %s]", label))
 		default:
 			if text, ok := block["text"].(string); ok && text != "" {
 				parts = append(parts, text)
@@ -877,6 +906,54 @@ func makeChatChunk(id string, created int64, model string, delta map[string]any,
 	}
 	raw, _ := json.Marshal(body)
 	return raw
+}
+
+// chatStream writes Chat Completions chunks to a plugin stream. The role chunk waits
+// for the first real output so startup errors can still reach the host's retry path.
+type chatStream struct {
+	streamID       string
+	completionID   string
+	created        int64
+	model          string
+	conversationID string
+	rawChunks      bool
+	sentRole       bool
+}
+
+func newChatStream(req rpcExecutorRequest, conversationID string) *chatStream {
+	path, _ := req.Metadata["request_path"].(string)
+	return &chatStream{
+		streamID:       req.StreamID,
+		completionID:   newCompletionID(),
+		created:        time.Now().Unix(),
+		model:          displayModel(req.Model),
+		conversationID: conversationID,
+		// The OpenAI HTTP handlers frame plain JSON chunks and send [DONE].
+		// Other entrypoints may translate these chunks as SSE, so keep that framing.
+		rawChunks: path == "/v1/chat/completions" || path == "/v1/completions",
+	}
+}
+
+func (s *chatStream) send(delta map[string]any, finishReason *string, usage map[string]any) error {
+	chunk := makeChatChunk(s.completionID, s.created, s.model, delta, finishReason, usage, s.conversationID)
+	if !s.rawChunks {
+		chunk = append(append([]byte("data: "), chunk...), '\n', '\n')
+	}
+	return emitPluginStreamChunk(s.streamID, chunk)
+}
+
+func (s *chatStream) emit(delta map[string]any, finishReason *string, usage map[string]any) error {
+	if !s.sentRole {
+		if err := s.send(map[string]any{"role": "assistant"}, nil, nil); err != nil {
+			return err
+		}
+		s.sentRole = true
+	}
+	return s.send(delta, finishReason, usage)
+}
+
+func (s *chatStream) finish() {
+	finishPluginStream(s.streamID, s.rawChunks, emitPluginStreamChunk, closePluginStream)
 }
 
 // isPathUnder reports whether path is base or below it, comparing cleaned paths.

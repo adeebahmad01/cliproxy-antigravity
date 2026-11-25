@@ -113,7 +113,7 @@
   <details>
     <summary>How multiple accounts work</summary>
     <p>Each account has its own sign-in, settings, conversations, and usage limits. New chats follow CLIProxyAPI’s routing strategy. By default, round-robin spreads requests across eligible accounts of the same priority; it does not split token usage equally.</p>
-    <p>When your chat client sends back a conversation ID, that chat stays on its original account. A client can continue it on another account by starting a new session with the chat history or a summary. This page manages accounts, not chats.</p>
+    <p>When your chat client sends back a conversation ID, that chat stays on its original account (and uses <code>print</code> mode). A client can continue it on another account by starting a new session with the chat history or a summary. With <code>mode: acp</code>, chats reuse the account's matching session by transcript fingerprint, and CLIProxyAPI's session affinity keeps a chat on one account. This page manages accounts, not chats.</p>
   </details>
 </main>
 

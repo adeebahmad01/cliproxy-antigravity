@@ -18,6 +18,9 @@ All notable changes to this project will be documented here.
 
 ### Added
 
+- Opt-in resident `agy acp` execution mode (`mode: acp`, keeping `mode: print` as the default) with one long-lived `agy acp` stdio process per account `HOME`, `plugin.quiesce` / `plugin.shutdown` lifecycle cleanup, automatic retirement of disabled/removed accounts (including the last account), slash-command safety on follow-up turns, and coexistence with `conversations.go` (`conversation_id` requests stay on `print` mode) and `xhigh`/`max` reasoning efforts (adapted from `@seiry`, #23).
+- Transcript-fingerprinted ACP session reuse for prompt-cache hits (`conv_debug_file` for troubleshooting) (adapted from `@seiry`, #23).
+- Audio, video, and file attachment support in ACP mode (`input_audio`, `video_url`/`input_video`, `file`/`input_file`) with magic-byte MIME sniffing, PCM16-to-WAV wrapping, SSRF validation on remote URLs (private/loopback/link-local IP blocking and redirect checks), and bounded media cache eviction in `.cliproxy_media` (adapted from `@seiry`, #23).
 - `max_prompt_bytes`: opt-in staging for requests larger than the inline prompt that `agy` accepts. `agy` truncates that prompt from the tail, which drops the newest user turn on long conversations; above the threshold the full prompt is written to `os.TempDir()/cliproxy-prompts/<random>` (`0600`, outside `workdir`) and `agy` is asked to read exactly that one file. Disabled by default — the truncation cap is agy-version dependent, so no threshold is assumed (~150000 is a conservative starting point).
 - Staged turns are observable rather than silent: non-streaming responses carry `agy_prompt_staged_bytes` in metadata, streaming responses carry `X-AGY-Prompt-Staged`.
 - The staged copy keeps the client-tools contract at the top, `count_tokens` still estimates the full prompt, and the file is removed after `agy` exits, on error, and on the cancel/kill paths (leftovers swept after an hour).

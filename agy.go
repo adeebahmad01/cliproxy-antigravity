@@ -123,7 +123,7 @@ type catalogState struct {
 var modelCatalog = catalogState{entries: map[string]*catalogEntry{}}
 
 func catalogKey(cfg pluginConfig) string {
-	return strings.Join([]string{cfg.BinaryPath, cfg.AccountHome}, "\x00")
+	return strings.Join([]string{cfg.BinaryPath, cfg.Mode, cfg.AccountHome}, "\x00")
 }
 
 // modelCatalogDiskCache is the last discovery that succeeded. `agy models` fails
@@ -323,6 +323,7 @@ func reconcileAccounts() {
 		}
 	}
 	modelCatalog.Unlock()
+	retireACPExcept(enabled)
 }
 
 func standardBuiltinModels() []modelInfo {
@@ -475,7 +476,15 @@ func discoverCatalog(cfg pluginConfig) ([]modelInfo, map[string]string, bool) {
 	models, nativeByID := builtinCatalog()
 	discoveryComplete := false
 
-	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
+	if cfg.Mode == modeACP {
+		if discovered, mapping, err := discoverModelsACP(cfg); err == nil {
+			models = append(models, discovered...)
+			mergeDiscoveredNativeMap(nativeByID, mapping)
+			discoveryComplete = true
+		}
+	}
+
+	if err := validateBinaryPath(cfg.BinaryPath); err == nil && !discoveryComplete {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		binPath := resolveBinaryPath(cfg.BinaryPath)
@@ -1315,11 +1324,40 @@ func prepareAgyExecutionWithDiscovery(req rpcExecutorRequest, discover bool) (ag
 }
 
 func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
+	cfg, err := withAccount(currentConfig(), req.AuthMetadata)
+	if err != nil {
+		return executorResponse{}, err
+	}
+	opts := resolveExecutionOptions(req, cfg)
+	if useACP(cfg, opts) {
+		if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
+			return executorResponse{}, err
+		}
+		result, err := executeNonStreamACP(req, cfg, opts)
+		if err != nil {
+			return executorResponse{}, err
+		}
+		payload, err := makeChatCompletion(req.Model, declaredToolNames(req.Payload), result)
+		if err != nil {
+			return executorResponse{}, err
+		}
+		headers := http.Header{"Content-Type": []string{"application/json"}}
+		mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
+		return executorResponse{
+			Payload: payload,
+			Headers: headers,
+			Metadata: map[string]any{
+				"agy_status": result.Status,
+				"agy_mode":   modeACP,
+			},
+		}, nil
+	}
+
 	run, err := prepareAgyExecution(req)
 	if err != nil {
 		return executorResponse{}, err
 	}
-	cfg, opts := run.cfg, run.opts
+	cfg, opts = run.cfg, run.opts
 	if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
 		if run.cleanup != nil {
 			run.cleanup()
@@ -1388,44 +1426,19 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	activeProcesses.add(cmd)
 	defer activeProcesses.remove(cmd)
 
-	completionID := newCompletionID()
-	created := time.Now().Unix()
 	model := displayModel(req.Model)
+	_ = model
 	session := run.session
-	conversationID := session.clientID()
+	out := newChatStream(req, session.clientID())
 	updateConversationID := func(nativeID string) {
 		if nativeID = strings.TrimSpace(nativeID); nativeID != "" && nativeID != session.NativeID {
 			session.NativeID = nativeID
-			conversationID = session.clientID()
+			out.conversationID = session.clientID()
 		}
 	}
 
-	// Don't commit a stream before actual output. A CLI error during startup can
-	// then still reach the host's retry path for new chats.
-	path, _ := req.Metadata["request_path"].(string)
-	// The OpenAI HTTP handlers frame plain JSON chunks and send [DONE].
-	// Other entrypoints may translate these chunks as SSE, so keep that framing.
-	rawChunks := path == "/v1/chat/completions" || path == "/v1/completions"
-	sendChunk := func(delta map[string]any, finish *string, usage map[string]any) error {
-		chunk := makeChatChunk(completionID, created, model, delta, finish, usage, conversationID)
-		if !rawChunks {
-			chunk = append(append([]byte("data: "), chunk...), '\n', '\n')
-		}
-		return emitPluginStreamChunk(streamID, chunk)
-	}
-	finishStream := func() {
-		finishPluginStream(streamID, rawChunks, emitPluginStreamChunk, closePluginStream)
-	}
-	sentRole := false
-	emit := func(delta map[string]any, finish *string, usage map[string]any) error {
-		if !sentRole {
-			if err := sendChunk(map[string]any{"role": "assistant"}, nil, nil); err != nil {
-				return err
-			}
-			sentRole = true
-		}
-		return sendChunk(delta, finish, usage)
-	}
+	emit := out.emit
+	finishStream := out.finish
 
 	scanner := bufio.NewScanner(stdout)
 	// One NDJSON event carries a whole assistant turn, and a turn holding several
