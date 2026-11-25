@@ -11,6 +11,16 @@ All notable changes to this project will be documented here.
 - The staged copy keeps the client-tools contract at the top, `count_tokens` still estimates the full prompt, and the file is removed after `agy` exits, on error, and on the cancel/kill paths (leftovers swept after an hour).
 - The staging root is validated as user-private: `0700` and owned by the current user on Unix, inside `%LOCALAPPDATA%`/the user profile on Windows (Go cannot inspect Windows ACLs from the stdlib, so a `TEMP`/`TMP` redirected to a shared directory makes staging refuse rather than leak).
 
+## [0.5.1] - 2026-11-25
+
+### Fixed
+
+- Client-side tool-calling contract (`[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]`) is now placed before conversation messages in `buildChatPrompt` so long prompts truncated from the tail do not lose tool definitions (PR #26, contributed by @mengnanquq).
+- Tool-call extraction now scans balanced JSON values instead of stopping at the first ```` ``` ```` fence inside string arguments, unquotes double-encoded JSON string arguments, recovers bare JSON payloads with trailing prose only when `tools[]` are declared, prioritizes leading ```` ```json ```` fences before searching for ```` ```tool_calls ```` markers, and falls back cleanly past empty or unnamed bare JSON arrays (PR #27, contributed by @mengnanquq).
+- Model-emitted tool names now snap strictly onto advertised tools (exact, case-insensitive, explicit alias table, and delimiter-safe namespace matching on `:`, `/`, `.`) while pinning exact tool names in the prompt instruction (PR #30, contributed by @mengnanquq).
+- Model discovery now retains the previous in-memory catalog and an atomic `0600` disk cache under the user cache directory when `agy models` fails, writing the cache only on clean exit (`cmd.Wait() == nil`) (PR #28, contributed by @mengnanquq).
+- Streaming execution now raises the NDJSON `bufio.Scanner` line limit from 8 MiB to 32 MiB and propagates `emit()` and `[DONE]` emission errors through `closePluginStream` instead of reporting false success (PR #29, PR #31, contributed by @mengnanquq).
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
