@@ -960,6 +960,53 @@ func TestPromptForTokenCountUsesFullPromptOnManagedResumeAndHandoff(t *testing.T
 		t.Fatalf("resume promptForTokenCount returned %d bytes instead of full prompt", len(full))
 	}
 
+	// 1b. Managed resume where the large message precedes the last assistant reply and
+	// the new follow-up is short: count_tokens must still reflect the full history.
+	earlyPayload := []byte(`{"model":"agy/default","conversation_id":"` + convID + `","messages":[{"role":"user","content":"` + blob + `"},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}`)
+	earlyResumeReq := rpcExecutorRequest{
+		Model:        "agy/default",
+		AuthID:       "auth-1",
+		AuthMetadata: map[string]any{"home": origDir},
+		Payload:      earlyPayload,
+	}
+	earlyRun, err := prepareAgyExecution(earlyResumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if earlyRun.stagedBytes != 0 {
+		t.Fatalf("short follow-up on native resume should not stage, got %d", earlyRun.stagedBytes)
+	}
+	earlyCountPrompt := promptForTokenCount(earlyResumeReq, earlyRun)
+	if !strings.Contains(earlyCountPrompt, blob) {
+		t.Fatalf("expected native-resume count_tokens prompt to include earlier history, got %d bytes", len(earlyCountPrompt))
+	}
+	earlyBody, err := json.Marshal(earlyResumeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlyRaw, err := handleMethod(methodExecutorCountTokens, earlyBody)
+	if err != nil {
+		t.Fatalf("count_tokens failed on native resume: %v", err)
+	}
+	var earlyEnv struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Payload []byte `json:"Payload"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(earlyRaw, &earlyEnv); err != nil || !earlyEnv.OK {
+		t.Fatalf("unexpected count_tokens envelope: %s (%v)", earlyRaw, err)
+	}
+	var earlyTok struct {
+		TotalTokens int `json:"total_tokens"`
+	}
+	if err := json.Unmarshal(earlyEnv.Result.Payload, &earlyTok); err != nil {
+		t.Fatal(err)
+	}
+	if earlyTok.TotalTokens < 7000 {
+		t.Fatalf("expected count_tokens on native resume with 30KB earlier history >= 7000, got %d", earlyTok.TotalTokens)
+	}
+
 	// 2. Explicit cross-account handoff with a large history.
 	headers := http.Header{}
 	headers.Set(handoffHeader, "true")

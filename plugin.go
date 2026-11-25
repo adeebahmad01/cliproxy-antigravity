@@ -603,24 +603,27 @@ func mustErrorEnvelope(pe *pluginError) []byte {
 	return raw
 }
 
-// promptForTokenCount returns the prompt a staged turn actually represents: the
-// full conversation, not the short handoff that replaced it.
+// promptForTokenCount returns the full conversation prompt a request represents,
+// without staged handoff wrapping or native-resume history trimming.
 func promptForTokenCount(req rpcExecutorRequest, run agyExecution) string {
+	if run.opts.ConversationID != "" {
+		if chatReq, err := decodeChatRequest(req.Payload); err == nil {
+			if full, err := buildChatPrompt(chatReq, "", run.cfg.Workdir); err == nil {
+				return full
+			}
+		}
+	}
 	if run.fullPrompt != "" {
 		return run.fullPrompt
 	}
 	if run.stagedBytes == 0 {
 		return run.prompt
 	}
-	var chatReq chatCompletionRequest
-	if err := json.Unmarshal(req.Payload, &chatReq); err != nil {
-		return run.prompt
-	}
-	nativeID, _, err := resolveConversation(run.opts.ConversationID, req.Headers, run.session)
+	chatReq, err := decodeChatRequest(req.Payload)
 	if err != nil {
 		return run.prompt
 	}
-	full, err := buildChatPrompt(chatReq, nativeID, run.cfg.Workdir)
+	full, err := buildChatPrompt(chatReq, "", run.cfg.Workdir)
 	if err != nil {
 		return run.prompt
 	}
