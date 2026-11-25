@@ -25,8 +25,8 @@ type pluginConfig struct {
 	EnforceLimits              bool
 	AccountsDir                string
 	// MaxPromptBytes, when > 0, applies MaxPromptAction ("stage" or "error") to
-	// requests larger than this many bytes. Disabled by default: the cap it works
-	// around is agy-version dependent, so no number is assumed.
+	// requests larger than this many bytes. Defaults to 150000 (below agy's ~190-198 KB
+	// inline prompt truncation cliff); set to 0 to disable.
 	MaxPromptBytes          int
 	MaxPromptAction         string
 	StreamKeepaliveInterval string
@@ -39,21 +39,25 @@ type pluginConfig struct {
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{
-		BinaryPath:            "agy",
-		PrintTimeout:          "30m",
-		LimitsTracking:        true,
-		LimitsRefreshInterval: "1m",
-		MaxPromptAction:       promptActionStage,
-		Mode:                  modePrint,
+		BinaryPath:              "agy",
+		PrintTimeout:            "30m",
+		LimitsTracking:          true,
+		LimitsRefreshInterval:   "1m",
+		MaxPromptBytes:          defaultMaxPromptBytes,
+		MaxPromptAction:         promptActionStage,
+		StreamKeepaliveInterval: defaultStreamKeepalive,
+		Mode:                    modePrint,
 	}
 }
 
 const (
-	modeACP            = "acp"
-	modePrint          = "print"
-	promptActionStage  = "stage"
-	promptActionError  = "error"
-	minStreamKeepalive = 15 * time.Second
+	modeACP                = "acp"
+	modePrint              = "print"
+	promptActionStage      = "stage"
+	promptActionError      = "error"
+	defaultMaxPromptBytes  = 150000
+	defaultStreamKeepalive = "15s"
+	minStreamKeepalive     = 15 * time.Second
 )
 
 // acpSettingsChanged reports a change that running resident agy processes cannot pick up.
@@ -380,8 +384,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			cfg.EnforceLimits = parsed
 		case "max_prompt_bytes":
 			parsed, err := strconv.Atoi(value)
-			if err != nil || parsed < 16*1024 {
-				return pluginConfig{}, fmt.Errorf("line %d: invalid max_prompt_bytes %q: must be an integer >= 16384", lineNo+1, value)
+			if err != nil || (parsed != 0 && parsed < 16*1024) {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid max_prompt_bytes %q: must be 0 (disabled) or an integer >= 16384", lineNo+1, value)
 			}
 			cfg.MaxPromptBytes = parsed
 		case "max_prompt_action":

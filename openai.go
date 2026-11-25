@@ -178,7 +178,7 @@ func buildChatPromptWithAttachments(req chatCompletionRequest, convID, workdir s
 		}
 		if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" && string(msg.ToolCalls) != "[]" {
 			b.WriteString("Prior assistant tool calls:\n")
-			b.Write(msg.ToolCalls)
+			b.WriteString(compactJSON(string(msg.ToolCalls)))
 			b.WriteByte('\n')
 		}
 	}
@@ -191,7 +191,7 @@ func writeToolInstruction(b *strings.Builder, tools []json.RawMessage) {
 	b.WriteString("[SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING]\n")
 	b.WriteString("The client application has provided the following tools:\n")
 	for _, tool := range tools {
-		b.Write(tool)
+		b.WriteString(compactJSON(string(tool)))
 		b.WriteByte('\n')
 	}
 	if names := toolNamesFromSpecs(tools); len(names) > 0 {
@@ -295,11 +295,22 @@ func removeStagedPrompt(path string) {
 
 // fileHandoffPrompt is the short inline prompt sent when the request is staged.
 func fileHandoffPrompt(path string, promptBytes int) string {
-	return fmt.Sprintf("READ THIS FIRST: this turn's complete client request (%d bytes) is stored in the file %s .\n"+
-		"Read exactly that one file in full before answering: use your file-reading tool with offset/limit and keep reading until you have consumed every line. Do not read any other file.\n"+
-		"The file begins with a [SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING] block that defines the client's tools, followed by the conversation transcript and the latest user request.\n"+
-		"Follow those instructions exactly: answer the latest user request, and when a client tool call is required reply ONLY with the fenced tool_calls JSON block described there.\n"+
-		"Do not modify files, run local commands, or inspect the machine beyond reading that file.\n", promptBytes, path)
+	return fileHandoffPromptFor(path, promptBytes, true)
+}
+
+func fileHandoffPromptFor(path string, promptBytes int, hasTools bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "READ THIS FIRST: this turn's complete client request (%d bytes) is stored in the file %s .\n", promptBytes, path)
+	b.WriteString("Read exactly that one file in full before answering: use your file-reading tool with offset/limit and keep reading until you have consumed every line. Do not read any other file.\n")
+	if hasTools {
+		b.WriteString("The file begins with a [SYSTEM INSTRUCTION: CLIENT-SIDE TOOL CALLING] block that defines the client's tools, followed by the conversation transcript and the latest user request.\n")
+		b.WriteString("Follow those instructions exactly: answer the latest user request, and when a client tool call is required reply ONLY with the fenced tool_calls JSON block described there.\n")
+	} else {
+		b.WriteString("The file contains the system/developer instructions, the conversation transcript, and the latest user request.\n")
+		b.WriteString("Follow those instructions and answer the latest user request directly without leaving the reply empty.\n")
+	}
+	b.WriteString("Do not modify files, run local commands, or inspect the machine beyond reading that file.\n")
+	return b.String()
 }
 
 func stageImage(dataURLOrPath string, workdir string) (string, error) {
@@ -771,10 +782,29 @@ func emptyResponseError() error {
 	)
 }
 
+func emptyResponseErrorForStaged(stagedBytes int) error {
+	return pRetryableError(
+		"empty_assistant_response",
+		fmt.Sprintf("agy returned no assistant text after staging a %d-byte prompt: agy may have blocked reading the staged temp file (requires agy >= 1.5.14 auto mode or dangerously_skip_permissions: true without sandbox blocking temp reads); you can also set max_prompt_action: error or max_prompt_bytes: 0", stagedBytes),
+		http.StatusBadGateway,
+	)
+}
+
 // promptTooLargeError marks a request that exceeded max_prompt_bytes when
 // max_prompt_action is set to error. Non-retryable at the same payload so
 // clients know to compact before retrying.
 func promptTooLargeError(promptBytes, limit int) error {
+	return promptTooLargeErrorWithContext(promptBytes, limit, 0, 0)
+}
+
+func promptTooLargeErrorWithContext(promptBytes, limit, msgCount, toolCount int) error {
+	if msgCount > 0 || toolCount > 0 {
+		return pError(
+			errorCodeRequestScoped,
+			fmt.Sprintf("built prompt is %d bytes (%d messages, %d tools), exceeding max_prompt_bytes (%d); compact the conversation or raise max_prompt_bytes", promptBytes, msgCount, toolCount, limit),
+			http.StatusRequestEntityTooLarge,
+		)
+	}
 	return pError(
 		errorCodeRequestScoped,
 		fmt.Sprintf("built prompt is %d bytes, exceeding max_prompt_bytes (%d); compact the conversation or raise max_prompt_bytes", promptBytes, limit),

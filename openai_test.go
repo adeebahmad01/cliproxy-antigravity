@@ -605,16 +605,115 @@ func stagedPathFromHandoff(t *testing.T, handoff string) string {
 	return rest[:end]
 }
 
-// Staging is off by default: no threshold, no file, whatever the size.
-func TestPrepareAgyExecutionDoesNotStageByDefault(t *testing.T) {
+// Staging is enabled by default at 150000 bytes, and max_prompt_bytes: 0 disables it.
+func TestPrepareAgyExecutionStagesByDefaultAndRespectsZeroDisable(t *testing.T) {
+	useTempStagingDir(t)
 	setConfig(defaultConfig())
 	t.Cleanup(func() { setConfig(defaultConfig()) })
+
 	run, err := prepareAgyExecution(stagedRequest(t, 220000))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.stagedBytes != 0 || run.cleanup != nil {
-		t.Fatalf("default config staged a request: %+v", run.stagedBytes)
+	if run.cleanup != nil {
+		defer run.cleanup()
+	}
+	if run.stagedBytes <= 200000 || run.promptBytes <= 200000 {
+		t.Fatalf("expected default config to stage oversized prompt, got staged=%d prompt=%d", run.stagedBytes, run.promptBytes)
+	}
+
+	disabled := defaultConfig()
+	disabled.MaxPromptBytes = 0
+	setConfig(disabled)
+	runDisabled, err := prepareAgyExecution(stagedRequest(t, 220000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runDisabled.stagedBytes != 0 || runDisabled.cleanup != nil {
+		t.Fatalf("max_prompt_bytes=0 still staged a request: %d", runDisabled.stagedBytes)
+	}
+}
+
+func TestBuildChatPromptCompactsToolsAndToolCalls(t *testing.T) {
+	payload := []byte(`{
+		"model": "agy/default",
+		"messages": [
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{
+					"id": "call_1",
+					"type": "function",
+					"function": {
+						"name": "bash",
+						"arguments": "{\"cmd\":\"ls\"}"
+					}
+				}
+			]}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "bash",
+					"description": "run command",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"cmd": {"type": "string"}
+						}
+					}
+				}
+			}
+		]
+	}`)
+	req, err := decodeChatRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := buildChatPrompt(req, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(prompt, "\n\t") || strings.Contains(prompt, "\n\t\t") {
+		t.Fatalf("expected tools/tool_calls JSON to be compacted, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, `"name":"bash"`) || !strings.Contains(prompt, `"id":"call_1"`) {
+		t.Fatalf("expected compacted tool schema and tool call in prompt:\n%s", prompt)
+	}
+}
+
+func TestFileHandoffPromptOmitsToolFenceWhenNoTools(t *testing.T) {
+	withoutTools := fileHandoffPromptFor("/tmp/cliproxy-prompts/turn-1/prompt.txt", 1234, false)
+	if strings.Contains(withoutTools, "tool_calls") {
+		t.Fatalf("did not expect tool_calls instructions when hasTools=false: %s", withoutTools)
+	}
+	withTools := fileHandoffPromptFor("/tmp/cliproxy-prompts/turn-1/prompt.txt", 1234, true)
+	if !strings.Contains(withTools, "tool_calls") {
+		t.Fatalf("expected tool_calls instructions when hasTools=true: %s", withTools)
+	}
+}
+
+func TestStagedEmptyResponseIncludesRemediationAndPromptHeaders(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a shell script")
+	}
+	useTempStagingDir(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	script := "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '{\"status\":\"SUCCESS\",\"response\":\"\"}\\n'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setConfig(pluginConfig{BinaryPath: bin, MaxPromptBytes: 4096, MaxPromptAction: promptActionStage})
+	t.Cleanup(func() { setConfig(defaultConfig()) })
+
+	_, err := executeNonStream(stagedRequest(t, 8000))
+	var pe *pluginError
+	if !errors.As(err, &pe) || pe.Code != "empty_assistant_response" {
+		t.Fatalf("expected empty_assistant_response, got %#v", err)
+	}
+	if !strings.Contains(pe.Message, "staging") || !strings.Contains(pe.Message, "max_prompt_bytes: 0") {
+		t.Fatalf("expected staged remediation in error message, got %q", pe.Message)
 	}
 }
 

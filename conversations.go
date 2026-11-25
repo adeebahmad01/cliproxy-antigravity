@@ -17,6 +17,8 @@ import (
 const (
 	conversationPrefix = "agy.v1."
 	conversationHeader = "X-AGY-Conversation-ID"
+	// promptBytesHeader carries the built prompt byte size on mode: print routes.
+	promptBytesHeader = "X-AGY-Prompt-Bytes"
 	// promptStagedHeader carries the staged prompt size on translated routes.
 	promptStagedHeader = "X-AGY-Prompt-Staged"
 	handoffHeader      = "X-AGY-Continue-On-Another-Account"

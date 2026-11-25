@@ -31,7 +31,7 @@ func validateStagingDirPrivacy(dir string, info os.FileInfo) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("staging directory %s is outside the user profile; point TEMP at a private directory or leave max_prompt_bytes unset", dir)
+	return fmt.Errorf("staging directory %s is outside the user profile; point TEMP at a private directory or set max_prompt_bytes: 0", dir)
 }
 
 // isPathWithin reports whether path is base or below it, comparing cleaned

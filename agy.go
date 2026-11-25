@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1286,8 +1287,9 @@ type agyExecution struct {
 	// fullPrompt retains the un-staged prompt when prompt was replaced by
 	// fileHandoffPrompt, so count_tokens measures the real conversation even on
 	// resumes and explicit handoffs.
-	fullPrompt string
-	session    conversationRef
+	fullPrompt  string
+	promptBytes int
+	session     conversationRef
 	// stagedBytes is non-zero when the request was staged to a temp file.
 	stagedBytes int
 	// cleanup removes the staged file; it runs after agy exits, on cancel, and on
@@ -1331,11 +1333,11 @@ func prepareAgyExecutionWithOptions(req rpcExecutorRequest, discover, applyPromp
 	if err != nil {
 		return agyExecution{}, err
 	}
-	run := agyExecution{cfg: cfg, opts: opts, prompt: prompt, fullPrompt: prompt, session: session}
-	// Oversized prompt handling is opt-in: only a configured threshold applies.
+	run := agyExecution{cfg: cfg, opts: opts, prompt: prompt, fullPrompt: prompt, promptBytes: len(prompt), session: session}
 	if applyPromptLimit && cfg.MaxPromptBytes > 0 && len(prompt) > cfg.MaxPromptBytes {
 		if cfg.MaxPromptAction == promptActionError {
-			return agyExecution{}, promptTooLargeError(len(prompt), cfg.MaxPromptBytes)
+			log.Printf("cliproxy-antigravity: rejecting oversized prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+			return agyExecution{}, promptTooLargeErrorWithContext(len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools))
 		}
 		staged, buildErr := buildChatPromptFor(chatReq, nativeID, cfg.Workdir, true)
 		if buildErr != nil {
@@ -1345,9 +1347,12 @@ func prepareAgyExecutionWithOptions(req rpcExecutorRequest, discover, applyPromp
 		if writeErr != nil {
 			return agyExecution{}, pError("prompt_staging_failed", "failed to stage the oversized prompt: "+writeErr.Error(), http.StatusInternalServerError)
 		}
-		run.prompt = fileHandoffPrompt(path, len(staged))
+		log.Printf("cliproxy-antigravity: staged oversized prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(staged), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+		run.prompt = fileHandoffPromptFor(path, len(staged), len(chatReq.Tools) > 0)
 		run.stagedBytes = len(staged)
 		run.cleanup = func() { removeStagedPrompt(path) }
+	} else if applyPromptLimit && cfg.MaxPromptBytes == 0 && len(prompt) >= defaultMaxPromptBytes {
+		log.Printf("cliproxy-antigravity: warning: inline prompt is %d bytes (messages=%d, tools=%d, model=%s) with max_prompt_bytes=0; agy may truncate the tail", len(prompt), len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
 	}
 	return run, nil
 }
@@ -1411,6 +1416,10 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 
 	payload, err := makeChatCompletion(req.Model, declaredToolNames(req.Payload), result)
 	if err != nil {
+		var pe *pluginError
+		if run.stagedBytes > 0 && errors.As(err, &pe) && pe.Code == "empty_assistant_response" {
+			return executorResponse{}, emptyResponseErrorForStaged(run.stagedBytes)
+		}
 		return executorResponse{}, err
 	}
 	headers := http.Header{"Content-Type": []string{"application/json"}}
@@ -1418,12 +1427,19 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 		headers.Set(conversationHeader, result.ConversationID)
 	}
 	mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
+	if run.promptBytes > 0 {
+		headers.Set(promptBytesHeader, fmt.Sprintf("%d", run.promptBytes))
+	}
 	metadata := map[string]any{
 		"agy_conversation_id": result.ConversationID,
 		"agy_status":          result.Status,
 	}
+	if run.promptBytes > 0 {
+		metadata["agy_prompt_bytes"] = run.promptBytes
+	}
 	// Observable, not silent: clients can see that the turn was staged.
 	if run.stagedBytes > 0 {
+		headers.Set(promptStagedHeader, fmt.Sprintf("%d", run.stagedBytes))
 		metadata["agy_prompt_staged_bytes"] = run.stagedBytes
 	}
 	return executorResponse{
@@ -1600,7 +1616,11 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		// agy finished without text: it burned the turn on its own built-in tools.
 		// Failing here lets the client walk its fallback chain instead of retrying
 		// an identical empty completion.
-		out.closeError(emptyResponseError())
+		if run.stagedBytes > 0 {
+			out.closeError(emptyResponseErrorForStaged(run.stagedBytes))
+		} else {
+			out.closeError(emptyResponseError())
+		}
 		return
 	}
 	if opts.HasTools && isToolCall {

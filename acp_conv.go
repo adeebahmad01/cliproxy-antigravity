@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -174,7 +175,8 @@ func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPla
 		text, err := buildFollowUpPrompt(chatReq.Messages[last+1:], len(chatReq.Tools) > 0, cfg.Workdir, &attachments)
 		if err == nil && cfg.MaxPromptBytes > 0 && cfg.MaxPromptAction == promptActionError && len(text) > cfg.MaxPromptBytes {
 			releaseMediaRefs(mediaPathsFromBlocks(attachments))
-			err = promptTooLargeError(len(text), cfg.MaxPromptBytes)
+			log.Printf("cliproxy-antigravity: rejecting oversized acp follow-up prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(text), cfg.MaxPromptBytes, len(chatReq.Messages)-(last+1), len(chatReq.Tools), opts.NativeModel)
+			err = promptTooLargeErrorWithContext(len(text), cfg.MaxPromptBytes, len(chatReq.Messages)-(last+1), len(chatReq.Tools))
 		}
 		if err == nil {
 			plan.reuse = conv

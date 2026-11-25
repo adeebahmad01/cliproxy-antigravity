@@ -224,15 +224,22 @@ stream_keepalive_interval: 15s
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 
-	disabled, err := parsePluginConfig([]byte("stream_keepalive_interval: 0s\n"))
+	disabled, err := parsePluginConfig([]byte("max_prompt_bytes: 0\nstream_keepalive_interval: 0s\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if disabled.StreamKeepaliveInterval != "" {
-		t.Fatalf("expected 0s keepalive to disable, got %q", disabled.StreamKeepaliveInterval)
+	if disabled.MaxPromptBytes != 0 || disabled.StreamKeepaliveInterval != "" {
+		t.Fatalf("expected 0 max_prompt_bytes and 0s keepalive to disable, got %+v", disabled)
+	}
+
+	def := defaultConfig()
+	if def.MaxPromptBytes != defaultMaxPromptBytes || def.StreamKeepaliveInterval != defaultStreamKeepalive {
+		t.Fatalf("unexpected prompt/keepalive defaults: %+v", def)
 	}
 
 	for _, bad := range []string{
+		"max_prompt_bytes: -1\n",
+		"max_prompt_bytes: 1024\n",
 		"max_prompt_action: drop\n",
 		"stream_keepalive_interval: 10s\n",
 		"stream_keepalive_interval: -5s\n",
