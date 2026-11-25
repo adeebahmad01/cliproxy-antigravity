@@ -4,6 +4,8 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-25
+
 ### Changed
 
 - Model discovery now uses `oauth` executor scope (`model.for_auth`) per enabled `agy` auth file rather than `static` scope with a `model_router` self-route (adapted from `@seiry`, #23). Each enabled auth registers models discovered under its own `HOME`, requiring at least one enabled `agy` auth file to serve `agy` models.
