@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -30,9 +31,69 @@ const (
 	pcm16SampleRate        = 16000
 )
 
-var mediaCacheMu sync.Mutex
+var (
+	mediaCacheMu   sync.Mutex
+	activeMediaRef = map[string]int{}
+)
 
-func acpMediaBlock(block map[string]any, workdir string) (acpPromptBlock, string, error) {
+func acquireMediaRefLocked(path string) {
+	activeMediaRef[path]++
+}
+
+func releaseMediaRefs(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	mediaCacheMu.Lock()
+	for _, path := range paths {
+		if activeMediaRef[path] <= 1 {
+			delete(activeMediaRef, path)
+		} else {
+			activeMediaRef[path]--
+		}
+	}
+	mediaCacheMu.Unlock()
+}
+
+func mediaPathsFromBlocks(blocks []acpPromptBlock) []string {
+	var paths []string
+	for _, b := range blocks {
+		if b["type"] != "resource_link" {
+			continue
+		}
+		uri, _ := b["uri"].(string)
+		if p, ok := strings.CutPrefix(uri, "file://"); ok && p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+func ensurePrivateMediaDir(workdir string) (string, error) {
+	base := workdir
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, acpMediaDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("creating media directory: %w", err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return "", fmt.Errorf("inspecting media directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("media directory %s must be a real directory, not a symlink", dir)
+	}
+	if workdir == "" || runtime.GOOS != "windows" {
+		if err := validateStagingDirPrivacy(dir, info); err != nil {
+			return "", fmt.Errorf("media directory privacy check failed: %w", err)
+		}
+	}
+	return dir, nil
+}
+
+func acpMediaBlock(block map[string]any, workdir string, requestKeep map[string]bool) (acpPromptBlock, string, error) {
 	kind, _ := block["type"].(string)
 	var data []byte
 	var mimeType, name string
@@ -78,9 +139,12 @@ func acpMediaBlock(block map[string]any, workdir string) (acpPromptBlock, string
 	if len(data) > acpMediaMaxBytes {
 		return nil, "", fmt.Errorf("attachment larger than %d bytes", acpMediaMaxBytes)
 	}
-	path, err := stageMedia(data, mimeType, name, workdir)
+	path, err := stageMedia(data, mimeType, name, workdir, requestKeep)
 	if err != nil {
 		return nil, "", err
+	}
+	if requestKeep != nil {
+		requestKeep[path] = true
 	}
 	link := acpPromptBlock{"type": "resource_link", "uri": "file://" + path, "name": filepath.Base(path), "mimeType": mimeType}
 	return link, mediaLabel(mimeType), nil
@@ -215,39 +279,66 @@ func mediaLabel(mimeType string) string {
 	}
 }
 
-func stageMedia(data []byte, mimeType, name, workdir string) (string, error) {
-	base := workdir
-	if base == "" {
-		base = os.TempDir()
-	}
-	dir := filepath.Join(base, acpMediaDir)
-
+func stageMedia(data []byte, mimeType, name, workdir string, requestKeep map[string]bool) (string, error) {
 	mediaCacheMu.Lock()
 	defer mediaCacheMu.Unlock()
 
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("creating media directory: %w", err)
+	dir, err := ensurePrivateMediaDir(workdir)
+	if err != nil {
+		return "", err
 	}
 	sum := sha256.Sum256(data)
 	path, err := filepath.Abs(filepath.Join(dir, hex.EncodeToString(sum[:12])+mediaExtension(mimeType, name)))
 	if err != nil {
 		return "", err
 	}
+
+	now := time.Now()
 	if _, err := os.Stat(path); err == nil {
-		now := time.Now()
 		_ = os.Chtimes(path, now, now)
-		evictMediaCacheLocked(dir, path, now)
+		acquireMediaRefLocked(path)
+		if err := evictMediaCacheLocked(dir, path, requestKeep, now); err != nil {
+			if activeMediaRef[path] <= 1 {
+				delete(activeMediaRef, path)
+			} else {
+				activeMediaRef[path]--
+			}
+			return "", err
+		}
 		return path, nil
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+
+	tmp, err := os.CreateTemp(dir, "media-*.tmp")
+	if err != nil {
 		return "", fmt.Errorf("writing attachment: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("writing attachment: %w", err)
 	}
-	evictMediaCacheLocked(dir, path, time.Now())
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("writing attachment: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("writing attachment: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("writing attachment: %w", err)
+	}
+	acquireMediaRefLocked(path)
+	if err := evictMediaCacheLocked(dir, path, requestKeep, now); err != nil {
+		if activeMediaRef[path] <= 1 {
+			delete(activeMediaRef, path)
+		} else {
+			activeMediaRef[path]--
+		}
+		return "", err
+	}
 	return path, nil
 }
 
@@ -257,13 +348,18 @@ type cachedMediaFile struct {
 	modTime time.Time
 }
 
-func evictMediaCacheLocked(dir, keepPath string, now time.Time) {
+func evictMediaCacheLocked(dir, keepPath string, requestKeep map[string]bool, now time.Time) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return nil
 	}
-	var kept []cachedMediaFile
+	isProtected := func(p string) bool {
+		return p == keepPath || requestKeep[p] || activeMediaRef[p] > 0
+	}
+	var evictable []cachedMediaFile
 	var totalBytes int64
+	var protectedBytes int64
+	var totalFiles int
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -282,31 +378,35 @@ func evictMediaCacheLocked(dir, keepPath string, now time.Time) {
 			}
 			continue
 		}
-		if p != keepPath && now.Sub(info.ModTime()) > acpMediaCacheTTL {
+		if !isProtected(p) && now.Sub(info.ModTime()) > acpMediaCacheTTL {
 			_ = os.Remove(p)
 			continue
 		}
-		kept = append(kept, cachedMediaFile{path: p, size: info.Size(), modTime: info.ModTime()})
 		totalBytes += info.Size()
-	}
-
-	if len(kept) <= acpMediaCacheMaxFiles && totalBytes <= acpMediaCacheMaxBytes {
-		return
-	}
-	sort.Slice(kept, func(i, j int) bool {
-		return kept[i].modTime.Before(kept[j].modTime)
-	})
-	remaining := len(kept)
-	for _, item := range kept {
-		if remaining <= acpMediaCacheMaxFiles && totalBytes <= acpMediaCacheMaxBytes {
-			break
-		}
-		if item.path == keepPath {
+		totalFiles++
+		if isProtected(p) {
+			protectedBytes += info.Size()
 			continue
 		}
-		if os.Remove(item.path) == nil {
-			remaining--
-			totalBytes -= item.size
+		evictable = append(evictable, cachedMediaFile{path: p, size: info.Size(), modTime: info.ModTime()})
+	}
+
+	if totalFiles > acpMediaCacheMaxFiles || totalBytes > acpMediaCacheMaxBytes {
+		sort.Slice(evictable, func(i, j int) bool {
+			return evictable[i].modTime.Before(evictable[j].modTime)
+		})
+		for _, item := range evictable {
+			if totalFiles <= acpMediaCacheMaxFiles && totalBytes <= acpMediaCacheMaxBytes {
+				break
+			}
+			if os.Remove(item.path) == nil {
+				totalFiles--
+				totalBytes -= item.size
+			}
 		}
 	}
+	if protectedBytes > acpMediaCacheMaxBytes {
+		return pError(errorCodeRequestScoped, fmt.Sprintf("in-flight attachments (%d bytes) exceed the %d-byte media cache limit", protectedBytes, acpMediaCacheMaxBytes), http.StatusRequestEntityTooLarge)
+	}
+	return nil
 }

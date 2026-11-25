@@ -929,6 +929,25 @@ func resolveExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) agyOption
 }
 
 func resolveExecutionOptionsWithDiscovery(req rpcExecutorRequest, cfg pluginConfig, discover bool) agyOptions {
+	opts, requestedModel := parseExecutionOptions(req, cfg)
+	opts.NativeModel = resolveNativeModelWithDiscovery(requestedModel, cfg, discover)
+	return opts
+}
+
+// resolveExecutionOptionsForRequest decides between ACP and print mode before model discovery
+// so requests with a conversation_id never start or wait on a resident ACP process.
+func resolveExecutionOptionsForRequest(req rpcExecutorRequest, cfg pluginConfig) (agyOptions, bool) {
+	opts, requestedModel := parseExecutionOptions(req, cfg)
+	acp := useACP(cfg, opts)
+	modelCfg := cfg
+	if !acp {
+		modelCfg.Mode = modePrint
+	}
+	opts.NativeModel = resolveNativeModelWithDiscovery(requestedModel, modelCfg, true)
+	return opts, acp
+}
+
+func parseExecutionOptions(req rpcExecutorRequest, cfg pluginConfig) (agyOptions, string) {
 	var chatReq chatCompletionRequest
 	_ = json.Unmarshal(req.Payload, &chatReq)
 
@@ -1001,14 +1020,11 @@ func resolveExecutionOptionsWithDiscovery(req rpcExecutorRequest, cfg pluginConf
 		effort = ""
 	}
 
-	nativeModel := resolveNativeModelWithDiscovery(requestedModel, cfg, discover)
-
 	return agyOptions{
-		NativeModel:     nativeModel,
 		ConversationID:  requestConversationID(chatReq.conversationFields, req.Headers, req.Metadata),
 		ReasoningEffort: effort,
 		HasTools:        len(chatReq.Tools) > 0,
-	}
+	}, requestedModel
 }
 
 func normalizeEffort(s string) string {
@@ -1284,6 +1300,8 @@ func prepareAgyExecutionWithDiscovery(req rpcExecutorRequest, discover bool) (ag
 	if err != nil {
 		return agyExecution{}, err
 	}
+	// Print execution and count_tokens never need an ACP resident for model resolution.
+	cfg.Mode = modePrint
 	opts := resolveExecutionOptionsWithDiscovery(req, cfg, discover)
 	session := conversationRef{Home: sessionHome(cfg.AccountHome), Managed: req.AuthID != ""}
 	nativeID, handoff, err := resolveConversation(opts.ConversationID, req.Headers, session)
@@ -1328,8 +1346,12 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 	if err != nil {
 		return executorResponse{}, err
 	}
-	opts := resolveExecutionOptions(req, cfg)
-	if useACP(cfg, opts) {
+	opts, acp := resolveExecutionOptionsForRequest(req, cfg)
+	if acp {
+		if err := beginACPWork(); err != nil {
+			return executorResponse{}, err
+		}
+		defer endACPWork()
 		if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
 			return executorResponse{}, err
 		}
@@ -1337,6 +1359,8 @@ func executeNonStream(req rpcExecutorRequest) (executorResponse, error) {
 		if err != nil {
 			return executorResponse{}, err
 		}
+		// Never expose a raw ACP session ID as conversation_id, or the next turn drops into print mode.
+		result.ConversationID = ""
 		payload, err := makeChatCompletion(req.Model, declaredToolNames(req.Payload), result)
 		if err != nil {
 			return executorResponse{}, err

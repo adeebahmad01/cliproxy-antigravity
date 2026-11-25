@@ -37,12 +37,11 @@ func isDisallowedIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
 		return true
 	}
-	// Carrier-grade NAT (100.64.0.0/10) and IPv4-mapped IPv6 addresses.
+	// Carrier-grade NAT (100.64.0.0/10) and documentation/benchmark ranges.
 	if ip4 := ip.To4(); ip4 != nil {
 		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 			return true
 		}
-		// 192.0.0.0/24, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24
 		if (ip4[0] == 192 && ip4[1] == 0 && (ip4[2] == 0 || ip4[2] == 2)) ||
 			(ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19 || (ip4[1] == 51 && ip4[2] == 100))) ||
 			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
@@ -59,6 +58,9 @@ func validateRemoteURL(rawURL string) (*url.URL, error) {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported attachment URL scheme %q", u.Scheme)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("attachment URLs with embedded credentials are not allowed")
 	}
 	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
 	if host == "" {
@@ -115,6 +117,8 @@ func newSSRFSafeHTTPClient() *http.Client {
 			if len(via) >= acpMaxRedirects {
 				return fmt.Errorf("too many redirects")
 			}
+			// Never forward signed query URLs across cross-origin redirects.
+			req.Header.Del("Referer")
 			_, err := validateRemoteURL(req.URL.String())
 			return err
 		},
@@ -181,14 +185,14 @@ func acpImageBlock(ref string) (acpPromptBlock, error) {
 	}
 }
 
-func buildACPBlocks(chatReq chatCompletionRequest, opts agyOptions, cfg pluginConfig) ([]acpPromptBlock, error) {
+func buildACPBlocks(chatReq chatCompletionRequest, opts agyOptions, cfg pluginConfig) ([]acpPromptBlock, []string, error) {
 	var attachments []acpPromptBlock
 	prompt, err := buildChatPromptWithAttachments(chatReq, opts.ConversationID, cfg.Workdir, false, &attachments)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	blocks := []acpPromptBlock{{"type": "text", "text": prompt}}
-	return append(blocks, attachments...), nil
+	return append(blocks, attachments...), mediaPathsFromBlocks(attachments), nil
 }
 
 func executeNonStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions) (agyResult, error) {
@@ -196,6 +200,8 @@ func executeNonStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptio
 	if err != nil {
 		return agyResult{}, err
 	}
+	defer plan.releaseMedia()
+
 	result, conv, err := runACP(cfg, opts, plan, nil)
 	if err != nil {
 		return agyResult{}, err
@@ -215,6 +221,7 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 		closePluginStream(streamID, err)
 		return
 	}
+	defer plan.releaseMedia()
 
 	out := newChatStream(req, "")
 	var streamed strings.Builder
@@ -301,6 +308,11 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 
 // discoverModelsACP lists the models of cfg's account from its resident agy.
 func discoverModelsACP(cfg pluginConfig) ([]modelInfo, map[string]string, error) {
+	if err := beginACPWork(); err != nil {
+		return nil, nil, err
+	}
+	defer endACPWork()
+
 	c := livePooledACP(cfg)
 	switch {
 	case c != nil:
@@ -321,7 +333,7 @@ func discoverModelsACP(cfg pluginConfig) ([]modelInfo, map[string]string, error)
 	defer c.busy.Add(-1)
 	ctx, cancel := context.WithTimeout(context.Background(), acpDiscoverTimeout)
 	defer cancel()
-	cwd := nonEmpty(cfg.Workdir, ".")
+	cwd := resolveSessionWorkdir(cfg.Workdir)
 	set, err := c.listModels(ctx, cwd)
 	if err != nil {
 		return nil, nil, err

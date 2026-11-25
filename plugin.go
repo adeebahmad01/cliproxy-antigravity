@@ -352,12 +352,18 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		opts := resolveExecutionOptions(req, cfg)
-		if useACP(cfg, opts) {
+		opts, acp := resolveExecutionOptionsForRequest(req, cfg)
+		if acp {
 			if err := checkModelLimits(cfg, opts.NativeModel); err != nil {
 				return nil, err
 			}
-			safeGo("executeStreamACP", func() { executeStreamACP(req, cfg, opts) })
+			if err := beginACPWork(); err != nil {
+				return nil, err
+			}
+			safeGo("executeStreamACP", func() {
+				defer endACPWork()
+				executeStreamACP(req, cfg, opts)
+			})
 			headers := http.Header{"Content-Type": []string{"text/event-stream"}}
 			mergeHeaders(headers, limitHeaders(cfg, opts.NativeModel))
 			return okEnvelope(executorStreamResponse{Headers: headers})
@@ -527,7 +533,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 	case methodPluginShutdown:
 		activeProcesses.killAll()
-		closeAllACP()
+		retireAllACP()
 		return okEnvelope(struct{}{})
 
 	default:

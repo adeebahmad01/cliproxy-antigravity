@@ -65,9 +65,13 @@ func setConfig(cfg pluginConfig) {
 	configState.Lock()
 	old := configState.value
 	configState.value = cfg
-	configState.Unlock()
+	var detached []*acpClient
 	if acpSettingsChanged(old, cfg) {
-		closeAllACP()
+		detached = detachACPGeneration()
+	}
+	configState.Unlock()
+	if len(detached) > 0 {
+		closeDetachedACP(detached)
 	}
 	invalidateModels()
 	invalidateLimits()

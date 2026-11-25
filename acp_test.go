@@ -80,9 +80,11 @@ func setupFakeACP(t *testing.T) (pluginConfig, string, string, string) {
 	cfg.BinaryPath = bin
 	cfg.Mode = modeACP
 	cfg.Workdir = dir
+	resetACPQuiesceForTest()
 	setConfig(cfg)
 	t.Cleanup(func() {
 		closeAllACP()
+		resetACPQuiesceForTest()
 		setConfig(defaultConfig())
 	})
 	return cfg, pidLog, modelLog, promptLog
@@ -151,6 +153,9 @@ func TestACPResidentExecutionAndSessionReuse(t *testing.T) {
 	content1, _ := body1["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["content"].(string)
 	if content1 != "acp ok (sess-2)" {
 		t.Fatalf("unexpected turn 1 response: %s", resp1.Payload)
+	}
+	if _, exists := body1["conversation_id"]; exists {
+		t.Fatalf("ACP response must not expose raw session ID as conversation_id: %s", resp1.Payload)
 	}
 	usage := body1["usage"].(map[string]any)
 	// inputTokens(10) + cachedReadTokens(5) = 15 prompt_tokens
@@ -248,6 +253,9 @@ func TestACPQuiesceAndShutdown(t *testing.T) {
 	}
 	if c.alive() {
 		t.Fatal("plugin.shutdown must close resident")
+	}
+	if err := beginACPWork(); err == nil {
+		t.Fatal("expected ACP work to be rejected after quiesce/shutdown")
 	}
 }
 
@@ -353,6 +361,7 @@ func TestSSRFBlocksLoopbackAndPrivateURLs(t *testing.T) {
 		"http://192.168.1.1/router.png",
 		"http://localhost/local.png",
 		"http://[::1]/v6.png",
+		"https://user:secret@example.com/private.png",
 		"file:///etc/passwd",
 	} {
 		if _, err := acpImageBlock(blocked); err == nil {
@@ -361,6 +370,18 @@ func TestSSRFBlocksLoopbackAndPrivateURLs(t *testing.T) {
 	}
 	if !isDisallowedIP(net.ParseIP("100.64.0.1")) {
 		t.Fatal("expected CGNAT IP to be disallowed")
+	}
+
+	// Verify CheckRedirect strips Referer before forwarding to a redirect target.
+	client := newSSRFSafeHTTPClient()
+	redirectReq, _ := http.NewRequest(http.MethodGet, "https://cdn.example.com/target.png", nil)
+	redirectReq.Header.Set("Referer", "https://signed.example.com/secret?token=abc")
+	prevReq, _ := http.NewRequest(http.MethodGet, "https://signed.example.com/secret?token=abc", nil)
+	if err := client.CheckRedirect(redirectReq, []*http.Request{prevReq}); err != nil {
+		t.Fatalf("valid public redirect failed: %v", err)
+	}
+	if got := redirectReq.Header.Get("Referer"); got != "" {
+		t.Fatalf("expected Referer to be stripped on redirect, got %q", got)
 	}
 }
 
@@ -392,12 +413,20 @@ func TestRemoteAttachmentFetchValidPublicHost(t *testing.T) {
 
 func TestACPMediaSniffingAndStaging(t *testing.T) {
 	workdir := t.TempDir()
+	keep := map[string]bool{}
+	t.Cleanup(func() {
+		var paths []string
+		for p := range keep {
+			paths = append(paths, p)
+		}
+		releaseMediaRefs(paths)
+	})
 
 	// PCM16 wraps as WAV; m4a labeled as mp3 sniffs as audio/mp4.
 	pcmBlock, label, err := acpMediaBlock(map[string]any{
 		"type":        "input_audio",
 		"input_audio": map[string]any{"data": base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}), "format": "pcm16"},
-	}, workdir)
+	}, workdir, keep)
 	if err != nil || label != "audio" || pcmBlock["mimeType"] != "audio/wav" {
 		t.Fatalf("pcm16: block=%+v label=%q err=%v", pcmBlock, label, err)
 	}
@@ -411,7 +440,7 @@ func TestACPMediaSniffingAndStaging(t *testing.T) {
 	m4aBlock, _, err := acpMediaBlock(map[string]any{
 		"type":        "input_audio",
 		"input_audio": map[string]any{"data": base64.StdEncoding.EncodeToString(m4aHeader), "format": "mp3"},
-	}, workdir)
+	}, workdir, keep)
 	if err != nil || m4aBlock["mimeType"] != "audio/mp4" {
 		t.Fatalf("m4a sniff failed: block=%+v err=%v", m4aBlock, err)
 	}
@@ -419,7 +448,7 @@ func TestACPMediaSniffingAndStaging(t *testing.T) {
 	pdfBlock, label, err := acpMediaBlock(map[string]any{
 		"type": "file",
 		"file": map[string]any{"filename": "doc.pdf", "file_data": base64.StdEncoding.EncodeToString([]byte("%PDF-1.4\n"))},
-	}, workdir)
+	}, workdir, keep)
 	if err != nil || label != "file" || pdfBlock["mimeType"] != "application/pdf" {
 		t.Fatalf("pdf: block=%+v label=%q err=%v", pdfBlock, label, err)
 	}
@@ -449,10 +478,11 @@ func TestACPMediaCacheEviction(t *testing.T) {
 		_ = os.Chtimes(p, ts, ts)
 	}
 
-	kept, err := stageMedia([]byte("%PDF-1.7\nfresh"), "application/pdf", "fresh.pdf", dir)
+	kept, err := stageMedia([]byte("%PDF-1.7\nfresh"), "application/pdf", "fresh.pdf", dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer releaseMediaRefs([]string{kept})
 	if _, err := os.Stat(kept); err != nil {
 		t.Fatalf("kept file missing: %v", err)
 	}
@@ -465,5 +495,64 @@ func TestACPMediaCacheEviction(t *testing.T) {
 	entries, _ := os.ReadDir(mediaDir)
 	if len(entries) > acpMediaCacheMaxFiles {
 		t.Fatalf("expected <= %d files after eviction, got %d", acpMediaCacheMaxFiles, len(entries))
+	}
+}
+
+func TestACPPlanSessionReuseSkipsHistoricalAttachmentFetch(t *testing.T) {
+	setupFakeACP(t)
+	cfg := currentConfig()
+	opts := agyOptions{NativeModel: "gemini-4-hydrogen", ReasoningEffort: "xhigh"}
+
+	turn1Payload := []byte(`{"model":"agy/gemini-4-hydrogen:xhigh","messages":[
+		{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://expired.example.com/gone.png"}}]}
+	]}`)
+	chat1, err := decodeChatRequest(turn1Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeClient := &acpClient{dead: make(chan struct{})}
+	plan1 := &acpPlan{scope: convScope(cfg, opts), tools: chat1.Tools, messages: chat1.Messages, chatReq: chat1, opts: opts, cfg: cfg}
+	plan1.retainConv(&acpConv{client: fakeClient, sessionID: "sess-hist"}, "saw it", nil, false)
+	t.Cleanup(dropAllConvs)
+
+	// Subsequent turn includes the old expired URL in history: planACP must hit reuse without fetching it.
+	prev := remoteFetchClientOverride
+	remoteFetchClientOverride = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("unexpected historical fetch for %s", r.URL.String())
+		}),
+	}
+	t.Cleanup(func() { remoteFetchClientOverride = prev })
+
+	turn2Req := rpcExecutorRequest{
+		Model: "agy/gemini-4-hydrogen:xhigh",
+		Payload: []byte(`{"model":"agy/gemini-4-hydrogen:xhigh","messages":[
+			{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://expired.example.com/gone.png"}}]},
+			{"role":"assistant","content":"saw it"},
+			{"role":"user","content":"follow up"}
+		]}`),
+	}
+	plan2, err := planACP(turn2Req, opts, cfg)
+	if err != nil {
+		t.Fatalf("planACP failed on cached session with expired historical URL: %v", err)
+	}
+	if plan2.reuse == nil || plan2.reuse.sessionID != "sess-hist" {
+		t.Fatalf("expected retained session reuse, got %+v", plan2.reuse)
+	}
+}
+
+func TestACPResolveSessionWorkdirAndSetModelErrorClassification(t *testing.T) {
+	wd := resolveSessionWorkdir("")
+	if !filepath.IsAbs(wd) {
+		t.Fatalf("resolveSessionWorkdir(\"\") = %q, want absolute path", wd)
+	}
+	if !isACPModelRejection(&acpRPCError{Code: -32602, Message: "invalid params"}) {
+		t.Fatal("expected -32602 to classify as model rejection")
+	}
+	if isACPModelRejection(&acpRPCError{Code: -32601, Message: "method not found"}) {
+		t.Fatal("-32601 method not found must not classify as model_not_found")
+	}
+	if isACPModelRejection(&acpRPCError{Code: -32603, Message: "rate limit exceeded"}) {
+		t.Fatal("-32603 rate limit must not classify as model_not_found")
 	}
 }

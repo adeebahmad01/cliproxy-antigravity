@@ -82,57 +82,93 @@ func dropAllConvs() {
 	acpConvs.Unlock()
 }
 
-// acpPlan carries both prompts for a request: the full transcript for a fresh session and, when a
-// stored session matches the history, just the new messages for that session.
+// acpPlan carries the prompts for a request: when a stored session matches the history, only
+// follow is built up front so historical attachment URLs are only fetched on a cache miss/replay.
 type acpPlan struct {
-	full     []acpPromptBlock
-	follow   []acpPromptBlock
-	reuse    *acpConv
-	scope    string
-	tools    []json.RawMessage
-	messages []chatMessage
-	debug    string
+	full      []acpPromptBlock
+	hasFull   bool
+	follow    []acpPromptBlock
+	reuse     *acpConv
+	scope     string
+	tools     []json.RawMessage
+	messages  []chatMessage
+	chatReq   chatCompletionRequest
+	opts      agyOptions
+	cfg       pluginConfig
+	debug     string
+	mediaRefs []string
+}
+
+func (p *acpPlan) ensureFull() ([]acpPromptBlock, error) {
+	if p.hasFull {
+		return p.full, nil
+	}
+	full, paths, err := buildACPBlocks(p.chatReq, p.opts, p.cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.full = full
+	p.hasFull = true
+	p.mediaRefs = append(p.mediaRefs, paths...)
+	return p.full, nil
+}
+
+func (p *acpPlan) releaseMedia() {
+	if len(p.mediaRefs) > 0 {
+		releaseMediaRefs(p.mediaRefs)
+		p.mediaRefs = nil
+	}
 }
 
 func convScope(cfg pluginConfig, opts agyOptions) string {
 	return cfg.AccountHome + "\x00" + opts.NativeModel + "\x00" + opts.ReasoningEffort
 }
 
-func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (acpPlan, error) {
+func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPlan, error) {
 	chatReq, err := decodeChatRequest(req.Payload)
 	if err != nil {
-		return acpPlan{}, err
+		return nil, err
 	}
-	full, err := buildACPBlocks(chatReq, opts, cfg)
-	if err != nil {
-		return acpPlan{}, err
+	plan := &acpPlan{
+		scope:    convScope(cfg, opts),
+		tools:    chatReq.Tools,
+		messages: chatReq.Messages,
+		chatReq:  chatReq,
+		opts:     opts,
+		cfg:      cfg,
+		debug:    cfg.ConvDebugFile,
 	}
-	plan := acpPlan{full: full, scope: convScope(cfg, opts), tools: chatReq.Tools, messages: chatReq.Messages, debug: cfg.ConvDebugFile}
 	last := lastAssistantIndex(chatReq.Messages)
 	if last < 0 || last == len(chatReq.Messages)-1 {
 		convDebug(plan.debug, map[string]any{"event": "lookup", "skip": "no assistant turn", "n": len(chatReq.Messages), "src": req.SourceFormat})
+		if _, err := plan.ensureFull(); err != nil {
+			return nil, err
+		}
 		return plan, nil
 	}
 	key := convKey(plan.scope, plan.tools, chatReq.Messages[:last+1])
 	conv := takeConv(key)
 	convDebug(plan.debug, map[string]any{"event": "lookup", "key": key[:12], "hit": conv != nil, "n": len(chatReq.Messages),
 		"tools": len(chatReq.Tools), "scope": plan.scope, "src": req.SourceFormat, "msgs": describeMessages(chatReq.Messages[:last+1])})
-	if conv == nil {
-		return plan, nil
-	}
-	var images []acpPromptBlock
-	text, err := buildFollowUpPrompt(chatReq.Messages[last+1:], len(chatReq.Tools) > 0, cfg.Workdir, &images)
-	if err != nil {
+	if conv != nil {
+		var attachments []acpPromptBlock
+		text, err := buildFollowUpPrompt(chatReq.Messages[last+1:], len(chatReq.Tools) > 0, cfg.Workdir, &attachments)
+		if err == nil {
+			plan.reuse = conv
+			plan.follow = append([]acpPromptBlock{{"type": "text", "text": text}}, attachments...)
+			plan.mediaRefs = append(plan.mediaRefs, mediaPathsFromBlocks(attachments)...)
+			return plan, nil
+		}
 		safeGo("closeConv", func() { conv.client.closeSession(conv.sessionID) })
-		return plan, nil
 	}
-	plan.reuse = conv
-	plan.follow = append([]acpPromptBlock{{"type": "text", "text": text}}, images...)
+	if _, err := plan.ensureFull(); err != nil {
+		return nil, err
+	}
 	return plan, nil
 }
 
 // retainConv keeps a finished turn's session for the request that will carry this reply as history.
-func (p acpPlan) retainConv(conv *acpConv, reply string, toolCalls []openAIToolCall, isToolCall bool) {
+func (p *acpPlan) retainConv(conv *acpConv, reply string, toolCalls []openAIToolCall, isToolCall bool) {
 	if conv == nil {
 		return
 	}

@@ -407,6 +407,7 @@ func messageContent(raw json.RawMessage, workdir string, attachments *[]acpPromp
 				if attachments != nil {
 					imgBlock, err := acpImageBlock(imgURL)
 					if err != nil {
+						releaseMediaRefs(mediaPathsFromBlocks(*attachments))
 						return "", err
 					}
 					*attachments = append(*attachments, imgBlock)
@@ -423,8 +424,13 @@ func messageContent(raw json.RawMessage, workdir string, attachments *[]acpPromp
 			if attachments == nil {
 				continue
 			}
-			link, label, err := acpMediaBlock(block, workdir)
+			requestKeep := map[string]bool{}
+			for _, p := range mediaPathsFromBlocks(*attachments) {
+				requestKeep[p] = true
+			}
+			link, label, err := acpMediaBlock(block, workdir, requestKeep)
 			if err != nil {
+				releaseMediaRefs(mediaPathsFromBlocks(*attachments))
 				return "", err
 			}
 			*attachments = append(*attachments, link)
