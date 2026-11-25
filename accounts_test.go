@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -85,14 +86,28 @@ func TestApplyAccountEnv(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.AccountHome = "/accounts/work"
 	applyAccountEnv(cmd, cfg)
-	var home string
+	var home, dbusAddr, sshConn string
 	for _, kv := range cmd.Env {
 		if v, ok := strings.CutPrefix(kv, "HOME="); ok {
 			home = v // last one wins, as in exec.Cmd
 		}
+		if v, ok := strings.CutPrefix(kv, "DBUS_SESSION_BUS_ADDRESS="); ok {
+			dbusAddr = v
+		}
+		if v, ok := strings.CutPrefix(kv, "SSH_CONNECTION="); ok {
+			sshConn = v
+		}
 	}
 	if home != "/accounts/work" {
 		t.Fatalf("HOME = %q", home)
+	}
+	if runtime.GOOS == "linux" {
+		if dbusAddr != "/dev/null" {
+			t.Fatalf("DBUS_SESSION_BUS_ADDRESS = %q, want /dev/null", dbusAddr)
+		}
+		if sshConn == "" {
+			t.Fatal("expected SSH_CONNECTION to be set on Linux for file-based token isolation")
+		}
 	}
 }
 

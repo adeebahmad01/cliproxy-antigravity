@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -242,9 +243,15 @@ func startAgyLogin(cfg pluginConfig) (authLoginStartResponse, error) {
 
 	cmd := exec.Command(resolveBinaryPath(cfg.BinaryPath))
 	cmd.Dir = home
-	cmd.Env = append(os.Environ(),
+	env := append(os.Environ(),
 		"HOME="+home, "USERPROFILE="+home, "BROWSER="+browser,
 		"DISPLAY=", "WAYLAND_DISPLAY=", "TERM=xterm-256color")
+	if runtime.GOOS == "linux" {
+		// Isolate the fresh account home from the user's shared D-Bus/Secret Service keyring
+		// so agy does not reuse an existing keyring token and stores the new token under HOME.
+		env = append(env, "DBUS_SESSION_BUS_ADDRESS=/dev/null", "SSH_CONNECTION=127.0.0.1 1 127.0.0.1 22")
+	}
+	cmd.Env = env
 	pty, err := startInPTY(cmd)
 	if err != nil {
 		s.cleanup(true)

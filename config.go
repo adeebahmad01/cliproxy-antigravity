@@ -117,7 +117,13 @@ func applyAccountEnv(cmd *exec.Cmd, cfg pluginConfig) {
 		return
 	}
 	// Later duplicates win, so these override the inherited values.
-	cmd.Env = append(os.Environ(), "HOME="+cfg.AccountHome, "USERPROFILE="+cfg.AccountHome)
+	env := append(os.Environ(), "HOME="+cfg.AccountHome, "USERPROFILE="+cfg.AccountHome)
+	if runtime.GOOS == "linux" {
+		// Isolate per-account homes from the user's shared D-Bus/Secret Service keyring
+		// so agy stores and reads tokens from HOME/.gemini/antigravity-cli/.
+		env = append(env, "DBUS_SESSION_BUS_ADDRESS=/dev/null", "SSH_CONNECTION=127.0.0.1 1 127.0.0.1 22")
+	}
+	cmd.Env = env
 }
 
 func isExecutableFile(path string) bool {
