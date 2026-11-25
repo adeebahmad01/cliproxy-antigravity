@@ -193,7 +193,8 @@ func buildACPBlocks(chatReq chatCompletionRequest, opts agyOptions, cfg pluginCo
 	}
 	if cfg.MaxPromptBytes > 0 && cfg.MaxPromptAction == promptActionError && len(prompt) > cfg.MaxPromptBytes {
 		releaseMediaRefs(mediaPathsFromBlocks(attachments))
-		return nil, nil, promptTooLargeError(len(prompt), cfg.MaxPromptBytes)
+		log.Printf("cliproxy-antigravity: rejecting oversized acp prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+		return nil, nil, promptTooLargeErrorWithContext(len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools))
 	}
 	blocks := []acpPromptBlock{{"type": "text", "text": prompt}}
 	return append(blocks, attachments...), mediaPathsFromBlocks(attachments), nil
@@ -266,6 +267,9 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 	)
 	out.stopKeepalive()
 	if kErr := out.keepaliveFailure(); kErr != nil {
+		if conv != nil {
+			safeGo("closeConv", func() { conv.client.closeSession(conv.sessionID) })
+		}
 		out.closeError(kErr)
 		return
 	}
