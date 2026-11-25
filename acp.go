@@ -910,8 +910,11 @@ func drainACP(limit time.Duration) {
 
 // runACP executes one prompt on the resident agy for cfg's account. onDelta, when set, receives
 // assistant text as it streams; returning an error from it cancels the ACP turn.
-func runACP(cfg pluginConfig, opts agyOptions, plan *acpPlan, onDelta func(string) error, onPromptStart func(), canRetry func() bool) (agyResult, *acpConv, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout(cfg))
+func runACP(parentCtx context.Context, cfg pluginConfig, opts agyOptions, plan *acpPlan, onDelta func(string) error, onPromptStart func(), canRetry func() bool) (agyResult, *acpConv, error) {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, commandTimeout(cfg))
 	defer cancel()
 
 	emitted := false

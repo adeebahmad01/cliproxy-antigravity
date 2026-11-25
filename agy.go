@@ -1503,7 +1503,10 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 		switch event.Event {
 		case "init":
 			updateConversationID(event.ConversationID)
-			out.startKeepalive(keepaliveInterval)
+			out.startKeepalive(keepaliveInterval, func(error) {
+				killProcessTree(cmd)
+				cancel()
+			})
 		case "step_update":
 			if event.StepUpdate.StepType == "agent_response" && event.StepUpdate.TextDelta != "" {
 				streamedText.WriteString(event.StepUpdate.TextDelta)
@@ -1552,6 +1555,10 @@ func executeStream(req rpcExecutorRequest, run agyExecution) {
 	out.stopKeepalive()
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
+	if kErr := out.keepaliveFailure(); kErr != nil {
+		out.closeError(kErr)
+		return
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		out.closeError(classifyAgyError(ctx.Err(), stderr.String()))
 		return

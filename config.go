@@ -425,7 +425,13 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 	return cfg, nil
 }
 
+// streamKeepaliveOverride lets unit tests exercise keepalive ticks quickly.
+var streamKeepaliveOverride time.Duration
+
 func streamKeepaliveInterval(cfg pluginConfig) time.Duration {
+	if streamKeepaliveOverride > 0 {
+		return streamKeepaliveOverride
+	}
 	if strings.TrimSpace(cfg.StreamKeepaliveInterval) == "" {
 		return 0
 	}

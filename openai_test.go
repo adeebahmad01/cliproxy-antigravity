@@ -914,7 +914,7 @@ func TestChatStreamKeepaliveAndStopOrdering(t *testing.T) {
 		mu.Unlock()
 	}
 
-	out.startKeepalive(5 * time.Millisecond)
+	out.startKeepalive(5*time.Millisecond, nil)
 	select {
 	case <-sawKeepalive:
 	case <-time.After(time.Second):
@@ -943,5 +943,65 @@ func TestChatStreamKeepaliveAndStopOrdering(t *testing.T) {
 	}
 	if events[len(events)-2] != "data: [DONE]\n\n" || events[len(events)-1] != "CLOSE" {
 		t.Fatalf("expected [DONE] then CLOSE at end, got %v", events[len(events)-2:])
+	}
+}
+
+func TestExecuteStreamKillsSilentAgyOnKeepaliveError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stub is a shell script")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	// Emit init so keepalive starts, then stay silent well past the test deadline.
+	script := "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '{\"event\":\"init\",\"conversation_id\":\"c1\"}\\n'\nsleep 30\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	prevInterval := streamKeepaliveOverride
+	prevEmit := chatStreamEmitChunk
+	prevClose := chatStreamClose
+	streamKeepaliveOverride = 10 * time.Millisecond
+	t.Cleanup(func() {
+		streamKeepaliveOverride = prevInterval
+		chatStreamEmitChunk = prevEmit
+		chatStreamClose = prevClose
+	})
+
+	emitErr := errors.New("client disconnected")
+	var closedErr error
+	var mu sync.Mutex
+	chatStreamEmitChunk = func(_ string, _ []byte) error {
+		return emitErr
+	}
+	chatStreamClose = func(_ string, err error) {
+		mu.Lock()
+		closedErr = err
+		mu.Unlock()
+	}
+
+	run := agyExecution{
+		cfg:    pluginConfig{BinaryPath: bin, PrintTimeout: "30s"},
+		opts:   agyOptions{OutputFormat: "stream-json"},
+		prompt: "hi",
+	}
+	req := rpcExecutorRequest{StreamID: "s-keepalive-err", Model: "agy/default"}
+
+	done := make(chan struct{})
+	go func() {
+		executeStream(req, run)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("executeStream hung after keepalive emission failed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !errors.Is(closedErr, emitErr) {
+		t.Fatalf("expected stream to close with %v, got %v", emitErr, closedErr)
 	}
 }

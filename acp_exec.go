@@ -206,7 +206,7 @@ func executeNonStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptio
 	}
 	defer plan.releaseMedia()
 
-	result, conv, err := runACP(cfg, opts, plan, nil, nil, nil)
+	result, conv, err := runACP(context.Background(), cfg, opts, plan, nil, nil, nil)
 	if err != nil {
 		return agyResult{}, err
 	}
@@ -253,15 +253,22 @@ func executeStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions)
 		return out.emit(map[string]any{"content": pending}, nil, nil)
 	}
 
+	acpCtx, acpCancel := context.WithCancel(context.Background())
+	defer acpCancel()
 	result, conv, err := runACP(
+		acpCtx,
 		cfg,
 		opts,
 		plan,
 		onDelta,
-		func() { out.startKeepalive(keepaliveInterval) },
+		func() { out.startKeepalive(keepaliveInterval, func(error) { acpCancel() }) },
 		func() bool { return !out.hasSent() },
 	)
 	out.stopKeepalive()
+	if kErr := out.keepaliveFailure(); kErr != nil {
+		out.closeError(kErr)
+		return
+	}
 	if err == errACPClientGone {
 		return
 	}

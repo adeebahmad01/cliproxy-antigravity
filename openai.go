@@ -928,6 +928,11 @@ func makeChatChunk(id string, created int64, model string, delta map[string]any,
 	return raw
 }
 
+var (
+	chatStreamEmitChunk = emitPluginStreamChunk
+	chatStreamClose     = closePluginStream
+)
+
 // chatStream writes Chat Completions chunks to a plugin stream. The role chunk waits
 // for the first real output (or keepalive tick after startup) so startup errors can
 // still reach the host's retry path.
@@ -944,6 +949,7 @@ type chatStream struct {
 	emitChunk      func(string, []byte) error
 	closeStream    func(string, error)
 	keepaliveStop  chan struct{}
+	keepaliveErr   error
 	keepaliveOnce  sync.Once
 	keepaliveWG    sync.WaitGroup
 }
@@ -959,8 +965,8 @@ func newChatStream(req rpcExecutorRequest, conversationID string) *chatStream {
 		// The OpenAI HTTP handlers frame plain JSON chunks and send [DONE].
 		// Other entrypoints may translate these chunks as SSE, so keep that framing.
 		rawChunks:   path == "/v1/chat/completions" || path == "/v1/completions",
-		emitChunk:   emitPluginStreamChunk,
-		closeStream: closePluginStream,
+		emitChunk:   chatStreamEmitChunk,
+		closeStream: chatStreamClose,
 	}
 }
 
@@ -1003,23 +1009,34 @@ func (s *chatStream) emit(delta map[string]any, finishReason *string, usage map[
 	return s.emitLocked(delta, finishReason, usage)
 }
 
-func (s *chatStream) emitKeepalive(stop <-chan struct{}) bool {
+func (s *chatStream) keepaliveFailure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepaliveErr
+}
+
+func (s *chatStream) emitKeepalive(stop <-chan struct{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	select {
 	case <-stop:
-		return false
+		return nil
 	default:
 	}
 	if s.closed {
-		return false
+		return nil
 	}
-	return s.emitLocked(map[string]any{"content": ""}, nil, nil) == nil
+	if err := s.emitLocked(map[string]any{"content": ""}, nil, nil); err != nil {
+		s.keepaliveErr = err
+		return err
+	}
+	return nil
 }
 
 // startKeepalive emits no-op content deltas on interval until stopKeepalive or
-// terminal closure. Tests can pass any positive duration; config enforces >= 15s.
-func (s *chatStream) startKeepalive(interval time.Duration) {
+// terminal closure. If an emission fails, onErr runs so the caller can abort the
+// upstream execution immediately. Tests can pass any positive duration; config enforces >= 15s.
+func (s *chatStream) startKeepalive(interval time.Duration, onErr func(error)) {
 	if interval <= 0 {
 		return
 	}
@@ -1042,7 +1059,10 @@ func (s *chatStream) startKeepalive(interval time.Duration) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				if !s.emitKeepalive(stop) {
+				if err := s.emitKeepalive(stop); err != nil {
+					if onErr != nil {
+						onErr(err)
+					}
 					return
 				}
 			}
