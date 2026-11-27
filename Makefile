@@ -43,14 +43,14 @@ test:
 	CGO_ENABLED=1 go test -v ./...
 
 build:
-	CGO_ENABLED=1 go build -buildmode=c-shared -o $(BINARY).$(EXT) .
+	CGO_ENABLED=1 go build -buildmode=c-shared -ldflags="-X main.pluginVersion=$(VERSION)" -o $(BINARY).$(EXT) .
 
 smoke: build
-	python3 scripts/abi_smoke.py ./$(BINARY).$(EXT)
+	EXPECTED_PLUGIN_VERSION="$(VERSION)" python3 scripts/abi_smoke.py ./$(BINARY).$(EXT)
 
 package:
 	mkdir -p $(DIST)
-	CGO_ENABLED=1 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -buildmode=c-shared -ldflags="-s -w" -o $(DIST)/$(BINARY).$(EXT) .
+	CGO_ENABLED=1 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -buildmode=c-shared -ldflags="-s -w -X main.pluginVersion=$(VERSION)" -o $(DIST)/$(BINARY).$(EXT) .
 	rm -f $(DIST)/$(BINARY).h
 	go run scripts/package-release.go -library $(DIST)/$(BINARY).$(EXT) -archive $(DIST)/$(BINARY)_$(VERSION)_$(GOOS)_$(GOARCH).zip -checksum $(DIST)/$(BINARY)_$(VERSION)_$(GOOS)_$(GOARCH).zip.sha256
 

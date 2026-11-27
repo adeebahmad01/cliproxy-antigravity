@@ -12,9 +12,11 @@ import (
 const (
 	pluginID      = "cliproxy-antigravity"
 	providerID    = "agy"
-	pluginVersion = "0.7.1"
 	schemaVersion = 6
 )
+
+// pluginVersion can be overridden with -X main.pluginVersion at build time.
+var pluginVersion = "0.7.1"
 
 const (
 	methodPluginRegister        = "plugin.register"

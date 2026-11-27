@@ -50,9 +50,9 @@ jobs:
       - name: Unit tests
         run: CGO_ENABLED=1 go test -race -v ./...
       - name: Build dynamic plugin
-        run: CGO_ENABLED=1 go build -buildmode=c-shared -o "$RUNNER_TEMP/cliproxy-antigravity.lib" .
+        run: CGO_ENABLED=1 go build -buildmode=c-shared -ldflags="-X main.pluginVersion=0.0.0-ci" -o "$RUNNER_TEMP/cliproxy-antigravity.lib" .
       - name: ABI smoke test
-        run: python3 scripts/abi_smoke.py "$RUNNER_TEMP/cliproxy-antigravity.lib"
+        run: EXPECTED_PLUGIN_VERSION=0.0.0-ci python3 scripts/abi_smoke.py "$RUNNER_TEMP/cliproxy-antigravity.lib"
 
   # Cross-compile every release target so a platform-specific break shows up on
   # the PR instead of on the tag.
