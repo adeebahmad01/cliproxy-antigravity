@@ -91,9 +91,14 @@ jobs:
 
           CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -buildmode=c-shared \
-            -ldflags "-s -w" \
+            -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
             -o "dist/${LIB_NAME}" .
           rm -f dist/*.h
+
+          # Verify the embedded version on native runners before packaging.
+          if [ "$(go env GOOS)" = "${{ matrix.goos }}" ] && [ "$(go env GOARCH)" = "${{ matrix.goarch }}" ]; then
+            EXPECTED_PLUGIN_VERSION="${VERSION}" python3 scripts/abi_smoke.py "dist/${LIB_NAME}"
+          fi
 
           go run scripts/package-release.go \
             -library "dist/${LIB_NAME}" \

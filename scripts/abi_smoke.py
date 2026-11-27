@@ -125,6 +125,13 @@ def main() -> int:
         if rc != 0 or not registration.get("ok"):
             raise RuntimeError(f"registration failed: {registration}")
         result = registration["result"]
+        expected_version = os.environ.get("EXPECTED_PLUGIN_VERSION")
+        if expected_version is not None:
+            actual_version = result["metadata"]["Version"]
+            if actual_version != expected_version:
+                raise RuntimeError(
+                    f"plugin version mismatch: expected {expected_version!r}, got {actual_version!r}"
+                )
         assert result["capabilities"]["executor_model_scope"] == "oauth"
         fields = {f["Name"]: f for f in result["metadata"]["ConfigFields"]}
         if fields["reasoning_effort"]["Type"] != "enum" or fields["reasoning_effort"]["EnumValues"] != ["low", "medium", "high", "xhigh", "max"] or fields["binary_path"]["Default"] != "agy":
