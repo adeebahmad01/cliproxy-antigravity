@@ -794,3 +794,48 @@ func TestACPMaxPromptActionErrorReturns413AndRestoresSession(t *testing.T) {
 		t.Fatalf("expected cached ACP session to be restored after 413 error, got %+v", restored)
 	}
 }
+
+func TestACPTrimDropsMiddleNotTail(t *testing.T) {
+	setupFakeACP(t)
+	cfg := currentConfig()
+	cfg.Workdir = t.TempDir()
+	cfg.MaxPromptBytes = 100000
+	cfg.MaxPromptAction = promptActionTrim
+	opts := agyOptions{NativeModel: "gemini-4-neon", ReasoningEffort: "high"}
+	big := strings.Repeat("x", 20000)
+	msgs := `{"role":"system","content":"rules"},{"role":"user","content":"the task"}`
+	for i := 0; i < 20; i++ {
+		msgs += fmt.Sprintf(`,{"role":"assistant","content":"step %d %s"},{"role":"user","content":"result %d"}`, i, big, i)
+	}
+	msgs += `,{"role":"user","content":"NEWEST REQUEST"}`
+	chatReq, err := decodeChatRequest([]byte(`{"model":"agy/gemini-4-neon:high","messages":[` + msgs + `]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, _, err := buildACPBlocks(chatReq, opts, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := fmt.Sprint(blocks[0]["text"])
+	if len(text) > cfg.MaxPromptBytes {
+		t.Fatalf("prompt is %d bytes, limit %d", len(text), cfg.MaxPromptBytes)
+	}
+	for _, want := range []string{"rules", "the task", "NEWEST REQUEST", "result 19", "omitted"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("trimmed prompt lost %q", want)
+		}
+	}
+	if strings.Contains(text, "step 0 ") {
+		t.Fatal("the oldest middle message should have been dropped")
+	}
+
+	// Under the limit nothing changes.
+	cfg.MaxPromptBytes = len(text) * 10
+	blocks, _, err = buildACPBlocks(chatReq, opts, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(blocks[0]["text"]), "omitted") {
+		t.Fatal("trimmed a prompt that fits")
+	}
+}

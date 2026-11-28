@@ -250,3 +250,13 @@ stream_keepalive_interval: 15s
 		}
 	}
 }
+
+func TestParseMaxPromptActionTrim(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte("max_prompt_action: trim\n"))
+	if err != nil || cfg.MaxPromptAction != promptActionTrim {
+		t.Fatalf("trim not accepted: %v %q", err, cfg.MaxPromptAction)
+	}
+	if _, err := parsePluginConfig([]byte("max_prompt_action: shorten\n")); err == nil {
+		t.Fatal("unknown action accepted")
+	}
+}

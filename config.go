@@ -24,7 +24,7 @@ type pluginConfig struct {
 	LimitsRefreshInterval      string
 	EnforceLimits              bool
 	AccountsDir                string
-	// MaxPromptBytes, when > 0, applies MaxPromptAction ("stage" or "error") to
+	// MaxPromptBytes, when > 0, applies MaxPromptAction ("stage", "error" or "trim") to
 	// requests larger than this many bytes. Defaults to 150000 (below agy's ~190-198 KB
 	// inline prompt truncation cliff); set to 0 to disable.
 	MaxPromptBytes          int
@@ -55,6 +55,7 @@ const (
 	modePrint              = "print"
 	promptActionStage      = "stage"
 	promptActionError      = "error"
+	promptActionTrim       = "trim"
 	defaultMaxPromptBytes  = 150000
 	defaultStreamKeepalive = "15s"
 	minStreamKeepalive     = 15 * time.Second
@@ -396,8 +397,8 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			cfg.MaxPromptBytes = parsed
 		case "max_prompt_action":
 			action := strings.ToLower(value)
-			if action != promptActionStage && action != promptActionError {
-				return pluginConfig{}, fmt.Errorf("line %d: max_prompt_action must be stage or error", lineNo+1)
+			if action != promptActionStage && action != promptActionError && action != promptActionTrim {
+				return pluginConfig{}, fmt.Errorf("line %d: max_prompt_action must be stage, error or trim", lineNo+1)
 			}
 			cfg.MaxPromptAction = action
 		case "stream_keepalive_interval":
