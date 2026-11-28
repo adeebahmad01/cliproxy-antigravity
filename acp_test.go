@@ -794,3 +794,47 @@ func TestACPMaxPromptActionErrorReturns413AndRestoresSession(t *testing.T) {
 		t.Fatalf("expected cached ACP session to be restored after 413 error, got %+v", restored)
 	}
 }
+
+func TestACPEmptyReplyKeepsSessionForRetry(t *testing.T) {
+	setupFakeACP(t)
+	cfg := currentConfig()
+	cfg.Workdir = t.TempDir()
+	opts := agyOptions{NativeModel: "gemini-4-neon", ReasoningEffort: "high"}
+	t.Cleanup(dropAllConvs)
+
+	// Turn 1 succeeds and stores its session under the history that ends with its reply.
+	turn1, err := decodeChatRequest([]byte(`{"model":"agy/gemini-4-neon:high","messages":[{"role":"user","content":"start"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closeBuf bytes.Buffer
+	client := &acpClient{dead: make(chan struct{}), in: nopWriteCloserBuf{&closeBuf}}
+	conv := &acpConv{client: client, sessionID: "sess-empty"}
+	plan1 := &acpPlan{scope: convScope(cfg, opts), tools: turn1.Tools, messages: turn1.Messages, chatReq: turn1, opts: opts, cfg: cfg}
+	plan1.retainConv(conv, "first answer", nil, false)
+
+	turn2 := rpcExecutorRequest{Model: "agy/gemini-4-neon:high", Payload: []byte(`{"model":"agy/gemini-4-neon:high","messages":[
+		{"role":"user","content":"start"},
+		{"role":"assistant","content":"first answer"},
+		{"role":"user","content":"next step"}
+	]}`)}
+
+	// Turn 2 reuses the session, then agy answers with no text.
+	plan2, err := planACP(turn2, opts, cfg)
+	if err != nil || plan2.reuse != conv {
+		t.Fatalf("turn 2: expected reuse of sess-empty, got plan=%+v err=%v", plan2, err)
+	}
+	plan2.retainConv(plan2.reuse, "  ", nil, false)
+	if strings.Contains(closeBuf.String(), "sess-empty") {
+		t.Fatalf("empty reply closed the session: %q", closeBuf.String())
+	}
+
+	// The client's retry sends the same history and must reuse the same session, not replay.
+	plan3, err := planACP(turn2, opts, cfg)
+	if err != nil || plan3.reuse != conv {
+		t.Fatalf("retry: expected reuse of sess-empty, got plan=%+v err=%v", plan3, err)
+	}
+	if len(plan3.follow) == 0 || !strings.Contains(fmt.Sprint(plan3.follow[0]["text"]), "next step") {
+		t.Fatalf("retry: expected a follow-up with only the new turn, got %+v", plan3.follow)
+	}
+}
