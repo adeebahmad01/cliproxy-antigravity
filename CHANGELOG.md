@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `mode: acp`: an empty assistant reply no longer closes the session. The session is kept under the transcript the client resends, so the client's retry continues it with only the new turn instead of replaying the whole history inline, which `agy` truncates from the tail above ~190 KB.
+
 ## [0.7.1] - 2026-11-26
 
 ### Fixed

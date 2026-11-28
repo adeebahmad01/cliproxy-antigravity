@@ -117,6 +117,9 @@ type acpPlan struct {
 	cfg       pluginConfig
 	debug     string
 	mediaRefs []string
+	// lookupKey fingerprints the history the request was looked up under. A turn that ends
+	// without an answer leaves that history unchanged, so the client's retry uses the same key.
+	lookupKey string
 }
 
 func (p *acpPlan) ensureFull() ([]acpPromptBlock, error) {
@@ -167,6 +170,7 @@ func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPla
 		return plan, nil
 	}
 	key := convKey(plan.scope, plan.tools, chatReq.Messages[:last+1])
+	plan.lookupKey = key
 	conv := takeConv(key)
 	convDebug(plan.debug, map[string]any{"event": "lookup", "key": key[:12], "hit": conv != nil, "n": len(chatReq.Messages),
 		"tools": len(chatReq.Tools), "scope": plan.scope, "src": req.SourceFormat, "msgs": describeMessages(chatReq.Messages[:last+1])})
@@ -199,6 +203,13 @@ func (p *acpPlan) retainConv(conv *acpConv, reply string, toolCalls []openAITool
 		return
 	}
 	if !isToolCall && strings.TrimSpace(reply) == "" {
+		// Keep the session for the client's retry. Closing it forces the retry to replay the
+		// whole history inline, and agy cuts inline input above its size limit.
+		if p.lookupKey != "" {
+			convDebug(p.debug, map[string]any{"event": "keep-after-empty", "key": p.lookupKey[:12], "n": len(p.messages)})
+			restoreConv(p.lookupKey, conv)
+			return
+		}
 		safeGo("closeConv", func() { conv.client.closeSession(conv.sessionID) })
 		return
 	}
