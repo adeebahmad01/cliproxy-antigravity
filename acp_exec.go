@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -196,8 +197,67 @@ func buildACPBlocks(chatReq chatCompletionRequest, opts agyOptions, cfg pluginCo
 		log.Printf("cliproxy-antigravity: rejecting oversized acp prompt (%d bytes > max_prompt_bytes=%d, messages=%d, tools=%d, model=%s)", len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
 		return nil, nil, promptTooLargeErrorWithContext(len(prompt), cfg.MaxPromptBytes, len(chatReq.Messages), len(chatReq.Tools))
 	}
+	if cfg.MaxPromptBytes > 0 && cfg.MaxPromptAction == promptActionTrim && len(prompt) > cfg.MaxPromptBytes && len(attachments) == 0 {
+		trimmed, dropped, err := trimMiddleForACP(chatReq, opts, cfg, cfg.MaxPromptBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		if dropped > 0 {
+			log.Printf("cliproxy-antigravity: trimmed oversized acp prompt (%d -> %d bytes > max_prompt_bytes=%d, dropped %d of %d messages, tools=%d, model=%s)", len(prompt), len(trimmed), cfg.MaxPromptBytes, dropped, len(chatReq.Messages), len(chatReq.Tools), opts.NativeModel)
+			prompt = trimmed
+		}
+	}
 	blocks := []acpPromptBlock{{"type": "text", "text": prompt}}
 	return append(blocks, attachments...), mediaPathsFromBlocks(attachments), nil
+}
+
+// trimMiddleForACP fits a full ACP prompt under limit by dropping the oldest messages after the
+// leading system/developer messages and the first user message, and inserting one note at the
+// gap. The newest messages stay complete: agy itself truncates an oversized inline prompt from
+// the tail, which removes the request that is being answered. Returns the prompt and the number
+// of dropped messages (0 when nothing can be dropped). When even the newest message alone does not
+// fit, everything droppable is dropped and agy's own limit applies to the rest.
+func trimMiddleForACP(chatReq chatCompletionRequest, opts agyOptions, cfg pluginConfig, limit int) (string, int, error) {
+	msgs := chatReq.Messages
+	head := 0
+	for head < len(msgs) && canonRole(msgs[head].Role) == "system" {
+		head++
+	}
+	if head < len(msgs) {
+		head++
+	}
+	droppable := len(msgs) - head - 1 // always keep the newest message
+	if droppable < 1 {
+		return "", 0, nil
+	}
+	build := func(drop int) (string, error) {
+		note, err := json.Marshal(fmt.Sprintf("[%d earlier messages were omitted here to fit the agy input limit. The newest messages follow in full.]", drop))
+		if err != nil {
+			return "", err
+		}
+		trimmed := chatReq
+		trimmed.Messages = append(append(append([]chatMessage(nil), msgs[:head]...), chatMessage{Role: "user", Content: note}), msgs[head+drop:]...)
+		var none []acpPromptBlock
+		return buildChatPromptWithAttachments(trimmed, opts.ConversationID, cfg.Workdir, false, &none)
+	}
+	best, bestDrop := "", 0
+	for lo, hi := 1, droppable; lo <= hi; {
+		mid := (lo + hi) / 2
+		text, err := build(mid)
+		if err != nil {
+			return "", 0, err
+		}
+		if len(text) <= limit {
+			best, bestDrop, hi = text, mid, mid-1
+		} else {
+			lo = mid + 1
+		}
+	}
+	if bestDrop == 0 {
+		text, err := build(droppable)
+		return text, droppable, err
+	}
+	return best, bestDrop, nil
 }
 
 func executeNonStreamACP(req rpcExecutorRequest, cfg pluginConfig, opts agyOptions) (agyResult, error) {

@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `max_prompt_action: trim`: in `mode: acp`, a full prompt over `max_prompt_bytes` drops the oldest middle messages (after the system messages and the first user message) and marks the gap, instead of `agy` truncating the tail, which removes the newest messages including the request. Some agent clients stop on the `error` action's `413` instead of compacting. In `mode: print`, `trim` stages like `stage`.
+
 ## [0.7.1] - 2026-11-26
 
 ### Fixed
