@@ -32,6 +32,12 @@ type pluginConfig struct {
 	StreamKeepaliveInterval string
 	Mode                    string
 	ConvDebugFile           string
+	// ACPSessionIdleTTL keeps an idle mode: acp session of a request that declared tools
+	// (an agent loop) for this long; ACPOneShotSessionTTL applies to tool-less turns, which
+	// are usually single prompts. ACPSessionCacheSize caps the stored sessions.
+	ACPSessionIdleTTL    time.Duration
+	ACPOneShotSessionTTL time.Duration
+	ACPSessionCacheSize  int
 	// AccountHome is the HOME given to agy for the account selected by CLIProxyAPI.
 	// It comes from the "home" field of the agy auth file, never from the plugin YAML.
 	AccountHome string
@@ -47,6 +53,9 @@ func defaultConfig() pluginConfig {
 		MaxPromptAction:         promptActionStage,
 		StreamKeepaliveInterval: defaultStreamKeepalive,
 		Mode:                    modePrint,
+		ACPSessionIdleTTL:       defaultACPSessionIdleTTL,
+		ACPOneShotSessionTTL:    defaultACPSessionIdleTTL,
+		ACPSessionCacheSize:     defaultACPSessionCacheSize,
 	}
 }
 
@@ -58,6 +67,9 @@ const (
 	defaultMaxPromptBytes  = 150000
 	defaultStreamKeepalive = "15s"
 	minStreamKeepalive     = 15 * time.Second
+	// The previous fixed values, kept as defaults.
+	defaultACPSessionIdleTTL   = 30 * time.Minute
+	defaultACPSessionCacheSize = 256
 )
 
 // acpSettingsChanged reports a change that running resident agy processes cannot pick up.
@@ -420,6 +432,22 @@ func parsePluginConfig(raw []byte) (pluginConfig, error) {
 			cfg.Mode = mode
 		case "conv_debug_file":
 			cfg.ConvDebugFile = expandHome(value)
+		case "acp_session_idle_ttl", "acp_oneshot_session_ttl":
+			d, err := time.ParseDuration(value)
+			if err != nil || d < 10*time.Second || d > 7*24*time.Hour {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid %s %q: must be a duration from 10s to 168h", lineNo+1, key, value)
+			}
+			if key == "acp_session_idle_ttl" {
+				cfg.ACPSessionIdleTTL = d
+			} else {
+				cfg.ACPOneShotSessionTTL = d
+			}
+		case "acp_session_cache_size":
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 16 || parsed > 10000 {
+				return pluginConfig{}, fmt.Errorf("line %d: invalid acp_session_cache_size %q: must be an integer from 16 to 10000", lineNo+1, value)
+			}
+			cfg.ACPSessionCacheSize = parsed
 		case "accounts_dir":
 			cleaned, err := validateWorkdir(value)
 			if err != nil {

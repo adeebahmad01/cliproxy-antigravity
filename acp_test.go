@@ -794,3 +794,35 @@ func TestACPMaxPromptActionErrorReturns413AndRestoresSession(t *testing.T) {
 		t.Fatalf("expected cached ACP session to be restored after 413 error, got %+v", restored)
 	}
 }
+
+func TestACPSessionTTLsFollowConfig(t *testing.T) {
+	setupFakeACP(t)
+	t.Cleanup(dropAllConvs)
+	cfg := currentConfig()
+	cfg.ACPSessionIdleTTL = 12 * time.Hour
+	cfg.ACPOneShotSessionTTL = 2 * time.Minute
+	opts := agyOptions{NativeModel: "gemini-3.8-flash"}
+	var buf bytes.Buffer
+	client := &acpClient{dead: make(chan struct{}), in: nopWriteCloserBuf{&buf}}
+
+	oneShot, err := decodeChatRequest([]byte(`{"model":"agy/gemini-3.8-flash","messages":[{"role":"user","content":"rate this"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1 := &acpConv{client: client, sessionID: "sess-oneshot"}
+	(&acpPlan{scope: convScope(cfg, opts), messages: oneShot.Messages, chatReq: oneShot, opts: opts, cfg: cfg}).retainConv(c1, "ok", nil, false)
+	if c1.ttl() != 2*time.Minute {
+		t.Fatalf("tool-less turn kept for %v, want 2m", c1.ttl())
+	}
+
+	agent, err := decodeChatRequest([]byte(`{"model":"agy/gemini-3.8-flash","messages":[{"role":"user","content":"work"}],
+		"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := &acpConv{client: client, sessionID: "sess-agent"}
+	(&acpPlan{scope: convScope(cfg, opts), tools: agent.Tools, messages: agent.Messages, chatReq: agent, opts: opts, cfg: cfg}).retainConv(c2, "done", nil, false)
+	if c2.ttl() != 12*time.Hour {
+		t.Fatalf("tool turn kept for %v, want 12h", c2.ttl())
+	}
+}

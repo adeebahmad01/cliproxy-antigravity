@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestParsePluginConfig(t *testing.T) {
@@ -247,6 +248,25 @@ stream_keepalive_interval: 15s
 	} {
 		if _, err := parsePluginConfig([]byte(bad)); err == nil {
 			t.Fatalf("expected error for config %q", bad)
+		}
+	}
+}
+
+func TestParseACPSessionSettings(t *testing.T) {
+	cfg, err := parsePluginConfig([]byte("acp_session_idle_ttl: 12h\nacp_oneshot_session_ttl: 2m\nacp_session_cache_size: 512\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ACPSessionIdleTTL != 12*time.Hour || cfg.ACPOneShotSessionTTL != 2*time.Minute || cfg.ACPSessionCacheSize != 512 {
+		t.Fatalf("parsed %v %v %d", cfg.ACPSessionIdleTTL, cfg.ACPOneShotSessionTTL, cfg.ACPSessionCacheSize)
+	}
+	def := defaultConfig()
+	if def.ACPSessionIdleTTL != 30*time.Minute || def.ACPOneShotSessionTTL != 30*time.Minute || def.ACPSessionCacheSize != 256 {
+		t.Fatalf("defaults changed: %v %v %d", def.ACPSessionIdleTTL, def.ACPOneShotSessionTTL, def.ACPSessionCacheSize)
+	}
+	for _, bad := range []string{"acp_session_idle_ttl: 1s", "acp_oneshot_session_ttl: soon", "acp_session_cache_size: 3"} {
+		if _, err := parsePluginConfig([]byte(bad + "\n")); err == nil {
+			t.Fatalf("%q accepted", bad)
 		}
 	}
 }
