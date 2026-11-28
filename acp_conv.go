@@ -17,15 +17,27 @@ import (
 // Session reuse: Antigravity only hits its prompt cache inside one session, so a finished turn stays
 // open under a fingerprint of the transcript the client will resend and the next turn continues it.
 
-const (
-	acpConvIdleTTL = 30 * time.Minute
-	acpConvMax     = 256
-)
-
 type acpConv struct {
 	client    *acpClient
 	sessionID string
 	lastUsed  time.Time
+	// idleTTL is how long the session may sit unused before it is closed; set by retainConv
+	// from acp_session_idle_ttl (turns with tools) or acp_oneshot_session_ttl (without).
+	idleTTL time.Duration
+}
+
+func (c *acpConv) ttl() time.Duration {
+	if c.idleTTL > 0 {
+		return c.idleTTL
+	}
+	return defaultACPSessionIdleTTL
+}
+
+func acpSessionCacheSize() int {
+	if n := currentConfig().ACPSessionCacheSize; n > 0 {
+		return n
+	}
+	return defaultACPSessionCacheSize
 }
 
 var acpConvs = struct {
@@ -47,6 +59,8 @@ func takeConv(key string) *acpConv {
 
 func putConv(key string, c *acpConv) {
 	c.lastUsed = time.Now()
+	// Read the cap before taking acpConvs: setConfig holds configState while it drops sessions.
+	limit := acpSessionCacheSize()
 	var evict []*acpConv
 	acpConvs.Lock()
 	if old := acpConvs.m[key]; old != nil && old != c {
@@ -54,12 +68,12 @@ func putConv(key string, c *acpConv) {
 	}
 	acpConvs.m[key] = c
 	for k, v := range acpConvs.m {
-		if v != c && (time.Since(v.lastUsed) > acpConvIdleTTL || !v.client.alive()) {
+		if v != c && (time.Since(v.lastUsed) > v.ttl() || !v.client.alive()) {
 			evict = append(evict, v)
 			delete(acpConvs.m, k)
 		}
 	}
-	for len(acpConvs.m) > acpConvMax {
+	for len(acpConvs.m) > limit {
 		oldestKey := ""
 		var oldest *acpConv
 		for k, v := range acpConvs.m {
@@ -197,6 +211,11 @@ func planACP(req rpcExecutorRequest, opts agyOptions, cfg pluginConfig) (*acpPla
 func (p *acpPlan) retainConv(conv *acpConv, reply string, toolCalls []openAIToolCall, isToolCall bool) {
 	if conv == nil {
 		return
+	}
+	if len(p.tools) == 0 {
+		conv.idleTTL = p.cfg.ACPOneShotSessionTTL
+	} else {
+		conv.idleTTL = p.cfg.ACPSessionIdleTTL
 	}
 	if !isToolCall && strings.TrimSpace(reply) == "" {
 		safeGo("closeConv", func() { conv.client.closeSession(conv.sessionID) })

@@ -301,6 +301,9 @@ The prompt is piped directly to `agy`'s standard input rather than passed as a c
 | `stream_keepalive_interval` | `15s` | Optional duration (minimum `15s`; `0s` disables) to emit no-op streaming content deltas (`""`) while waiting on `agy` after turn initialization, preventing idle client or reverse-proxy timeouts on long staged turns. |
 | `mode` | `print` | Execution mode: `print` (default, spawns `agy -p` per request) or `acp` (keeps a resident `agy acp` process per enabled account home, reuses matching sessions by transcript fingerprint to hit Antigravity's prompt cache, and supports `input_audio`, `video_url`, and `file` attachments). Requests carrying a `conversation_id` stay on `print` mode. |
 | `conv_debug_file` | empty | Optional JSONL log file path for troubleshooting ACP session lookup/store fingerprints (contains message excerpts; enable only during short debugging sessions). |
+| `acp_session_idle_ttl` | `30m` | `mode: acp`: how long an idle session of a request that declared `tools` stays open for reuse (`10s`–`168h`). Agent loops can sit for hours on a long command or at their prompt; when the session is gone, the next turn replays the whole history inline. |
+| `acp_oneshot_session_ttl` | `30m` | `mode: acp`: the same for tool-less turns, which are usually single prompts (for example `agy`'s own safety rater). A short value keeps them from filling the session cache. |
+| `acp_session_cache_size` | `256` | `mode: acp`: most sessions kept for reuse; the least recently used is closed first (`16`–`10000`). |
 | `accounts_dir` | empty | Directory holding one agy home per account. Accounts added from the panel go here (`~/.agy-accounts` when empty). See [Multiple accounts](#multiple-accounts). |
 
 ### Usage limits

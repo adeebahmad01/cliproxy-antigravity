@@ -4,6 +4,10 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `acp_session_idle_ttl`, `acp_oneshot_session_ttl` and `acp_session_cache_size` for `mode: acp` session reuse (defaults unchanged: `30m`, `30m`, `256`). Long agent loops can keep their session through long tool runs, and one-shot tool-less turns can expire quickly instead of crowding agent sessions out of the cache.
+
 ## [0.7.1] - 2026-11-26
 
 ### Fixed
